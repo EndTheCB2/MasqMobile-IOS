@@ -1,0 +1,117 @@
+name: Mobile CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - agent/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: UI, core, engine, and privacy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.11.0
+          cache: npm
+          cache-dependency-path: masq-mobile/package-lock.json
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install 1.77.2 --profile minimal
+          rustup toolchain install 1.97.1 --profile minimal
+      - name: Install JavaScript dependencies
+        working-directory: masq-mobile
+        run: npm ci
+      - name: Verify all non-platform code
+        working-directory: masq-mobile
+        run: npm run verify:all
+
+  ios:
+    name: Unsigned iPhone release build
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.11.0
+          cache: npm
+          cache-dependency-path: masq-mobile/package-lock.json
+      - uses: ruby/setup-ruby@a30dfa457ad68707b8b910ac3a244714b61c0626 # v1.320.0
+        with:
+          bundler-cache: true
+          working-directory: masq-mobile
+      - name: Install Rust and JavaScript dependencies
+        run: |
+          rustup toolchain install 1.77.2 --profile minimal
+          rustup target add --toolchain 1.77.2 aarch64-apple-ios
+          cd masq-mobile
+          npm ci
+      - name: Install locked CocoaPods
+        working-directory: masq-mobile/ios
+        run: bundle exec pod install --deployment
+      - name: Build the complete embedded MASQ core for iPhone
+        working-directory: masq-mobile
+        run: >-
+          xcodebuild
+          -workspace ios/MasqMobile.xcworkspace
+          -scheme MasqMobile
+          -configuration Release
+          -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO
+          MASQ_NODE_FINDER_URL=https://ci.invalid.example
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
+          build
+
+  android:
+    name: Unsigned Android release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.11.0
+          cache: npm
+          cache-dependency-path: masq-mobile/package-lock.json
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - name: Install Android SDK and pinned Rust tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.1.12297006'
+          rustup toolchain install 1.77.2 --profile minimal
+          rustup target add --toolchain 1.77.2 aarch64-linux-android x86_64-linux-android
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup target add --toolchain 1.97.1 aarch64-linux-android x86_64-linux-android
+          rustup run 1.97.1 cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Install JavaScript dependencies
+        working-directory: masq-mobile
+        run: npm ci
+      - name: Build self-contained unsigned APK
+        working-directory: masq-mobile/android
+        env:
+          MASQ_NODE_FINDER_URL: https://ci.invalid.example
+        run: ./gradlew assembleRelease --no-daemon
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: masq-mobile-unsigned-android
+          path: masq-mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 7

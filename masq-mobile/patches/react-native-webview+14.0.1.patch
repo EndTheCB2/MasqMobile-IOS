@@ -1,0 +1,50 @@
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+index 266b0c1..a3f3c2d 100644
+--- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
++++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+@@ -17,6 +17,16 @@
+ 
+ #import "objc/runtime.h"
+ 
++#if TARGET_OS_IOS
++// MASQ Mobile provides this symbol from its app target. A strong reference is intentional: an iOS
++// build must fail to link rather than create an incognito WebView that can silently use the direct
++// network when the private data-store contract is missing.
++extern WKWebsiteDataStore *masq_private_browser_data_store(void);
++extern WKWebsiteDataStore *masq_direct_browser_data_store(void);
++extern void masq_configure_private_browser_content_controller(
++    WKUserContentController *controller);
++#endif
++
+ static NSTimer *keyboardTimer;
+ static NSString *const HistoryShimName = @"ReactNativeHistoryShim";
+ static NSString *const MessageHandlerName = @"ReactNativeWebView";
+@@ -459,7 +468,15 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
+     wkWebViewConfig.preferences = prefs;
+   }
+   if (_incognito) {
++#if TARGET_OS_IOS
++    wkWebViewConfig.websiteDataStore = masq_private_browser_data_store();
++#else
+     wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
++#endif
++#if TARGET_OS_IOS
++  } else if (!_cacheEnabled) {
++    wkWebViewConfig.websiteDataStore = masq_direct_browser_data_store();
++#endif
+   } else if (_cacheEnabled) {
+     wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+   }
+@@ -473,5 +491,11 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
+   }
+   wkWebViewConfig.userContentController = [WKUserContentController new];
++#if TARGET_OS_IOS
++  if (_incognito || !_cacheEnabled) {
++    masq_configure_private_browser_content_controller(
++        wkWebViewConfig.userContentController);
++  }
++#endif
+-
++
+ #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* iOS 13 */
+   if (@available(iOS 13.0, *)) {

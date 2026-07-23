@@ -1,0 +1,568 @@
+import { AppState } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { normalizeWalletSecret, toMasqConfig } from '../core/config';
+import {
+  isAbortError,
+  startWithEntryNodeRefresh,
+} from '../core/entryNodeRefresh';
+import { stopMasqSafely } from '../core/connectionLifecycle';
+import { startAndAwaitMasqConnection } from '../core/connectionReadiness';
+import { masqCore } from '../core/masqCore';
+import {
+  classifyMasqIssue,
+  reconcileMasqIssue,
+  type MasqIssue,
+} from '../core/issues';
+import { chooseReachableRpc } from '../core/rpcHealth';
+import { SingleFlight } from '../core/singleFlight';
+import {
+  EMPTY_WALLET_BALANCE,
+  fetchWalletBalance,
+  type WalletBalanceState,
+} from '../core/walletBalance';
+import {
+  UNSUPPORTED_SYSTEM_TUNNEL,
+  type RoutableApp,
+  type SystemTunnelMode,
+  type SystemTunnelStatus,
+} from '../core/systemTunnel';
+import {
+  DEFAULT_SETUP,
+  EMPTY_STATUS,
+  type CoreStatus,
+  type NetworkStatus,
+  type SetupDraft,
+} from '../core/types';
+
+const UNKNOWN_NETWORK: NetworkStatus = {
+  available: false,
+  interface: 'unknown',
+  expensive: false,
+  constrained: false,
+  generation: 0,
+};
+
+export function useMasqController() {
+  const [status, setStatus] = useState<CoreStatus>(EMPTY_STATUS);
+  const [network, setNetwork] = useState<NetworkStatus>(UNKNOWN_NETWORK);
+  const [draft, setDraft] = useState<SetupDraft>(DEFAULT_SETUP);
+  const [busy, setBusy] = useState(true);
+  const [issue, setIssue] = useState<MasqIssue | null>(null);
+  const [entryNodeRefresh, setEntryNodeRefresh] = useState<{
+    attempt: number;
+    maxAttempts: number;
+  } | null>(null);
+  const [walletBalance, setWalletBalance] =
+    useState<WalletBalanceState>(EMPTY_WALLET_BALANCE);
+  const [systemTunnel, setSystemTunnel] = useState<SystemTunnelStatus>(
+    UNSUPPORTED_SYSTEM_TUNNEL,
+  );
+  const [routableApps, setRoutableApps] = useState<RoutableApp[]>([]);
+  const [systemTunnelBusy, setSystemTunnelBusy] = useState(false);
+  const operationEpoch = useRef(0);
+  const connectAbort = useRef<AbortController | null>(null);
+  const balanceAbort = useRef<AbortController | null>(null);
+  const connectFlight = useRef(new SingleFlight<CoreStatus>());
+  const desiredConnected = useRef(false);
+  const statusRef = useRef(status);
+  const networkRef = useRef(network);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+  useEffect(() => {
+    networkRef.current = network;
+  }, [network]);
+
+  const run = useCallback(async (operation: () => Promise<CoreStatus>) => {
+    const epoch = ++operationEpoch.current;
+    setBusy(true);
+    setIssue(null);
+    try {
+      const next = await operation();
+      if (epoch === operationEpoch.current) {
+        setStatus(next);
+      }
+      return next;
+    } catch (caught) {
+      if (epoch === operationEpoch.current && !isAbortError(caught)) {
+        setIssue(
+          classifyMasqIssue(caught, networkRef.current, statusRef.current),
+        );
+      }
+      throw caught;
+    } finally {
+      if (epoch === operationEpoch.current) {
+        setBusy(false);
+      }
+    }
+  }, []);
+
+  const cancelConnectionAttempt = useCallback(() => {
+    connectAbort.current?.abort();
+    connectAbort.current = null;
+    setEntryNodeRefresh(null);
+  }, []);
+
+  const refresh = useCallback(() => run(() => masqCore.getStatus()), [run]);
+
+  const refreshWalletBalance = useCallback(async () => {
+    const walletAddress = status.walletAddress;
+    const chain = status.chain;
+    if (!walletAddress || !chain) {
+      balanceAbort.current?.abort();
+      balanceAbort.current = null;
+      setWalletBalance(EMPTY_WALLET_BALANCE);
+      return;
+    }
+
+    balanceAbort.current?.abort();
+    const controller = new AbortController();
+    balanceAbort.current = controller;
+    setWalletBalance(current => ({
+      state: 'loading',
+      value: current.value,
+      message: null,
+    }));
+    try {
+      const value = await fetchWalletBalance(
+        chain,
+        draft.rpcUrl,
+        walletAddress,
+        { signal: controller.signal },
+      );
+      if (!controller.signal.aborted) {
+        setWalletBalance({ state: 'ready', value, message: null });
+      }
+    } catch (caught) {
+      if (!controller.signal.aborted) {
+        setWalletBalance(current => ({
+          state: 'error',
+          value: current.value,
+          message:
+            caught instanceof TypeError
+              ? 'Balance check unavailable. Verify the RPC and internet connection.'
+              : caught instanceof Error
+              ? caught.message
+              : 'Balance check unavailable.',
+        }));
+      }
+    } finally {
+      if (balanceAbort.current === controller) {
+        balanceAbort.current = null;
+      }
+    }
+  }, [draft.rpcUrl, status.chain, status.walletAddress]);
+
+  const updateSystemTunnel = useCallback(
+    async (mode: SystemTunnelMode, selectedApps: string[]) => {
+      setSystemTunnelBusy(true);
+      try {
+        const next = await masqCore.setSystemTunnel(mode, selectedApps);
+        setSystemTunnel(next);
+        return next;
+      } finally {
+        setSystemTunnelBusy(false);
+      }
+    },
+    [],
+  );
+
+  const disableSystemTunnel = useCallback(async () => {
+    const current = await masqCore.getSystemTunnelStatus();
+    setSystemTunnel(current);
+    if (!current.supported) {
+      return current;
+    }
+    const next = await masqCore.setSystemTunnel('off', []);
+    setSystemTunnel(next);
+    if (next.active || next.phase !== 'off' || next.mode !== 'off') {
+      throw new Error(
+        'MASQ could not confirm that system routing stopped.',
+      );
+    }
+    return next;
+  }, []);
+
+  const saveSetup = useCallback(
+    async (nextDraft: SetupDraft) => {
+      desiredConnected.current = false;
+      cancelConnectionAttempt();
+      let savedDraft = nextDraft;
+      await run(async () => {
+        const rpcUrl = await chooseReachableRpc(
+          nextDraft.chain,
+          nextDraft.rpcUrl,
+        );
+        const resolvedDraft = { ...nextDraft, rpcUrl };
+        savedDraft = resolvedDraft;
+        await masqCore.configure(toMasqConfig(resolvedDraft));
+        const walletSecret = normalizeWalletSecret(resolvedDraft);
+        return walletSecret
+          ? masqCore.importWallet(walletSecret)
+          : masqCore.getStatus();
+      });
+      setDraft({ ...savedDraft, configVersion: 2, walletSecret: '' });
+    },
+    [cancelConnectionAttempt, run],
+  );
+
+  const connect = useCallback(() => {
+    desiredConnected.current = true;
+    const flight = connectFlight.current;
+    if (flight.isRunning) {
+      return flight.run(() => masqCore.getStatus());
+    }
+
+    const controller = new AbortController();
+    connectAbort.current = controller;
+    return flight.run(() =>
+      run(async () => {
+        setStatus(current => ({
+          ...current,
+          phase: 'connecting',
+          lastError: null,
+        }));
+        try {
+          return await startWithEntryNodeRefresh(
+            () =>
+              startAndAwaitMasqConnection(
+                () => masqCore.start(),
+                () => masqCore.getStatus(),
+                {
+                  onStatus: setStatus,
+                  signal: controller.signal,
+                },
+              ),
+            {
+              onAttempt: setEntryNodeRefresh,
+              signal: controller.signal,
+            },
+          );
+        } finally {
+          if (connectAbort.current === controller) {
+            connectAbort.current = null;
+          }
+          setEntryNodeRefresh(null);
+        }
+      }),
+    );
+  }, [run]);
+
+  const disconnect = useCallback(async () => {
+    desiredConnected.current = false;
+    cancelConnectionAttempt();
+    return run(async () => {
+      setStatus(current => ({ ...current, phase: 'stopping' }));
+      await disableSystemTunnel();
+      return stopMasqSafely(masqCore);
+    });
+  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+
+  const updateMinHops = useCallback(
+    async (minHops: number) => {
+      const next = await run(() => masqCore.updateMinHops(minHops));
+      setDraft(current => ({ ...current, minHops }));
+      return next;
+    },
+    [run],
+  );
+
+  const reset = useCallback(async () => {
+    desiredConnected.current = false;
+    cancelConnectionAttempt();
+    const next = await run(async () => {
+      await disableSystemTunnel();
+      return masqCore.reset();
+    });
+    setDraft({ ...DEFAULT_SETUP, neighbors: [] });
+    return next;
+  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+
+  const resetNetworkProfile = useCallback(async () => {
+    desiredConnected.current = false;
+    cancelConnectionAttempt();
+    const next = await run(async () => {
+      await disableSystemTunnel();
+      return masqCore.resetNetworkProfile();
+    });
+    setDraft(current => ({
+      ...DEFAULT_SETUP,
+      walletImportMode: current.walletImportMode,
+      walletSecret: '',
+      neighbors: [],
+    }));
+    return next;
+  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+
+  const removeWallet = useCallback(async () => {
+    desiredConnected.current = false;
+    cancelConnectionAttempt();
+    const next = await run(async () => {
+      await disableSystemTunnel();
+      return masqCore.removeWallet();
+    });
+    setDraft(current => ({ ...current, walletSecret: '' }));
+    return next;
+  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const epoch = operationEpoch.current;
+    Promise.all([
+      masqCore.getStatus(),
+      masqCore.getNetworkStatus().catch(() => UNKNOWN_NETWORK),
+      masqCore.getSavedConfiguration(),
+    ])
+      .then(([initialStatus, initialNetwork, saved]) => {
+        if (cancelled || epoch !== operationEpoch.current) return;
+        setStatus(initialStatus);
+        setNetwork(initialNetwork);
+        if (saved) {
+          setDraft(current => ({ ...current, ...saved, walletSecret: '' }));
+        }
+      })
+      .catch(caught => {
+        if (cancelled) return;
+        setIssue(
+          classifyMasqIssue(caught, networkRef.current, statusRef.current),
+        );
+      })
+      .finally(() => {
+        if (!cancelled && epoch === operationEpoch.current) setBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    Promise.all([masqCore.getSystemTunnelStatus(), masqCore.getRoutableApps()])
+      .then(([tunnel, apps]) => {
+        if (!cancelled) {
+          setSystemTunnel(tunnel);
+          setRoutableApps(apps);
+        }
+      })
+      .catch(() => undefined);
+    const poll = async () => {
+      try {
+        const next = await masqCore.getSystemTunnelStatus();
+        if (!cancelled) setSystemTunnel(next);
+      } catch {
+        // The MASQ connection status remains usable if the optional tunnel API is unavailable.
+      } finally {
+        if (!cancelled) timer = setTimeout(poll, 2000);
+      }
+    };
+    timer = setTimeout(poll, 2000);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!status.walletAddress || !status.chain) {
+      balanceAbort.current?.abort();
+      balanceAbort.current = null;
+      setWalletBalance(EMPTY_WALLET_BALANCE);
+      return;
+    }
+    refreshWalletBalance().catch(() => undefined);
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') {
+        refreshWalletBalance().catch(() => undefined);
+      }
+    }, 60_000);
+    return () => {
+      clearInterval(timer);
+      balanceAbort.current?.abort();
+      balanceAbort.current = null;
+    };
+  }, [refreshWalletBalance, status.chain, status.walletAddress]);
+
+  // The next poll is scheduled only after the previous native call settles.
+  // The epoch prevents an old poll from overwriting a newer user operation.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      if (AppState.currentState !== 'active') {
+        if (!cancelled) timer = setTimeout(poll, 5000);
+        return;
+      }
+      const epoch = operationEpoch.current;
+      try {
+        const next = await masqCore.getStatus();
+        if (!cancelled && epoch === operationEpoch.current) {
+          setStatus(next);
+          setIssue(current =>
+            reconcileMasqIssue(current, next, networkRef.current),
+          );
+        }
+      } catch (caught) {
+        if (!cancelled && epoch === operationEpoch.current) {
+          setIssue(
+            classifyMasqIssue(caught, networkRef.current, statusRef.current),
+          );
+        }
+      } finally {
+        const activeRoute = ['connecting', 'connected', 'stopping'].includes(
+          statusRef.current.phase,
+        );
+        if (!cancelled) timer = setTimeout(poll, activeRoute ? 1000 : 5000);
+      }
+    };
+    timer = setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let reconnecting = false;
+    const pollNetwork = async () => {
+      if (AppState.currentState !== 'active') {
+        if (!cancelled) timer = setTimeout(pollNetwork, 5000);
+        return;
+      }
+      try {
+        const next = await masqCore.getNetworkStatus();
+        if (cancelled) return;
+        const previous = networkRef.current;
+        setNetwork(next);
+        setIssue(current =>
+          reconcileMasqIssue(current, statusRef.current, next),
+        );
+        const changed =
+          next.generation !== previous.generation &&
+          (next.interface !== previous.interface ||
+            next.available !== previous.available);
+        if (
+          changed &&
+          next.available &&
+          desiredConnected.current &&
+          statusRef.current.phase !== 'connected' &&
+          !reconnecting
+        ) {
+          reconnecting = true;
+          connect()
+            .catch(() => undefined)
+            .finally(() => {
+              reconnecting = false;
+            });
+        }
+      } catch {
+        // Core status remains authoritative when the OS monitor is unavailable.
+      } finally {
+        if (!cancelled) timer = setTimeout(pollNetwork, 2000);
+      }
+    };
+    pollNetwork();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [connect]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState !== 'active') {
+        cancelConnectionAttempt();
+        masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
+        return;
+      }
+      Promise.all([masqCore.getStatus(), masqCore.getNetworkStatus()])
+        .then(([nextStatus, nextNetwork]) => {
+          setStatus(nextStatus);
+          setNetwork(nextNetwork);
+          if (
+            desiredConnected.current &&
+            nextNetwork.available &&
+            !['connected', 'connecting'].includes(nextStatus.phase)
+          ) {
+            connect().catch(() => undefined);
+          }
+        })
+        .catch(() => undefined);
+    });
+    return () => subscription.remove();
+  }, [cancelConnectionAttempt, connect]);
+
+  useEffect(
+    () => () => {
+      connectAbort.current?.abort();
+      connectAbort.current = null;
+      balanceAbort.current?.abort();
+      balanceAbort.current = null;
+    },
+    [],
+  );
+
+  const connectionProgress = useMemo(
+    () => describeConnectionProgress(status, network, entryNodeRefresh),
+    [entryNodeRefresh, network, status],
+  );
+
+  return {
+    status,
+    network,
+    connectionProgress,
+    draft,
+    busy,
+    issue,
+    entryNodeRefresh,
+    walletBalance,
+    systemTunnel,
+    routableApps,
+    systemTunnelBusy,
+    setDraft,
+    saveSetup,
+    connect,
+    disconnect,
+    updateMinHops,
+    reset,
+    resetNetworkProfile,
+    removeWallet,
+    refresh,
+    refreshWalletBalance,
+    updateSystemTunnel,
+  };
+}
+
+function describeConnectionProgress(
+  status: CoreStatus,
+  network: NetworkStatus,
+  refresh: { attempt: number; maxAttempts: number } | null,
+) {
+  if (!network.available && network.interface !== 'unknown') {
+    return { step: 1, total: 5, label: 'Waiting for an internet connection' };
+  }
+  if (refresh) {
+    return {
+      step: 2,
+      total: 5,
+      label: `Finding reachable entry nodes (${refresh.attempt}/${refresh.maxAttempts})`,
+    };
+  }
+  if (status.connectedNeighbors < 1) {
+    return { step: 3, total: 5, label: 'Connecting to an entry peer' };
+  }
+  if (status.routeStage < 2) {
+    return { step: 4, total: 5, label: 'Preparing a private exit route' };
+  }
+  return {
+    step: 5,
+    total: 5,
+    label: status.proxyEnabled
+      ? 'Private browser protected'
+      : 'Private route verified',
+  };
+}
