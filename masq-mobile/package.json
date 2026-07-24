@@ -10,6 +10,8 @@
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
+    "test:ci:linux": "jest --runInBand --testPathIgnorePatterns=iosNativeCoreLinking.test.ts",
+    "test:ci:ios": "jest --runInBand --runTestsByPath __tests__/iosNativeCoreLinking.test.ts",
     "test:core": "node scripts/test-core.mjs",
     "test:engine": "node scripts/test-engine.mjs",
     "test:tunnel": "rustup run 1.97.1 cargo test --manifest-path native/masq-packet-tunnel/Cargo.toml --locked",
@@ -18,6 +20,7 @@
     "postinstall": "patch-package",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run lint && npm test -- --runInBand && npm run test:core",
+    "verify:ci:linux": "npm run typecheck && npm run lint && npm run test:ci:linux && npm run test:core && npm run test:engine && npm run test:tunnel && npm run verify:privacy",
     "verify:android:apk": "bash scripts/verify-android-apk-privacy.sh",
     "verify:privacy": "bash scripts/verify-source-privacy.sh",
     "verify:all": "npm run verify && npm run test:engine && npm run test:tunnel && npm run verify:privacy"
