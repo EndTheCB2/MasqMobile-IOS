@@ -45,6 +45,11 @@ jobs:
         working-directory: masq-mobile
         timeout-minutes: 10
         run: npm run test:ci:linux
+      - name: Fetch locked Rust dependencies
+        timeout-minutes: 15
+        run: |
+          rustup run 1.77.2 cargo fetch --locked --manifest-path masq-mobile/native/masq-mobile-core/Cargo.toml
+          rustup run 1.97.1 cargo fetch --locked --manifest-path masq-mobile/native/masq-packet-tunnel/Cargo.toml
       - name: Test mobile core
         working-directory: masq-mobile
         timeout-minutes: 30
