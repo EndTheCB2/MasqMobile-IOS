@@ -33,9 +33,34 @@ jobs:
       - name: Install JavaScript dependencies
         working-directory: masq-mobile
         run: npm ci
-      - name: Verify all non-platform code
+      - name: Type-check
         working-directory: masq-mobile
-        run: npm run verify:ci:linux
+        timeout-minutes: 5
+        run: npm run typecheck
+      - name: Lint
+        working-directory: masq-mobile
+        timeout-minutes: 5
+        run: npm run lint
+      - name: Test UI and shared TypeScript
+        working-directory: masq-mobile
+        timeout-minutes: 10
+        run: npm run test:ci:linux
+      - name: Test mobile core
+        working-directory: masq-mobile
+        timeout-minutes: 30
+        run: npm run test:core
+      - name: Test embedded node engine
+        working-directory: masq-mobile
+        timeout-minutes: 45
+        run: npm run test:engine
+      - name: Test packet tunnel
+        working-directory: masq-mobile
+        timeout-minutes: 15
+        run: npm run test:tunnel
+      - name: Verify source privacy
+        working-directory: masq-mobile
+        timeout-minutes: 5
+        run: npm run verify:privacy
 
   ios:
     name: Unsigned iPhone release build

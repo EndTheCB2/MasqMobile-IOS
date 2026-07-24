@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
-    "test:ci:linux": "jest --runInBand --testPathIgnorePatterns=iosNativeCoreLinking.test.ts",
+    "test:ci:linux": "jest --ci --runInBand --detectOpenHandles --testTimeout=15000 --testPathIgnorePatterns=iosNativeCoreLinking.test.ts",
     "test:ci:ios": "jest --runInBand --runTestsByPath __tests__/iosNativeCoreLinking.test.ts",
     "test:core": "node scripts/test-core.mjs",
     "test:engine": "node scripts/test-engine.mjs",
