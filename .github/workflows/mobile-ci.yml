@@ -39,6 +39,7 @@ jobs:
 
   ios:
     name: Unsigned iPhone release build
+    if: github.event_name == 'push' || github.actor != 'dependabot[bot]'
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -79,6 +80,7 @@ jobs:
 
   android:
     name: Unsigned Android release
+    if: github.event_name == 'push' || github.actor != 'dependabot[bot]'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
