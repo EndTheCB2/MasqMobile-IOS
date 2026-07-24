@@ -51,7 +51,8 @@ jobs:
           cache-dependency-path: masq-mobile/package-lock.json
       - uses: ruby/setup-ruby@a30dfa457ad68707b8b910ac3a244714b61c0626 # v1.320.0
         with:
-          ruby-version: 2.6.10
+          ruby-version: 3.3.0
+          bundler: 2.4.22
           bundler-cache: true
           working-directory: masq-mobile
       - name: Install Rust and JavaScript dependencies
@@ -62,7 +63,7 @@ jobs:
           npm ci
       - name: Install locked CocoaPods
         working-directory: masq-mobile/ios
-        run: bundle exec pod install --deployment
+        run: bundle _2.4.22_ exec pod install --deployment
       - name: Build the complete embedded MASQ core for iPhone
         working-directory: masq-mobile
         run: >-
