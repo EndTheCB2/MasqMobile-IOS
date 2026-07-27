@@ -32,8 +32,12 @@ workspace through `../masq-node-mobile/node`.
 - Embedded **MASQ Private** browser with fail-closed proxying and a separate, explicitly selected
   **Browse without MASQ** mode for ordinary device networking.
 - Local browser protection for known advertising/tracking resources, cross-site cookies and common
-  cookie-consent banners, plus an optional explicit rejection flow for supported consent dialogs,
-  with separate controls inside the browser.
+  consent managers, with Balanced/Strict presets, exact-host exceptions and verified Reject-only
+  automation.
+- ENS `.eth` browsing through an explicit eth.limo HTTPS transport boundary while the logical ENS
+  address remains visible.
+- Temporary browser sessions by default, with exact-host remembered sign-in profiles only on
+  Android WebView runtimes that report multi-profile isolation support.
 - Android whole-device and selected-app routing through a fail-closed `VpnService` packet tunnel.
 - Automatic RPC validation and entry-node discovery/retry.
 - Wallet import, live balance warnings, configurable hop count, and live exit-country inventory.
@@ -47,18 +51,20 @@ matching happens locally: the feature downloads no external filter list and send
 telemetry or rule-match report to the maintainer. The public build deliberately compiles out
 YouTube-specific filtering and does not broadly block `googlevideo` media hosts.
 
-Cookie-banner hiding and optional-cookie rejection are separate. Hiding is cosmetic. The
-off-by-default rejection option currently recognizes DPG Media/HLN dialogs and follows
-**Configure → Reject all**; it never chooses **Accept**. An unrecognized full-page consent gate
-stays visible because hiding it could make the page unusable. On iOS, browser sessions use
-non-persistent WebKit stores. On Android, cookies and website storage are cleared when a temporary
-browser session starts and closes, although WebView may use app storage while the session is
-active. The rejection preference is reapplied for each new session.
+Consent automation only uses reviewed exact Reject controls for supported managers and hides a
+resolved banner only after that action succeeds. It never chooses **Accept**. An unrecognized gate
+stays visible. Android remembers a site only after explicit opt-in and a runtime
+`MULTI_PROFILE` capability check; otherwise the control is disabled and the session stays
+temporary. MASQ and Direct profiles remain separate.
+Cross-site top-frame links and redirects always select the destination profile. Android also
+blocks top-frame non-GET form navigations because WebView does not expose those requests to the
+normal navigation-policy callback.
 
 Browser routing is never selected implicitly. **MASQ Private** blocks the page if its route fails
 and never falls back to the device connection. **Browse without MASQ** is a separate, temporary
-choice that first stops any active MASQ connection and system routing. It shows a persistent
-warning: destination sites see the public IP used by the current connection or VPN, while the
+choice that first stops any active MASQ connection and system routing. A compact persistent
+`DIRECT · MASQ OFF` badge identifies the mode; destination sites see the public IP used by the
+current connection or VPN, while the
 internet provider and DNS resolver can observe normal connection metadata. Closing or
 backgrounding the browser returns its native routing state to blocked. The user must reconnect
 before opening **MASQ Private** again.

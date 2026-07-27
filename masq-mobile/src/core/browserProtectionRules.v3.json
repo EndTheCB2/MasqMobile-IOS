@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "adSelectors": [
+    "[data-ad-slot]",
+    "[data-ad-client]",
+    "iframe[src*=\"doubleclick.net\"]",
+    "iframe[src*=\"googlesyndication.com\"]",
+    "iframe[src*=\"googleadservices.com\"]"
+  ],
+  "rejectSelectors": [
+    "#onetrust-reject-all-handler",
+    "#CybotCookiebotDialogBodyButtonDecline",
+    "#didomi-notice-disagree-button",
+    "[data-testid=\"uc-deny-all-button\"]"
+  ],
+  "resolvedBannerSelectors": [
+    "#onetrust-banner-sdk",
+    "#onetrust-consent-sdk",
+    "#CybotCookiebotDialog",
+    ".didomi-popup-container",
+    "[data-testid=\"uc-banner-content\"]",
+    "[data-nosnippet=\"cookie-banner\"]"
+  ]
+}

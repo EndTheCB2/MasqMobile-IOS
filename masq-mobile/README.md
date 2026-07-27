@@ -29,16 +29,20 @@ exit services to other nodes.
   succeeds through the local MASQ proxy and exit route.
 - A separately selected direct browser that works without a wallet or MASQ route, stops any active
   MASQ connection and system routing, never inherits MASQ hop/exit settings, and continuously
-  identifies that sites see the public IP of the current connection or VPN.
+  identifies the mode with the compact `DIRECT · MASQ OFF` badge.
 - Bounded private-browser recovery for transient iOS and Android WebView failures, without blindly
   retrying offline or TLS-certificate failures and without letting stale timers reload a new URL.
 - A hardened embedded WebView profile in both modes that disables local-file access, mixed
   content, popup windows, shared cookies and process pools, link previews, and production WebView
   debugging.
-- User-controlled browser protection, enabled by default, for known advertising/tracking
-  resources, cross-site cookies and common cookie-consent banners.
-- An opt-in optional-cookie rejection flow for supported DPG Media/HLN consent dialogs that follows
-  **Configure → Reject all** and never selects **Accept**.
+- User-controlled Balanced/Strict browser protection for known advertising/tracking resources,
+  cross-site cookies and supported consent managers, plus exact-host compatibility exceptions.
+- Opt-in Reject-only handling for supported OneTrust, Cookiebot, Didomi, Usercentrics and DPG
+  Media dialogs. Unknown gates remain visible and **Accept** is never selected.
+- ENS `.eth` navigation through eth.limo HTTPS transport without search or Direct fallback.
+- Temporary sessions by default, with exact-host remembered sign-in profiles only after Android
+  WebView confirms multi-profile isolation support. Cross-site top-frame transitions select the
+  destination profile and top-frame non-GET form navigations are blocked fail-closed.
 - Local MASQ Mobile-authored protection rules with no downloaded filter list, browsing telemetry
   or rule-match reporting.
 - User-selectable route lengths from one to six hops and an optional exit-country preference with
@@ -175,10 +179,12 @@ instructions are in
 6. Start MASQ and follow the five-stage connection status.
 7. Open **MASQ Private** after its route preflight succeeds, or explicitly choose **Browse without
    MASQ** and confirm that the normal connection exposes the device IP and bypasses MASQ routing.
-8. Review the separate **Ads & trackers**, **Cross-site cookies**, **Cookie banners** and
-   **Reject optional cookies** controls in the browser. Rejection is off by default. Changing a
-   control rebuilds the active WebView with the selected local protection.
-9. On Android, optionally open Traffic scope and protect the whole device or selected apps. Android
+8. Choose **Balanced** or **Strict**, or review the individual **Ads & trackers**,
+   **Cross-site cookies**, **Hide resolved banners** and **Reject optional cookies** controls.
+   Exact-host protection exceptions and remembered sign-ins are opt-in.
+9. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
+   the logical ENS address in the bar.
+10. On Android, optionally open Traffic scope and protect the whole device or selected apps. Android
    asks once for VPN permission; the selected package names stay on the device.
 
 A real route requires reachable entry nodes and a wallet that meets the network requirements. No
@@ -194,16 +200,17 @@ The public app ships a deliberately bounded, MASQ Mobile-authored ruleset:
   requests and hide common ad or cookie-banner elements.
 - On Android, the embedded WebView disables third-party cookies and applies the corresponding
   local cosmetic selectors. It does not claim the same native request-filtering coverage as iOS.
-- Cookie-banner hiding only hides recognized page elements. It does not click **Accept** or
-  **Reject**, create a consent record or guarantee that every site remains usable.
-- **Reject optional cookies** is a separate, off-by-default action. It currently recognizes DPG
-  Media/HLN consent dialogs and follows **Configure → Reject all**. It never selects **Accept**.
-  A full-page consent gate that cannot be rejected safely remains visible; cosmetically hiding such
-  a gate could leave the page blocked or unusable.
-- iOS uses non-persistent website stores in both modes. Android clears cookies and website storage
-  when a temporary browser session starts and closes, although WebView may use app-private storage
-  while the session is active. The app reapplies the rejection preference in each new session, so
-  a site may present and reject its dialog again later.
+- **Reject optional cookies** is separate and off by default. Exact Reject controls are supported
+  for selected OneTrust, Cookiebot, Didomi, Usercentrics and DPG Media dialogs. A banner is hidden
+  only after rejection succeeds; unknown gates remain visible and **Accept** is never selected.
+- Android sessions are temporary by default. Remembered sign-in is enabled only after AndroidX
+  WebKit confirms `MULTI_PROFILE`; it then uses separate exact-host profiles for MASQ and Direct.
+  Cross-site top-frame links and redirects select the destination profile. Because Android does
+  not expose top-frame non-GET requests to the normal navigation policy, those form navigations
+  are blocked; sign-in flows that require one may not work. Unsupported runtimes remain temporary.
+  Forget-site, clear-all and reset remove retained profiles.
+- **Protection off for this site** is an exact-host compatibility exception and does not affect
+  other sites.
 - The rules are included in the application source and binary. The app does not retrieve EasyList,
   another external list or a remote ruleset, and it does not send visited URLs, matches or block
   counts to MASQ Mobile.
@@ -263,10 +270,9 @@ self-contained unsigned Android release APK with commit-pinned actions.
 - iOS uses separate non-persistent stores for MASQ and direct sessions. Strong native link
   contracts make a missing binding fail the build. Only the direct store can have an empty proxy
   configuration, and only after the explicit direct action.
-- iOS uses separate ephemeral stores that do not write session cache or cookies to persistent
-  website storage; data may remain in memory until the web-content process exits. Android clears
-  WebView cookies and website storage at session start and close, but WebView may use app-private
-  storage while the session is active. The browser closes on background, routing returns to a
+- iOS uses separate ephemeral stores by default. Android uses separate MASQ and Direct WebView
+  profiles when the runtime supports them, and offers exact-host persistence only after opt-in;
+  unsupported runtimes remain temporary. The browser closes on background, routing returns to a
   blocked sink, and MASQ never permits proxy failover.
 - Browser-protection preferences are local app settings. Protection does not send browsing
   telemetry, but destination websites still receive normal requests and can detect or react to
@@ -275,6 +281,8 @@ self-contained unsigned Android release APK with commit-pinned actions.
 - Browser navigation accepts HTTPS only and blocks localhost, private, and link-local addresses.
   Free text entered in the browser bar opens the public Timpi Search website through the selected
   MASQ Private or Direct routing mode; MASQ Mobile does not embed Timpi's private data API.
+- Normalized `.eth` addresses are rewritten locally to eth.limo HTTPS transport. Gateway failure
+  is reported and never falls back to Timpi, ordinary DNS or Direct networking.
 - After import, the wallet secret is removed from React state and temporary Rust copies are
   zeroized. iOS persists it with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; Android uses
   AES-GCM with a non-exportable key held by Android Keystore.

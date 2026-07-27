@@ -9,6 +9,8 @@ import android.net.VpnService
 import android.content.pm.PackageManager
 import android.webkit.CookieManager
 import android.webkit.WebStorage
+import androidx.webkit.Profile
+import androidx.webkit.ProfileStore
 import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewFeature
@@ -17,6 +19,8 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.BaseActivityEventListener
 import androidx.core.content.ContextCompat
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.Executor
@@ -108,7 +112,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               blockCrossSiteCookies =
                   preferences.getBoolean(BLOCK_CROSS_SITE_COOKIES_KEY, true),
               hideCookieBanners =
-                  preferences.getBoolean(HIDE_COOKIE_BANNERS_KEY, true),
+                  preferences.getBoolean(HIDE_COOKIE_BANNERS_KEY, false),
               rejectOptionalCookies =
                   preferences.getBoolean(REJECT_OPTIONAL_COOKIES_KEY, false),
               youtubeBestEffort =
@@ -188,6 +192,132 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             rejectOptionalCookies,
             youtubeBestEffort,
         ))
+  }
+
+  override fun getBrowserSiteSettings(mode: String, hostname: String, promise: Promise) {
+    val site = validateBrowserSite(mode, hostname, promise) ?: return
+    try {
+      promise.resolve(selectBrowserSite(site.mode, site.hostname))
+    } catch (error: RuntimeException) {
+      promise.reject(
+          "E_BROWSER_PROFILE",
+          "Android could not prepare the isolated website profile.",
+          error,
+      )
+    }
+  }
+
+  override fun setBrowserSiteSettings(
+      mode: String,
+      hostname: String,
+      rememberSignIn: Boolean,
+      protectionDisabled: Boolean,
+      promise: Promise,
+  ) {
+    val site = validateBrowserSite(mode, hostname, promise) ?: return
+    val persistentSupported = browserProfilesSupported()
+    if (rememberSignIn && !persistentSupported) {
+      promise.reject(
+          "E_BROWSER_PROFILE_UNSUPPORTED",
+          "This Android WebView cannot isolate remembered website sessions.",
+      )
+      return
+    }
+    val prefix = browserSitePreferencePrefix(site.mode, site.hostname)
+    val saved =
+        preferences
+            .edit()
+            .putBoolean("${prefix}remember-sign-in", rememberSignIn)
+            .putBoolean("${prefix}protection-disabled", protectionDisabled)
+            .commit()
+    if (!saved) {
+      promise.reject(
+          "E_BROWSER_SITE_STORAGE",
+          "Android could not save the website privacy settings.",
+      )
+      return
+    }
+    try {
+      promise.resolve(selectBrowserSite(site.mode, site.hostname))
+    } catch (error: RuntimeException) {
+      promise.reject(
+          "E_BROWSER_PROFILE",
+          "Android could not switch the isolated website profile.",
+          error,
+      )
+    }
+  }
+
+  override fun clearBrowserSiteData(mode: String, hostname: String, promise: Promise) {
+    val site = validateBrowserSite(mode, hostname, promise) ?: return
+    val prefix = browserSitePreferencePrefix(site.mode, site.hostname)
+    val wasRemembered =
+        browserProfilesSupported() &&
+            preferences.getBoolean("${prefix}remember-sign-in", false)
+    val profileToDelete =
+        if (wasRemembered) {
+          persistentBrowserProfileName(site.mode, site.hostname)
+        } else {
+          temporaryBrowserProfileName(site.mode)
+        }
+    val saved =
+        preferences
+            .edit()
+            .remove("${prefix}remember-sign-in")
+            .remove("${prefix}protection-disabled")
+            .commit()
+    if (!saved) {
+      promise.reject(
+          "E_BROWSER_SITE_STORAGE",
+          "Android could not remove the website privacy settings.",
+      )
+      return
+    }
+    callbackExecutor.execute {
+      try {
+        selectTemporaryBrowserProfile(site.mode)
+        if (browserProfilesSupported()) {
+          ProfileStore.getInstance().deleteProfile(profileToDelete)
+          promise.resolve(browserSiteSettingsJson(site.mode, site.hostname))
+        } else {
+          WebStorage.getInstance().deleteAllData()
+          val cookieManager = CookieManager.getInstance()
+          cookieManager.removeAllCookies {
+            try {
+              cookieManager.flush()
+              promise.resolve(browserSiteSettingsJson(site.mode, site.hostname))
+            } catch (error: RuntimeException) {
+              promise.reject(
+                  "E_BROWSER_SITE_DELETE",
+                  "Android could not remove the temporary website data.",
+                  error,
+              )
+            }
+          }
+        }
+      } catch (error: RuntimeException) {
+        promise.reject(
+            "E_BROWSER_SITE_DELETE",
+            "Android could not remove the remembered website data.",
+            error,
+        )
+      }
+    }
+  }
+
+  override fun clearRememberedBrowserData(promise: Promise) {
+    callbackExecutor.execute {
+      try {
+        clearRememberedBrowserStorage(clearProtectionExceptions = false)
+        promise.resolve("ok")
+      } catch (error: RuntimeException) {
+        promise.reject(
+            "E_BROWSER_SITE_DELETE",
+            "Android could not clear the remembered website sessions.",
+            error,
+        )
+      }
+    }
   }
 
   override fun getSavedConfiguration(promise: Promise) {
@@ -346,26 +476,29 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun reset(promise: Promise) {
-    try {
-      walletStore.delete()
-    } catch (error: Exception) {
-      promise.reject(
-          "E_KEYSTORE_DELETE",
-          "The saved consumer wallet could not be removed from secure Android storage.",
-          error,
-      )
-      return
-    }
-    preferences.edit().remove(SAVED_CONFIG_KEY).commit()
-    restoreAttempted = true
-    if (!MasqCoreJni.isAvailable) {
-      promise.resolve(statusJson())
-      return
-    }
-    try {
-      promise.resolve(MasqCoreJni.nativeReset())
-    } catch (error: RuntimeException) {
-      promise.reject("E_CORE_RESET", "The MASQ core could not be reset.", error)
+    callbackExecutor.execute {
+      try {
+        walletStore.delete()
+        clearRememberedBrowserStorage(clearProtectionExceptions = true)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_KEYSTORE_DELETE",
+            "Saved wallet or remembered browser data could not be removed from secure Android storage.",
+            error,
+        )
+        return@execute
+      }
+      preferences.edit().remove(SAVED_CONFIG_KEY).commit()
+      restoreAttempted = true
+      if (!MasqCoreJni.isAvailable) {
+        promise.resolve(statusJson())
+        return@execute
+      }
+      try {
+        promise.resolve(MasqCoreJni.nativeReset())
+      } catch (error: RuntimeException) {
+        promise.reject("E_CORE_RESET", "The MASQ core could not be reset.", error)
+      }
     }
   }
 
@@ -632,6 +765,18 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.reject("E_PROXY_UNSUPPORTED", "This Android WebView does not support proxy override.")
       return
     }
+    if (mode == "masq" || mode == "direct") {
+      try {
+        selectTemporaryBrowserProfile(mode)
+      } catch (error: RuntimeException) {
+        promise.reject(
+            "E_BROWSER_PROFILE",
+            "Android could not prepare the temporary browser profile.",
+            error,
+        )
+        return
+      }
+    }
 
     val request = BrowserRoutingRequest(mode, promise)
     val next =
@@ -830,13 +975,163 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     )
   }
 
+  private fun validateBrowserSite(
+      mode: String,
+      hostname: String,
+      promise: Promise,
+  ): BrowserSite? {
+    val normalized = hostname.lowercase(Locale.ROOT)
+    val valid =
+        (mode == "masq" || mode == "direct") &&
+            hostname == normalized &&
+            hostname.length in 1..253 &&
+            !hostname.endsWith(".") &&
+            hostname != "localhost" &&
+            !hostname.endsWith(".local") &&
+            hostname.split(".").size >= 2 &&
+            hostname.split(".").all { label ->
+              label.length in 1..63 &&
+                  BROWSER_SITE_LABEL_PATTERN.matches(label)
+            }
+    if (!valid) {
+      promise.reject(
+          "E_BROWSER_SITE",
+          "Choose an exact public HTTPS hostname for MASQ or Direct browsing.",
+      )
+      return null
+    }
+    return BrowserSite(mode, hostname)
+  }
+
+  private fun browserProfilesSupported(): Boolean =
+      WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
+
+  private fun selectBrowserSite(mode: String, hostname: String): String {
+    val prefix = browserSitePreferencePrefix(mode, hostname)
+    val persistentSupported = browserProfilesSupported()
+    val remembered =
+        persistentSupported &&
+            preferences.getBoolean("${prefix}remember-sign-in", false)
+    if (remembered) {
+      selectActiveBrowserProfile(
+          mode,
+          persistentBrowserProfileName(mode, hostname),
+          persistent = true,
+      )
+    } else {
+      selectTemporaryBrowserProfile(mode)
+    }
+    return browserSiteSettingsJson(mode, hostname)
+  }
+
+  private fun selectTemporaryBrowserProfile(mode: String) {
+    selectActiveBrowserProfile(
+        mode,
+        temporaryBrowserProfileName(mode),
+        persistent = false,
+    )
+  }
+
+  private fun selectActiveBrowserProfile(
+      mode: String,
+      profileName: String,
+      persistent: Boolean,
+  ) {
+    val saved =
+        preferences
+            .edit()
+            .putString(ACTIVE_BROWSER_PROFILE_KEY, profileName)
+            .putString(ACTIVE_BROWSER_MODE_KEY, mode)
+            .putBoolean(ACTIVE_BROWSER_PROFILE_PERSISTENT_KEY, persistent)
+            .commit()
+    if (!saved) {
+      throw IllegalStateException("The active Android WebView profile could not be saved.")
+    }
+  }
+
+  private fun browserSiteSettingsJson(mode: String, hostname: String): String {
+    val prefix = browserSitePreferencePrefix(mode, hostname)
+    val persistentSupported = browserProfilesSupported()
+    return JSONObject()
+        .put("hostname", hostname)
+        .put("mode", mode)
+        .put("persistentSessionsSupported", persistentSupported)
+        .put("protectionDisabled", preferences.getBoolean("${prefix}protection-disabled", false))
+        .put(
+            "rememberSignIn",
+            persistentSupported &&
+                preferences.getBoolean("${prefix}remember-sign-in", false),
+        )
+        .toString()
+  }
+
+  private fun browserSitePreferencePrefix(mode: String, hostname: String): String =
+      "$BROWSER_SITE_PREFERENCE_PREFIX$mode.${sha256(hostname)}."
+
+  private fun clearRememberedBrowserStorage(clearProtectionExceptions: Boolean) {
+    val activeMode = preferences.getString(ACTIVE_BROWSER_MODE_KEY, "masq") ?: "masq"
+    selectTemporaryBrowserProfile(if (activeMode == "direct") "direct" else "masq")
+    val editor = preferences.edit()
+    preferences.all.keys
+        .filter { key ->
+          key.startsWith(BROWSER_SITE_PREFERENCE_PREFIX) &&
+              (clearProtectionExceptions || key.endsWith("remember-sign-in"))
+        }
+        .forEach { key -> editor.remove(key) }
+    if (!editor.commit()) {
+      throw IllegalStateException("Remembered browser settings could not be deleted.")
+    }
+    if (browserProfilesSupported()) {
+      val temporaryProfiles =
+          setOf(temporaryBrowserProfileName("masq"), temporaryBrowserProfileName("direct"))
+      ProfileStore.getInstance().allProfileNames
+          .filter { profileName ->
+            profileName.startsWith(BROWSER_PROFILE_PREFIX) &&
+                (clearProtectionExceptions || profileName !in temporaryProfiles)
+          }
+          .forEach { profileName -> ProfileStore.getInstance().deleteProfile(profileName) }
+    } else if (clearProtectionExceptions) {
+      WebStorage.getInstance().deleteAllData()
+      CookieManager.getInstance().removeAllCookies(null)
+      CookieManager.getInstance().flush()
+    }
+  }
+
+  private fun persistentBrowserProfileName(mode: String, hostname: String): String =
+      "$BROWSER_PROFILE_PREFIX${mode}_${sha256("site:$hostname")}"
+
+  private fun temporaryBrowserProfileName(mode: String): String =
+      "$BROWSER_PROFILE_PREFIX${mode}_${sha256("temporary")}"
+
+  private fun sha256(value: String): String =
+      MessageDigest.getInstance("SHA-256")
+          .digest(value.toByteArray(StandardCharsets.UTF_8))
+          .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+  private fun activeBrowserProfile(): Profile? {
+    if (!browserProfilesSupported()) return null
+    val profileName = preferences.getString(ACTIVE_BROWSER_PROFILE_KEY, null) ?: return null
+    return ProfileStore.getInstance().getProfile(profileName)
+  }
+
   private fun clearBrowserWebsiteData(
       onComplete: () -> Unit,
       onError: (Throwable) -> Unit,
   ) {
     try {
-      WebStorage.getInstance().deleteAllData()
-      val cookieManager = CookieManager.getInstance()
+      if (
+          preferences.getBoolean(ACTIVE_BROWSER_PROFILE_PERSISTENT_KEY, false) &&
+              browserProfilesSupported()
+      ) {
+        // Explicitly remembered profiles survive routing teardown. Their
+        // profile is isolated per exact host and per MASQ/Direct mode.
+        onComplete()
+        return
+      }
+      val profile = activeBrowserProfile()
+      val webStorage = profile?.webStorage ?: WebStorage.getInstance()
+      val cookieManager = profile?.cookieManager ?: CookieManager.getInstance()
+      webStorage.deleteAllData()
       cookieManager.removeAllCookies {
         try {
           cookieManager.flush()
@@ -1039,6 +1334,12 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         "browser-protection.reject-optional-cookies"
     private const val YOUTUBE_BEST_EFFORT_KEY =
         "browser-protection.youtube-best-effort"
+    private const val ACTIVE_BROWSER_PROFILE_KEY = "browser-profile.active"
+    private const val ACTIVE_BROWSER_MODE_KEY = "browser-profile.mode"
+    private const val ACTIVE_BROWSER_PROFILE_PERSISTENT_KEY =
+        "browser-profile.persistent"
+    private const val BROWSER_PROFILE_PREFIX = "masq_"
+    private const val BROWSER_SITE_PREFERENCE_PREFIX = "browser-site."
     private const val BLOCKED_BROWSER_PROXY = "http://127.0.0.1:1"
     private const val STOP_TUNNEL_TIMEOUT_MS = 10_000L
     private val STOP_REQUEST_COUNTER = AtomicLong(1L)
@@ -1050,8 +1351,15 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             "rejectOptionalCookies",
             "youtubeBestEffort",
         )
+    private val BROWSER_SITE_LABEL_PATTERN =
+        Regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
     private const val VPN_PERMISSION_REQUEST = 4108
   }
+
+  private data class BrowserSite(
+      val mode: String,
+      val hostname: String,
+  )
 
   private data class PendingTunnelRequest(
       val mode: String,

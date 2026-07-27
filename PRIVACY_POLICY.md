@@ -1,6 +1,6 @@
 # MASQ Mobile Privacy Policy
 
-Effective: 23 July 2026
+Effective: 27 July 2026
 
 MASQ Mobile is an independent, open-source, consume-only client. It is not an official release of
 the MASQ Project. This direct-download preview is maintained and distributed through the
@@ -13,7 +13,8 @@ responsible for complying with local law.
 The app has no maintainer-operated account, advertising SDK, analytics SDK or cross-app tracking.
 It does not sell personal data. It stores the consumer wallet secret and network profile on the
 device. Using MASQ sends data to a blockchain RPC, a node-finder, MASQ peers and the websites the
-user chooses to visit. Free-text browser searches are sent to Timpi Search. Explicit direct
+user chooses to visit. Free-text browser searches are sent to Timpi Search, while explicit
+normalized `.eth` addresses are loaded through the independent eth.limo HTTPS gateway. Direct
 browsing instead uses the device's normal internet connection. Those independent services may
 process or retain network data under their own policies.
 
@@ -27,8 +28,20 @@ process or retain network data under their own policies.
   cookies, cache and page history are not written to persistent website storage, but may remain in
   process memory until the app's web-content process exits. The app clears that in-memory website
   data before it prepares a new browser session and when protection settings change.
-- On Android, cookies and website storage are cleared when a temporary browser session starts and
-  closes. Android WebView may still use app-private storage while that session is active.
+- On Android, cookies and website storage are temporary by default. If the installed Android
+  WebView supports isolated profiles, a user can explicitly remember a sign-in for one exact host.
+  MASQ and Direct use different profiles, and profiles for different remembered hosts are
+  separate. If this runtime capability is unavailable, the control remains disabled and sessions
+  stay temporary.
+- Remembered profiles contain WebView-managed cookies and website data. MASQ does not extract
+  passwords or session tokens. Cross-site top-frame links and redirects switch to the
+  destination's own profile. Embedded third-party resources can still retain their own data inside
+  the current site's isolated profile. Android blocks top-frame non-GET form navigations because
+  the platform does not expose them to the browser's normal navigation policy; sign-in flows that
+  require such a form may therefore not work. **Forget this site**, **Clear all remembered
+  sign-ins**, and **Reset everything** remove the corresponding retained profiles. Some providers,
+  including Google, may refuse authentication inside an embedded WebView even when persistence is
+  enabled.
 - Browser-protection choices are stored as local app preferences. The advertising/tracker,
   cross-site-cookie, cookie-banner and optional-cookie-rejection rules are authored for MASQ Mobile
   and bundled with the app; no external filter list or browsing history is downloaded or
@@ -103,6 +116,15 @@ queries, country-level location, temporary IP data, server-log information and i
 advertising. Its current terms and retention practices are controlled by Timpi:
 [Timpi privacy policy](https://timpi.io/wp-content/uploads/2025/07/Timpi-International-Ltd-Privacy-Policy.pdf).
 
+### ENS websites
+
+Normalized ASCII or punycode `.eth` browser addresses are translated locally to the matching
+`eth.limo` HTTPS gateway address. The original `.eth` name remains visible in the address bar.
+eth.limo and its infrastructure can process the requested ENS name, path and normal connection
+metadata. In **MASQ Private**, the gateway sees the MASQ exit IP; in **Direct**, it sees the public
+IP of the current connection or VPN. A gateway failure is shown as an error and never falls back to
+Timpi Search, ordinary DNS, or Direct browsing.
+
 ### Browser protection
 
 Browser protection is performed on the device. The public build can block a limited set of known
@@ -112,18 +134,18 @@ visited URLs, matching rules, blocked-resource counts or page contents to the ma
 Destination sites still receive the requests that are not blocked and may detect that resources
 were filtered.
 
-Cookie-banner hiding is a visual best-effort feature; by itself, it does not accept or reject
-consent on the user's behalf. A separate **Reject optional cookies** preference is disabled by
-default. When enabled, it currently recognizes DPG Media/HLN dialogs and deliberately follows
-**Configure → Reject all**. It never chooses **Accept**. An unrecognized full-page consent gate is
-left visible because hiding it could leave the page inaccessible.
+Balanced and Strict presets use a versioned rule bundle shipped with the app. A malformed future
+bundle falls back to the reviewed last-known-good rules. Cookie-banner hiding is never used as a
+substitute for consent. A separate **Reject optional cookies** preference is disabled by default.
+When enabled, exact Reject controls are used for supported OneTrust, Cookiebot, Didomi,
+Usercentrics and DPG Media dialogs. A banner is hidden only after a verified Reject action. The app
+never chooses **Accept**, and an unrecognized consent gate stays visible.
 
-The app reapplies the user's rejection preference in each temporary browser session. iOS does not
-durably retain the website's consent cookie in its non-persistent stores. Android clears cookies
-and website storage when the browser starts and closes, although WebView may use app-private
-storage while a session is active. A site may therefore display and reject its dialog again in a
-later session. Blocking, hiding and rejection rules cannot recognize every advertisement, tracker
-or banner and may occasionally make a site less functional.
+Protection can be disabled for one exact host to restore compatibility. This permits that site's
+cookies, advertising and trackers under its own policy; it does not disable protection elsewhere.
+Temporary sessions reapply the rejection preference. A remembered session may retain the site's
+consent cookie until the user forgets it. Blocking and rejection rules cannot recognize every
+advertisement, tracker or banner and may occasionally make a site less functional.
 
 YouTube-specific filtering is compiled out of the public app. A separately signed, direct-install
 iOS build from the no-NFT codebase can enable an optional, narrow best-effort experiment for known
@@ -143,9 +165,10 @@ sites and infrastructure providers described above.
 
 ## Security and limitations
 
-The software uses operating-system secure storage, encrypted MASQ transport and isolated temporary
-browser sessions. iOS uses non-persistent WebKit stores; Android clears WebView cookies and website
-storage at session boundaries. Direct browsing deliberately does not provide MASQ anonymity. No
+The software uses operating-system secure storage, encrypted MASQ transport and temporary browser
+sessions by default. Remembered Android sessions are available only with runtime-verified WebView
+profile isolation and require an exact-host opt-in. Direct browsing deliberately does not provide
+MASQ anonymity. No
 software or decentralized network can guarantee complete anonymity or security. Keep a separate
 offline backup of the recovery phrase and use only funds appropriate for experimental software
 until the distributor completes an independent security review.

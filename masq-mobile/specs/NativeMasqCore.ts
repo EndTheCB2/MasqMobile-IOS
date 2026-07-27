@@ -22,6 +22,15 @@ export interface Spec extends TurboModule {
   prepareBrowserProtection(): Promise<string>;
   setBrowserProtection(configJson: string): Promise<string>;
   setBrowserRoutingMode(mode: string): Promise<string>;
+  getBrowserSiteSettings(mode: string, hostname: string): Promise<string>;
+  setBrowserSiteSettings(
+    mode: string,
+    hostname: string,
+    rememberSignIn: boolean,
+    protectionDisabled: boolean,
+  ): Promise<string>;
+  clearBrowserSiteData(mode: string, hostname: string): Promise<string>;
+  clearRememberedBrowserData(): Promise<string>;
 }
 
 export default TurboModuleRegistry.get<Spec>('NativeMasqCore');

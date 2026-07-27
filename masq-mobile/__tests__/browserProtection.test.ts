@@ -1,9 +1,12 @@
 import {
+  BROWSER_PROTECTION_RULES_VERSION,
+  browserProtectionPreset,
   browserProtectionPreferences,
   buildBrowserCosmeticProtectionScript,
   decodeBrowserProtectionConfiguration,
   DEFAULT_BROWSER_PROTECTION_PREFERENCES,
   encodeBrowserProtectionPreferences,
+  loadBrowserProtectionRules,
   type BrowserProtectionConfiguration,
 } from '../src/core/browserProtection';
 
@@ -22,7 +25,7 @@ describe('browser protection boundary', () => {
     expect(DEFAULT_BROWSER_PROTECTION_PREFERENCES).toEqual({
       blockAdsAndTrackers: true,
       blockCrossSiteCookies: true,
-      hideCookieBanners: true,
+      hideCookieBanners: false,
       rejectOptionalCookies: false,
       youtubeBestEffort: false,
     });
@@ -133,6 +136,39 @@ describe('browser protection boundary', () => {
     expect(script).toContain('MutationObserver');
     expect(script).not.toContain('fetch(');
     expect(script).not.toContain('XMLHttpRequest');
+    expect(script).toContain(
+      `__masqGenericCosmeticProtectionV${BROWSER_PROTECTION_RULES_VERSION}`,
+    );
+  });
+
+  it('offers explicit balanced and strict presets', () => {
+    expect(browserProtectionPreset('balanced')).toMatchObject({
+      blockAdsAndTrackers: true,
+      blockCrossSiteCookies: true,
+      hideCookieBanners: false,
+      rejectOptionalCookies: false,
+    });
+    expect(browserProtectionPreset('strict')).toMatchObject({
+      blockAdsAndTrackers: true,
+      blockCrossSiteCookies: true,
+      hideCookieBanners: true,
+      rejectOptionalCookies: true,
+    });
+  });
+
+  it('falls back to the reviewed last-good rules when a bundle is malformed', () => {
+    const rules = loadBrowserProtectionRules({
+      version: 99,
+      adSelectors: ['[data-ad-slot]'],
+      rejectSelectors: ['#accept-all'],
+      resolvedBannerSelectors: ['#banner'],
+    });
+
+    expect(rules.version).toBe(BROWSER_PROTECTION_RULES_VERSION);
+    expect(rules.rejectSelectors).toContain('#onetrust-reject-all-handler');
+    expect(rules.rejectSelectors.join(' ').toLowerCase()).not.toContain(
+      'accept',
+    );
   });
 
   it('contains no YouTube-specific page or media manipulation', () => {
@@ -156,13 +192,14 @@ describe('browser protection boundary', () => {
     expect(script).toContain("hostname === 'myprivacy.dpgmedia.be'");
     expect(script).toContain("hostname === 'myprivacy.dpgmedia.nl'");
     expect(script).toContain("pathname === '/consent'");
-    expect(script).toContain("querySelector('#pg-configure-btn')");
-    expect(script).toContain("querySelector('#pg-reject-btn')");
-    expect(script).toContain('maxConsentAttempts = 24');
+    expect(script).toContain("'#pg-configure-btn'");
+    expect(script).toContain("'#pg-reject-btn'");
+    expect(script).toContain('#onetrust-reject-all-handler');
+    expect(script).toContain('#CybotCookiebotDialogBodyButtonDecline');
+    expect(script).toContain('#didomi-notice-disagree-button');
+    expect(script).toContain('uc-deny-all-button');
+    expect(script).toContain('consentAttempts < 32');
     expect(script).not.toContain('#pg-accept-btn');
-    expect(script.indexOf('if (isDpgPrivacyHost)')).toBeLessThan(
-      script.indexOf("document.createElement('style')"),
-    );
   });
 
   it.each([
@@ -199,15 +236,15 @@ describe('browser protection boundary', () => {
     ).toEqual([]);
   });
 
-  it('uses only the DPG shadow host for HLN cookie-banner hiding', () => {
-    const script = buildBrowserCosmeticProtectionScript(CONFIGURATION);
-    expect(script).toContain(
-      "hostname === 'hln.be' || hostname.endsWith('.hln.be')",
+  it('never hides a consent gate before a verified rejection succeeds', () => {
+    const script = buildBrowserCosmeticProtectionScript({
+      ...CONFIGURATION,
+      rejectOptionalCookies: true,
+    });
+    expect(script.indexOf('if (consentRejected)')).toBeLessThan(
+      script.indexOf('hideMatches(document, residualConsentSelectors)'),
     );
-    expect(script).toContain("? ['#pg-shadow-host-dom']");
-    expect(script).toContain("document.body.style.height === '100vh'");
-    expect(script).toContain("document.body.style.overflow === 'hidden'");
-    expect(script).toContain('hlnConsentHostEncountered');
+    expect(script).not.toContain('residualConsentSelectors.map');
   });
 
   it('still injects consent handling when only rejection is active', () => {

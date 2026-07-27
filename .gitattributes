@@ -2,3 +2,4 @@ masq-node-mobile/vendor/** linguist-vendored
 *.jar binary
 *.mmdb binary
 *.png binary
+*.patch -whitespace

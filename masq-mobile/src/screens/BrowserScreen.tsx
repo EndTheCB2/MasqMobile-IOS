@@ -23,12 +23,22 @@ import WebView, { type WebViewNavigation } from 'react-native-webview';
 import { decideBrowserNavigation } from '../core/browserNavigation';
 import {
   browserProtectionPreferences,
+  browserProtectionPreset,
   buildBrowserCosmeticProtectionScript,
   type BrowserProtectionConfiguration,
   type BrowserProtectionPreferences,
 } from '../core/browserProtection';
-import { resolveBrowserInput } from '../core/browserInput';
+import { resolveBrowserInputTarget } from '../core/browserInput';
 import { decideBrowserRecovery } from '../core/browserRecovery';
+import {
+  browserSiteHostname,
+  type BrowserSiteSettings,
+} from '../core/browserSiteSettings';
+import {
+  displayBrowserUrl,
+  resolveBrowserUrlTarget,
+  type BrowserTarget,
+} from '../core/browserTarget';
 import { masqCore } from '../core/masqCore';
 import { colors, radii } from '../ui/theme';
 
@@ -40,6 +50,8 @@ interface Props {
 }
 
 interface ShouldStartLoadRequest extends WebViewNavigation {
+  hasGesture?: boolean;
+  isRedirect?: boolean;
   isTopFrame: boolean;
 }
 
@@ -89,6 +101,7 @@ const BrowserWebView = WebView as unknown as ComponentType<
 >;
 const MAX_TRANSIENT_RETRIES = 2;
 const MAX_HTTPS_REDIRECT_UPGRADES = 4;
+const FORM_SUBMISSION_NAVIGATIONS = new Set(['formsubmit', 'formresubmit']);
 
 export function BrowserScreen({ mode, onClose }: Props) {
   const isMasq = mode === 'masq';
@@ -97,8 +110,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
   const httpsRedirectUpgrades = useRef(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const protectionOperation = useRef(0);
+  const siteSettingsOperation = useRef(0);
   const [input, setInput] = useState('');
   const [url, setUrl] = useState<string | null>(null);
+  const [isEnsTarget, setIsEnsTarget] = useState(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -107,17 +122,22 @@ export function BrowserScreen({ mode, onClose }: Props) {
   const [protectionBusy, setProtectionBusy] = useState(true);
   const [protectionError, setProtectionError] = useState<string | null>(null);
   const [protectionExpanded, setProtectionExpanded] = useState(false);
+  const [siteSettings, setSiteSettings] = useState<BrowserSiteSettings | null>(
+    null,
+  );
+  const [siteSettingsBusy, setSiteSettingsBusy] = useState(false);
   const [webViewGeneration, setWebViewGeneration] = useState(0);
-  const protectionStatusText =
-    protectionBusy && !protection
-      ? 'Preparing before navigation'
-      : protection?.nativeRequestBlocking
-      ? 'Network and page filtering'
-      : protection
-      ? isMasq
-        ? 'Private page filtering'
-        : 'Page filtering'
-      : 'Navigation paused';
+  const protectionStatusText = siteSettings?.protectionDisabled
+    ? 'Off for this site'
+    : protectionBusy && !protection
+    ? 'Preparing before navigation'
+    : protection?.nativeRequestBlocking
+    ? 'Network and page filtering'
+    : protection
+    ? isMasq
+      ? 'Private page filtering'
+      : 'Page filtering'
+    : 'Navigation paused';
 
   const cancelScheduledRetry = () => {
     if (retryTimer.current) {
@@ -157,17 +177,66 @@ export function BrowserScreen({ mode, onClose }: Props) {
     prepareProtection().catch(() => undefined);
     return () => {
       protectionOperation.current += 1;
+      siteSettingsOperation.current += 1;
       cancelScheduledRetry();
     };
   }, [prepareProtection]);
 
   const cosmeticProtectionScript = useMemo(
     () =>
-      protection ? buildBrowserCosmeticProtectionScript(protection) : 'true;',
-    [protection],
+      protection && !siteSettings?.protectionDisabled
+        ? buildBrowserCosmeticProtectionScript(protection)
+        : 'true;',
+    [protection, siteSettings?.protectionDisabled],
   );
 
-  const navigate = () => {
+  const openTarget = useCallback(
+    async (target: BrowserTarget) => {
+      const operation = ++siteSettingsOperation.current;
+      setSiteSettingsBusy(true);
+      setError(null);
+      cancelScheduledRetry();
+      retryCount.current = 0;
+      httpsRedirectUpgrades.current = 0;
+      try {
+        const hostname = browserSiteHostname(target.transportUrl);
+        // Unmount the previous WebView before native code changes the active
+        // profile. The destination is mounted only after the exact profile and
+        // protection exception have been selected.
+        setUrl(null);
+        setSiteSettings(null);
+        setCanGoBack(false);
+        setLoading(false);
+        setIsEnsTarget(target.isEns);
+        setInput(target.displayUrl);
+        const settings = await masqCore.getBrowserSiteSettings(mode, hostname);
+        if (operation !== siteSettingsOperation.current) {
+          return;
+        }
+        cancelScheduledRetry();
+        retryCount.current = 0;
+        httpsRedirectUpgrades.current = 0;
+        setSiteSettings(settings);
+        setUrl(target.transportUrl);
+        setWebViewGeneration(current => current + 1);
+      } catch (caught) {
+        if (operation === siteSettingsOperation.current) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : 'Website privacy settings could not be prepared.',
+          );
+        }
+      } finally {
+        if (operation === siteSettingsOperation.current) {
+          setSiteSettingsBusy(false);
+        }
+      }
+    },
+    [mode],
+  );
+
+  const navigate = async () => {
     if (!protection || protectionBusy) {
       setError(
         isMasq
@@ -177,12 +246,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
       return;
     }
     try {
-      const next = resolveBrowserInput(input);
-      cancelScheduledRetry();
-      retryCount.current = 0;
-      httpsRedirectUpgrades.current = 0;
-      setError(null);
-      setUrl(next);
+      await openTarget(resolveBrowserInputTarget(input));
     } catch (caught) {
       setError(browserAddressError(caught));
     }
@@ -190,7 +254,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
 
   const navigationChanged = (event: WebViewNavigation) => {
     setCanGoBack(event.canGoBack);
-    setInput(event.url);
+    setInput(displayBrowserUrl(event.url));
   };
 
   const retryPage = () => {
@@ -218,7 +282,11 @@ export function BrowserScreen({ mode, onClose }: Props) {
       mode,
     );
     retryCount.current = recovery.nextAttempt;
-    setError(recovery.message);
+    setError(
+      isEnsTarget
+        ? `The ENS gateway could not load this .eth website. ${recovery.message}`
+        : recovery.message,
+    );
     if (recovery.retry && recovery.delayMs !== null) {
       retryTimer.current = setTimeout(() => {
         retryTimer.current = null;
@@ -236,6 +304,26 @@ export function BrowserScreen({ mode, onClose }: Props) {
     }
     const decision = decideBrowserNavigation(request);
     if (decision.action === 'allow') {
+      if (
+        request.isTopFrame &&
+        siteSettings &&
+        browserSiteHostname(decision.url) !== siteSettings.hostname
+      ) {
+        if (FORM_SUBMISSION_NAVIGATIONS.has(request.navigationType ?? '')) {
+          setError(
+            'The browser blocked this form submission because changing website session profiles would discard the submitted data. Open the destination first.',
+          );
+          return false;
+        }
+        // Every cross-site top-frame transition, including a server redirect,
+        // is re-opened only after the destination's exact-host profile and
+        // protection exception have been selected. This prevents a remembered
+        // session or a site exception from silently following the redirect.
+        openTarget(resolveBrowserUrlTarget(decision.url)).catch(
+          () => undefined,
+        );
+        return false;
+      }
       return true;
     }
     if (decision.action === 'block') {
@@ -258,25 +346,24 @@ export function BrowserScreen({ mode, onClose }: Props) {
     httpsRedirectUpgrades.current += 1;
     cancelScheduledRetry();
     retryCount.current = 0;
-    setError(null);
-    setInput(decision.url);
-    setUrl(decision.url);
+    const redirectedTarget = resolveBrowserUrlTarget(decision.url);
+    openTarget({
+      ...redirectedTarget,
+      displayUrl:
+        decision.action === 'redirect'
+          ? decision.displayUrl
+          : redirectedTarget.displayUrl,
+    }).catch(() => undefined);
     return false;
   };
 
-  const toggleProtection = async (key: keyof BrowserProtectionPreferences) => {
+  const applyProtection = async (next: BrowserProtectionPreferences) => {
     if (!protection || protectionBusy) {
       return;
     }
-    if (key === 'youtubeBestEffort' && !protection.youtubeBestEffortAvailable) {
+    if (next.youtubeBestEffort && !protection.youtubeBestEffortAvailable) {
       return;
     }
-
-    const preferences = browserProtectionPreferences(protection);
-    const next: BrowserProtectionPreferences = {
-      ...preferences,
-      [key]: !preferences[key],
-    };
     const operation = ++protectionOperation.current;
     setProtectionBusy(true);
     setProtectionError(null);
@@ -304,6 +391,119 @@ export function BrowserScreen({ mode, onClose }: Props) {
     } finally {
       if (operation === protectionOperation.current) {
         setProtectionBusy(false);
+      }
+    }
+  };
+
+  const toggleProtection = async (key: keyof BrowserProtectionPreferences) => {
+    if (!protection || protectionBusy) {
+      return;
+    }
+    const preferences = browserProtectionPreferences(protection);
+    await applyProtection({
+      ...preferences,
+      [key]: !preferences[key],
+    });
+  };
+
+  const updateSiteSettings = async (
+    rememberSignIn: boolean,
+    protectionDisabled: boolean,
+  ) => {
+    if (!siteSettings || siteSettingsBusy) {
+      return;
+    }
+    const operation = ++siteSettingsOperation.current;
+    setSiteSettingsBusy(true);
+    setProtectionError(null);
+    try {
+      const updated = await masqCore.setBrowserSiteSettings(
+        mode,
+        siteSettings.hostname,
+        rememberSignIn,
+        protectionDisabled,
+      );
+      if (operation !== siteSettingsOperation.current) {
+        return;
+      }
+      setSiteSettings(updated);
+      if (updated.protectionDisabled !== siteSettings.protectionDisabled) {
+        await prepareProtection();
+      }
+      setWebViewGeneration(current => current + 1);
+    } catch (caught) {
+      if (operation === siteSettingsOperation.current) {
+        setProtectionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Website privacy settings could not be saved.',
+        );
+      }
+    } finally {
+      if (operation === siteSettingsOperation.current) {
+        setSiteSettingsBusy(false);
+      }
+    }
+  };
+
+  const forgetCurrentSite = async () => {
+    if (!siteSettings || siteSettingsBusy) {
+      return;
+    }
+    const operation = ++siteSettingsOperation.current;
+    setSiteSettingsBusy(true);
+    setProtectionError(null);
+    try {
+      const updated = await masqCore.clearBrowserSiteData(
+        mode,
+        siteSettings.hostname,
+      );
+      if (operation === siteSettingsOperation.current) {
+        setSiteSettings(updated);
+        await prepareProtection();
+        setWebViewGeneration(current => current + 1);
+      }
+    } catch (caught) {
+      if (operation === siteSettingsOperation.current) {
+        setProtectionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Website data could not be removed.',
+        );
+      }
+    } finally {
+      if (operation === siteSettingsOperation.current) {
+        setSiteSettingsBusy(false);
+      }
+    }
+  };
+
+  const clearRememberedSignIns = async () => {
+    if (siteSettingsBusy) {
+      return;
+    }
+    const operation = ++siteSettingsOperation.current;
+    setSiteSettingsBusy(true);
+    setProtectionError(null);
+    try {
+      await masqCore.clearRememberedBrowserData();
+      if (operation === siteSettingsOperation.current) {
+        setSiteSettings(current =>
+          current ? { ...current, rememberSignIn: false } : current,
+        );
+        setWebViewGeneration(current => current + 1);
+      }
+    } catch (caught) {
+      if (operation === siteSettingsOperation.current) {
+        setProtectionError(
+          caught instanceof Error
+            ? caught.message
+            : 'Remembered website sessions could not be removed.',
+        );
+      }
+    } finally {
+      if (operation === siteSettingsOperation.current) {
+        setSiteSettingsBusy(false);
       }
     }
   };
@@ -349,14 +549,6 @@ export function BrowserScreen({ mode, onClose }: Props) {
           <Text style={styles.reload}>↻</Text>
         </Pressable>
       </View>
-      {!isMasq ? (
-        <View accessibilityRole="alert" style={styles.directWarning}>
-          <Text style={styles.directWarningText}>
-            This traffic is not routed through MASQ. Sites see the public IP of
-            your current connection or VPN.
-          </Text>
-        </View>
-      ) : null}
       <View style={styles.addressRow}>
         <Pressable
           accessibilityLabel={
@@ -380,10 +572,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
           }
           autoCapitalize="none"
           autoCorrect={false}
-          editable={Boolean(protection) && !protectionBusy}
+          editable={Boolean(protection) && !protectionBusy && !siteSettingsBusy}
           keyboardType="default"
           onChangeText={setInput}
-          onSubmitEditing={navigate}
+          onSubmitEditing={() => navigate().catch(() => undefined)}
           placeholder="Search with Timpi or enter a website"
           placeholderTextColor="#61788B"
           returnKeyType="search"
@@ -429,6 +621,30 @@ export function BrowserScreen({ mode, onClose }: Props) {
           <>
             {protection ? (
               <View style={styles.protectionOptions}>
+                <PresetButton
+                  disabled={protectionBusy}
+                  label="Balanced"
+                  onPress={() =>
+                    applyProtection(
+                      browserProtectionPreset(
+                        'balanced',
+                        protection.youtubeBestEffort,
+                      ),
+                    ).catch(() => undefined)
+                  }
+                />
+                <PresetButton
+                  disabled={protectionBusy}
+                  label="Strict"
+                  onPress={() =>
+                    applyProtection(
+                      browserProtectionPreset(
+                        'strict',
+                        protection.youtubeBestEffort,
+                      ),
+                    ).catch(() => undefined)
+                  }
+                />
                 <ProtectionToggle
                   disabled={protectionBusy}
                   enabled={protection.blockAdsAndTrackers}
@@ -452,7 +668,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
                 <ProtectionToggle
                   disabled={protectionBusy}
                   enabled={protection.hideCookieBanners}
-                  label="Cookie banners"
+                  label="Hide resolved banners"
                   onPress={() =>
                     toggleProtection('hideCookieBanners').catch(() => undefined)
                   }
@@ -481,6 +697,77 @@ export function BrowserScreen({ mode, onClose }: Props) {
                 ) : null}
               </View>
             ) : null}
+            {siteSettings ? (
+              <View style={styles.siteSettings}>
+                <Text style={styles.siteSettingsTitle}>
+                  This site · {siteSettings.hostname}
+                </Text>
+                <View style={styles.protectionOptions}>
+                  <ProtectionToggle
+                    disabled={siteSettingsBusy || protectionBusy}
+                    enabled={siteSettings.protectionDisabled}
+                    label="Protection off for this site"
+                    onPress={() =>
+                      updateSiteSettings(
+                        siteSettings.rememberSignIn,
+                        !siteSettings.protectionDisabled,
+                      ).catch(() => undefined)
+                    }
+                  />
+                  <ProtectionToggle
+                    disabled={
+                      siteSettingsBusy ||
+                      !siteSettings.persistentSessionsSupported
+                    }
+                    enabled={siteSettings.rememberSignIn}
+                    label="Remember sign-in for this site"
+                    onPress={() =>
+                      updateSiteSettings(
+                        !siteSettings.rememberSignIn,
+                        siteSettings.protectionDisabled,
+                      ).catch(() => undefined)
+                    }
+                  />
+                </View>
+                {!siteSettings.persistentSessionsSupported ? (
+                  <Text style={styles.protectionHint}>
+                    This device WebView cannot isolate remembered website
+                    sessions. Sign-in stays temporary.
+                  </Text>
+                ) : (
+                  <Text style={styles.protectionHint}>
+                    Remembered sign-in stores WebView cookies and website data
+                    in the selected MASQ or Direct profile. Cross-site links
+                    and redirects switch profiles. Android blocks top-frame
+                    non-GET forms that could bypass that switch. MASQ never
+                    reads passwords or session tokens. Some providers,
+                    including Google, may refuse embedded sign-in.
+                  </Text>
+                )}
+                <View style={styles.siteActions}>
+                  <Pressable
+                    accessibilityLabel="Forget data for this site"
+                    accessibilityRole="button"
+                    disabled={siteSettingsBusy}
+                    onPress={() => forgetCurrentSite().catch(() => undefined)}
+                  >
+                    <Text style={styles.siteAction}>Forget this site</Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityLabel="Clear all remembered sign-ins"
+                    accessibilityRole="button"
+                    disabled={siteSettingsBusy}
+                    onPress={() =>
+                      clearRememberedSignIns().catch(() => undefined)
+                    }
+                  >
+                    <Text style={styles.siteAction}>
+                      Clear all remembered sign-ins
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
             {protection && !protection.youtubeBestEffortAvailable ? (
               <Text style={styles.protectionHint}>
                 YouTube-specific ad filtering is unavailable in this public
@@ -496,17 +783,14 @@ export function BrowserScreen({ mode, onClose }: Props) {
             {protection ? (
               <Text style={styles.protectionHint}>
                 {isMasq
-                  ? 'Optional cookie rejection is off by default. When enabled, MASQ selects Reject on supported consent pages such as HLN and never selects Accept.'
-                  : 'Optional cookie rejection is off by default. When enabled, the browser selects Reject on supported consent pages such as HLN and never selects Accept.'}
+                  ? 'Consent rejection only uses verified Reject controls on supported consent managers. Unknown consent gates stay visible; MASQ never selects Accept.'
+                  : 'Consent rejection only uses verified Reject controls on supported consent managers. Unknown consent gates stay visible; the browser never selects Accept.'}
               </Text>
             ) : null}
             {protection ? (
               <Text style={styles.protectionHint}>
-                {Platform.OS === 'ios'
-                  ? isMasq
-                    ? 'Changes reload this page and clear private session data.'
-                    : 'Changes reload this page and clear temporary session data.'
-                  : 'Changes reload this page. Website data is cleared when the browser closes.'}
+                Filter changes reload this page. Temporary sessions remain
+                isolated; explicitly remembered sessions are not erased.
               </Text>
             ) : null}
           </>
@@ -544,7 +828,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
         </View>
       ) : null}
       <View style={styles.webContainer}>
-        {url && protection ? (
+        {url && protection && siteSettings && !siteSettingsBusy ? (
           <BrowserWebView
             key={`${mode}-webview-${webViewGeneration}`}
             ref={webView}
@@ -553,10 +837,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
             allowUniversalAccessFromFileURLs={false}
             allowsBackForwardNavigationGestures
             allowsLinkPreview={false}
-            cacheEnabled={false}
+            cacheEnabled={Boolean(siteSettings?.rememberSignIn)}
             fraudulentWebsiteWarningEnabled
             geolocationEnabled={false}
-            incognito={isMasq || Platform.OS !== 'ios'}
+            incognito={Platform.OS === 'ios' && isMasq}
             injectedJavaScript={cosmeticProtectionScript}
             injectedJavaScriptBeforeContentLoaded={cosmeticProtectionScript}
             injectedJavaScriptBeforeContentLoadedForMainFrameOnly={
@@ -587,7 +871,9 @@ export function BrowserScreen({ mode, onClose }: Props) {
               retryCount.current = 0;
               setLoading(false);
               setError(
-                isMasq
+                isEnsTarget
+                  ? `The ENS gateway returned HTTP ${nativeEvent.statusCode} for this .eth website.`
+                  : isMasq
                   ? `The website returned HTTP ${nativeEvent.statusCode} through MASQ.`
                   : `The website returned HTTP ${nativeEvent.statusCode}.`,
               );
@@ -613,7 +899,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
             sharedCookiesEnabled={false}
             source={{ uri: url }}
             style={styles.webView}
-            thirdPartyCookiesEnabled={!protection.blockCrossSiteCookies}
+            thirdPartyCookiesEnabled={
+              Boolean(siteSettings?.protectionDisabled) ||
+              !protection.blockCrossSiteCookies
+            }
             useSharedProcessPool={false}
             webviewDebuggingEnabled={false}
           />
@@ -640,22 +929,23 @@ export function BrowserScreen({ mode, onClose }: Props) {
                 : 'Browser safeguards required'}
             </Text>
             <Text style={styles.startText}>
-              {Platform.OS === 'ios'
-                ? 'Website cookies, cache and page history are not written to persistent website storage, but may remain in memory until the browser process exits.'
-                : 'Cookies and website storage are cleared when this temporary browser session starts and closes. Android WebView may still use app storage while the session is active.'}
+              Website sessions are temporary by default. You can opt in to
+              remembering a sign-in for an individual site; MASQ and Direct keep
+              separate browser profiles.
             </Text>
             <Text style={styles.startHint}>
               {protection
                 ? isMasq
                   ? 'Search with Timpi or enter a public HTTPS address to browse through MASQ.'
-                  : 'Search with Timpi or enter a public HTTPS address using your normal internet connection.'
+                  : 'Search with Timpi or enter a public HTTPS address using your normal internet connection. Direct browsing is identified by the compact badge above.'
                 : isMasq
                 ? 'Resolve browser protection above before opening a website.'
                 : 'Resolve browser safeguards above before opening a website.'}
             </Text>
             {protection ? (
               <Text style={styles.searchProvider}>
-                Free-text searches open Timpi Search.
+                Free-text searches open Timpi Search. ENS .eth websites use the
+                HTTPS eth.limo gateway.
               </Text>
             ) : null}
           </View>
@@ -715,6 +1005,28 @@ function ProtectionToggle({
   );
 }
 
+function PresetButton({
+  disabled,
+  label,
+  onPress,
+}: {
+  disabled: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={`${label} browser protection`}
+      accessibilityRole="button"
+      disabled={disabled}
+      onPress={onPress}
+      style={[styles.presetButton, disabled && styles.disabled]}
+    >
+      <Text style={styles.presetButtonText}>{label}</Text>
+    </Pressable>
+  );
+}
+
 function browserAddressError(caught: unknown): string {
   if (!(caught instanceof Error)) {
     return 'Invalid web address.';
@@ -768,23 +1080,6 @@ const styles = StyleSheet.create({
     letterSpacing: 1.2,
   },
   directBadgeText: { color: '#FFD27A' },
-  directWarning: {
-    backgroundColor: '#33250C',
-    borderColor: '#8E6720',
-    borderRadius: radii.small,
-    borderWidth: 1,
-    marginBottom: 10,
-    marginHorizontal: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-  },
-  directWarningText: {
-    color: '#FFD27A',
-    fontSize: 11,
-    fontWeight: '700',
-    lineHeight: 16,
-    textAlign: 'center',
-  },
   addressRow: {
     flexDirection: 'row',
     gap: 8,
@@ -852,6 +1147,21 @@ const styles = StyleSheet.create({
   protectionOptionEnabled: {
     borderColor: '#6B55A0',
   },
+  presetButton: {
+    alignItems: 'center',
+    backgroundColor: '#261C3E',
+    borderColor: colors.violet,
+    borderRadius: radii.small,
+    borderWidth: 1,
+    justifyContent: 'center',
+    minHeight: 34,
+    paddingHorizontal: 12,
+  },
+  presetButtonText: {
+    color: '#D8CBFF',
+    fontSize: 10,
+    fontWeight: '800',
+  },
   protectionOptionText: {
     color: colors.white,
     fontSize: 10,
@@ -862,6 +1172,28 @@ const styles = StyleSheet.create({
     fontSize: 9,
     lineHeight: 13,
     marginTop: 7,
+  },
+  siteSettings: {
+    borderTopColor: colors.line,
+    borderTopWidth: 1,
+    marginTop: 10,
+    paddingTop: 9,
+  },
+  siteSettingsTitle: {
+    color: colors.white,
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  siteActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 14,
+    marginTop: 8,
+  },
+  siteAction: {
+    color: colors.violet,
+    fontSize: 10,
+    fontWeight: '800',
   },
   protectionWarning: {
     color: '#FFD29B',

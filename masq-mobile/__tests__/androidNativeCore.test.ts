@@ -36,12 +36,17 @@ describe('Android native MASQ core integration', () => {
   );
   const rustAndroid = read('native/masq-mobile-core/src/android.rs');
   const rustCore = read('native/masq-mobile-core/src/core.rs');
+  const webViewPatch = read('patches/react-native-webview+14.0.1.patch');
+  const webViewClientSource = read(
+    'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java',
+  );
 
   it('builds and packages the real Rust node engine for supported Android ABIs', () => {
     const buildScript = read('scripts/build-rust-android.sh');
 
     expect(gradle).toContain('it.name == "preBuild"');
     expect(gradle).toContain('dependsOn(buildMasqRustAndroid)');
+    expect(gradle).toContain('dependsOn(verifyMasqWebViewProfilePatch)');
     expect(gradle).toContain('applicationId "com.endthecb2.masqmobile"');
     expect(gradle).toContain('abiFilters "arm64-v8a", "x86_64"');
     expect(gradle).toContain('-ffile-prefix-map=');
@@ -66,7 +71,9 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain(
       'def debugNodeFinderUrl = configuredNodeFinderUrl ?: "https://dev2.api.masq.ai"',
     );
-    expect(gradle).toContain('def releaseNodeFinderUrl = configuredNodeFinderUrl ?: ""');
+    expect(gradle).toContain(
+      'def releaseNodeFinderUrl = configuredNodeFinderUrl ?: ""',
+    );
     expect(gradle).toContain('tasks.register("validateReleaseNodeFinderUrl")');
     expect(gradle).toContain('dependsOn(validateReleaseNodeFinderUrl)');
     expect(gradle).toContain('parsed.rawUserInfo == null');
@@ -78,12 +85,8 @@ describe('Android native MASQ core integration', () => {
     const releaseBuilder = read('scripts/build-android-direct-release.sh');
     const apkVerifier = read('scripts/verify-android-apk-privacy.sh');
 
-    expect(releaseBuilder).toContain(
-      'MASQ_ANDROID_EXPECTED_CERT_SHA256',
-    );
-    expect(releaseBuilder).toContain(
-      'ALLOW_DEVELOPMENT_NODE_FINDER=YES',
-    );
+    expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_CERT_SHA256');
+    expect(releaseBuilder).toContain('ALLOW_DEVELOPMENT_NODE_FINDER=YES');
     expect(releaseBuilder).toContain('SIGNED_TEMP_APK');
     expect(releaseBuilder).toContain('--v4-signing-enabled false');
     expect(releaseBuilder).toContain('ci\\.invalid\\.example');
@@ -119,9 +122,7 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain(
       'mode != "blocked" && mode != "masq" && mode != "direct"',
     );
-    expect(moduleSource).toContain(
-      '.addProxyRule(BLOCKED_BROWSER_PROXY)',
-    );
+    expect(moduleSource).toContain('.addProxyRule(BLOCKED_BROWSER_PROXY)');
     expect(moduleSource).toContain(
       '.addProxyRule("http://127.0.0.1:$proxyPort")',
     );
@@ -129,21 +130,15 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain(
       'ProxyController.getInstance().clearProxyOverride(callbackExecutor)',
     );
-    expect(moduleSource).toContain(
-      'tunnelStatus.optBoolean("active", false)',
-    );
+    expect(moduleSource).toContain('tunnelStatus.optBoolean("active", false)');
     expect(directRouting).toContain(
       'if (tunnelPhase != "off" || tunnelActive)',
     );
     expect(vpnService).toContain(
       '"The MASQ packet translator stopped. Traffic remains blocked.",',
     );
-    expect(vpnService).toContain(
-      '"blocked",\n              true,',
-    );
-    expect(moduleSource).toContain(
-      'MasqCoreJni.nativeSetProxyEnabled(false)',
-    );
+    expect(vpnService).toContain('"blocked",\n              true,');
+    expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(false)');
     expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(true)');
     expect(moduleSource).toContain('browserRoutingQueue');
     expect(masqRouting).toContain(
@@ -166,11 +161,25 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).not.toContain('cdn-cgi/trace');
   });
 
+  it('blocks top-level non-GET WebView requests before Android can submit them', () => {
+    expect(webViewClientSource).toContain(
+      'shouldInterceptRequest(WebView view, WebResourceRequest request)',
+    );
+    expect(webViewClientSource).toContain('request.isForMainFrame()');
+    expect(webViewClientSource).toContain(
+      '!"GET".equalsIgnoreCase(request.getMethod())',
+    );
+    expect(webViewClientSource).toContain(
+      'Collections.singletonMap("Cache-Control", "no-store")',
+    );
+    expect(webViewClientSource).toContain(
+      'new ByteArrayInputStream(blockedBody)',
+    );
+  });
+
   it('clears Android WebView cookies and website storage in blocked mode', () => {
     const blockedRouting = moduleSource.slice(
-      moduleSource.indexOf(
-        'private fun installBlockedBrowserState(',
-      ),
+      moduleSource.indexOf('private fun installBlockedBrowserState('),
       moduleSource.indexOf(
         'private fun applyMasqBrowserRouting(request: BrowserRoutingRequest)',
       ),
@@ -190,17 +199,45 @@ describe('Android native MASQ core integration', () => {
       'clearBrowserWebsiteData(onReady, onError)',
     );
     expect(websiteDataCleanup).toContain(
-      'WebStorage.getInstance().deleteAllData()',
+      'profile?.webStorage ?: WebStorage.getInstance()',
     );
-    expect(websiteDataCleanup).toContain(
-      'cookieManager.removeAllCookies',
-    );
+    expect(websiteDataCleanup).toContain('webStorage.deleteAllData()');
+    expect(websiteDataCleanup).toContain('cookieManager.removeAllCookies');
     expect(websiteDataCleanup).toContain('cookieManager.flush()');
     expect(websiteDataCleanup).toContain('onError(error)');
     expect(websiteDataCleanup).toContain('return@removeAllCookies');
-    expect(failClosedRecovery).toContain(
-      'installBlockedBrowserState(',
+    expect(failClosedRecovery).toContain('installBlockedBrowserState(');
+  });
+
+  it('isolates remembered sign-ins by exact host and MASQ/direct profile when supported', () => {
+    expect(moduleSource).toContain('WebViewFeature.MULTI_PROFILE');
+    expect(moduleSource).toContain('ProfileStore.getInstance()');
+    expect(moduleSource).toContain('persistentSessionsSupported');
+    expect(moduleSource).toContain(
+      'override fun getBrowserSiteSettings(mode: String, hostname: String, promise: Promise)',
     );
+    expect(moduleSource).toContain('override fun setBrowserSiteSettings(');
+    expect(moduleSource).toContain('override fun clearBrowserSiteData(');
+    expect(moduleSource).toContain('override fun clearRememberedBrowserData(');
+    expect(moduleSource).toContain('sha256("site:$hostname")');
+    expect(moduleSource).toContain('temporaryBrowserProfileName("masq")');
+    expect(moduleSource).toContain('temporaryBrowserProfileName("direct")');
+    expect(moduleSource).toContain(
+      'clearRememberedBrowserStorage(clearProtectionExceptions = true)',
+    );
+    expect(webViewPatch).toContain(
+      'WebViewCompat.setProfile(webView, profileName)',
+    );
+    expect(webViewPatch).toContain(
+      'WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)',
+    );
+    expect(webViewPatch).toContain('settings.savePassword = false');
+    expect(webViewPatch).toContain('settings.saveFormData = false');
+    expect(moduleSource).not.toContain('.getCookie(');
+    expect(nativeSpec).toContain(
+      'getBrowserSiteSettings(mode: string, hostname: string): Promise<string>',
+    );
+    expect(coreFacade).toContain('persistentSessionsSupported: false');
   });
 
   it('packages a fail-closed Android system packet tunnel', () => {
@@ -246,9 +283,7 @@ describe('Android native MASQ core integration', () => {
     expect(stopDispatch).toContain(
       '.putExtra(MasqVpnService.EXTRA_STOP_REQUEST_ID, requestId)',
     );
-    expect(stopDispatch).toContain(
-      'stopAcknowledgementExecutor.schedule(',
-    );
+    expect(stopDispatch).toContain('stopAcknowledgementExecutor.schedule(');
     expect(stopDispatch).toContain('E_VPN_STOP_TIMEOUT');
     expect(stopDispatch).toContain('E_VPN_STOP_DISPATCH');
     expect(stopDispatch).toContain('if (dispatched == null)');
@@ -267,9 +302,7 @@ describe('Android native MASQ core integration', () => {
     );
     expect(vpnService).toContain('currentPhase = "blocked"');
     expect(vpnService).toContain('currentActive = true');
-    expect(vpnService).toContain(
-      'stopAcknowledgements.remove(requestId)',
-    );
+    expect(vpnService).toContain('stopAcknowledgements.remove(requestId)');
   });
 
   it('cleans up Android native executors and pending stop acknowledgements', () => {
@@ -292,9 +325,7 @@ describe('Android native MASQ core integration', () => {
     expect(invalidation).toContain(
       'operation.timeoutFuture.getAndSet(null)?.cancel(false)',
     );
-    expect(invalidation).toContain(
-      'stopAcknowledgementExecutor.shutdownNow()',
-    );
+    expect(invalidation).toContain('stopAcknowledgementExecutor.shutdownNow()');
     expect(invalidation).toContain('ioExecutor.shutdownNow()');
     expect(invalidation).toContain('super.invalidate()');
   });
@@ -338,12 +369,8 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain(
       'override fun setBrowserProtection(configJson: String, promise: Promise)',
     );
-    expect(moduleSource).toContain(
-      'fields != BROWSER_PROTECTION_FIELDS',
-    );
-    expect(moduleSource).toContain(
-      'config.opt(field) !is Boolean',
-    );
+    expect(moduleSource).toContain('fields != BROWSER_PROTECTION_FIELDS');
+    expect(moduleSource).toContain('config.opt(field) !is Boolean');
     expect(moduleSource).toContain(
       'preferences.getBoolean(BLOCK_ADS_AND_TRACKERS_KEY, true)',
     );
@@ -351,7 +378,7 @@ describe('Android native MASQ core integration', () => {
       'preferences.getBoolean(BLOCK_CROSS_SITE_COOKIES_KEY, true)',
     );
     expect(moduleSource).toContain(
-      'preferences.getBoolean(HIDE_COOKIE_BANNERS_KEY, true)',
+      'preferences.getBoolean(HIDE_COOKIE_BANNERS_KEY, false)',
     );
     expect(moduleSource).toContain(
       'preferences.getBoolean(REJECT_OPTIONAL_COOKIES_KEY, false)',
@@ -377,11 +404,7 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain(
       '.put("rejectOptionalCookies", rejectOptionalCookies)',
     );
-    expect(moduleSource).toContain(
-      '.put("nativeRequestBlocking", false)',
-    );
-    expect(moduleSource).toContain(
-      '.put("youtubeBestEffortAvailable", false)',
-    );
+    expect(moduleSource).toContain('.put("nativeRequestBlocking", false)');
+    expect(moduleSource).toContain('.put("youtubeBestEffortAvailable", false)');
   });
 });

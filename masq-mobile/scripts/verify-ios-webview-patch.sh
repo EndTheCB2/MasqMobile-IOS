@@ -15,20 +15,25 @@ fail() {
 [ -f "$PATCH_FILE" ] || \
   fail "The required react-native-webview fail-closed patch is missing."
 
-MASQ_DATA_STORE_CALL="wkWebViewConfig.websiteDataStore = masq_private_browser_data_store();"
-DIRECT_DATA_STORE_CALL="wkWebViewConfig.websiteDataStore = masq_direct_browser_data_store();"
+MASQ_DATA_STORE_CALL="masq_private_browser_data_store()"
+DIRECT_DATA_STORE_CALL="masq_direct_browser_data_store()"
+MASQ_PERSISTENT_DATA_STORE_CALL="masq_persistent_browser_data_store()"
+DIRECT_PERSISTENT_DATA_STORE_CALL="masq_direct_persistent_browser_data_store()"
 CONTENT_CONTROLLER_CALL="masq_configure_private_browser_content_controller("
-PROTECTED_CONTROLLER_SCOPE="if (_incognito || !_cacheEnabled)"
 
 for required_call in \
   "$MASQ_DATA_STORE_CALL" \
   "$DIRECT_DATA_STORE_CALL" \
-  "$CONTENT_CONTROLLER_CALL" \
-  "$PROTECTED_CONTROLLER_SCOPE"; do
+  "$MASQ_PERSISTENT_DATA_STORE_CALL" \
+  "$DIRECT_PERSISTENT_DATA_STORE_CALL" \
+  "$CONTENT_CONTROLLER_CALL"; do
   /usr/bin/grep -Fq "$required_call" "$WEBVIEW_SOURCE" || \
     fail "react-native-webview is unpatched. Run npm install without --ignore-scripts."
   /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
     fail "The persisted react-native-webview patch is incomplete."
 done
+
+(cd "$ROOT_DIR" && /usr/bin/git apply --check --reverse "$PATCH_FILE") || \
+  fail "The persisted react-native-webview patch is corrupt or does not match the installed source."
 
 echo "iOS MASQ/direct fail-closed WebView patch verified."

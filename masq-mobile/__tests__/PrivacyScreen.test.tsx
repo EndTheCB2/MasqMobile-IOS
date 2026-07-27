@@ -30,8 +30,16 @@ describe('PrivacyScreen', () => {
     expect(content).toContain(
       'stops any active MASQ connection and system routing',
     );
-    expect(content).toContain('MASQ hops and exit-country settings do not apply');
+    expect(content).toContain(
+      'MASQ hops and exit-country settings do not apply',
+    );
     expect(content).toContain('Wallet secret stays on this device');
+    expect(content).toContain('Browser sessions are temporary by default');
+    expect(content).toContain('Remember sign-in');
+    expect(content).toContain('ENS preview uses an HTTPS gateway');
+    expect(content).toContain('never falls back to search');
+    expect(content).toContain('Cookie protection is local and optional');
+    expect(content).toContain('never selects Accept');
 
     const privacyButton = renderer.root.find(
       node =>

@@ -97,7 +97,7 @@ describe('iOS native MASQ core linkage', () => {
           archiveScriptPath,
           value,
         ],
-        {encoding: 'utf8'},
+        { encoding: 'utf8' },
       ).status;
 
     expect(validate('https://nodes.example.org:443/masq')).toBe(0);
@@ -110,13 +110,25 @@ describe('iOS native MASQ core linkage', () => {
     expect(validate('https:///missing-host')).not.toBe(0);
   });
 
-  it('binds MASQ and direct WebViews to separate fail-closed ephemeral stores', () => {
-    expect(bridgeSource).toContain(
-      'WKWebsiteDataStore *masq_private_browser_data_store(void)',
-    );
-    expect(bridgeSource).toContain(
-      'WKWebsiteDataStore *masq_direct_browser_data_store(void)',
-    );
+  it('binds MASQ and direct WebViews to isolated fail-closed session stores', () => {
+    const requiredDataStoreCalls = [
+      'masq_private_browser_data_store()',
+      'masq_direct_browser_data_store()',
+      'masq_persistent_browser_data_store()',
+      'masq_direct_persistent_browser_data_store()',
+    ];
+    requiredDataStoreCalls.forEach(requiredCall => {
+      expect(browserSource).toContain(requiredCall);
+      expect(browserPatch).toContain(requiredCall);
+    });
+    [
+      'masq_private_browser_data_store(void)',
+      'masq_direct_browser_data_store(void)',
+      'masq_persistent_browser_data_store(void)',
+      'masq_direct_persistent_browser_data_store(void)',
+    ].forEach(requiredDeclaration => {
+      expect(bridgeSource).toContain(requiredDeclaration);
+    });
     expect(bridgeSource).toContain('MasqBlockedBrowserProxyPort');
     expect(bridgeSource).toContain(
       'nw_proxy_config_set_failover_allowed(proxy, false)',
@@ -125,29 +137,19 @@ describe('iOS native MASQ core linkage', () => {
       '[WKWebsiteDataStore defaultDataStore].proxyConfigurations',
     );
 
-    const requiredMasqBinding =
-      'wkWebViewConfig.websiteDataStore = masq_private_browser_data_store()';
-    const requiredDirectBinding =
-      'wkWebViewConfig.websiteDataStore = masq_direct_browser_data_store()';
-    expect(browserSource).toContain(requiredMasqBinding);
-    expect(browserSource).toContain(requiredDirectBinding);
-    expect(browserPatch).toContain(requiredMasqBinding);
-    expect(browserPatch).toContain(requiredDirectBinding);
     expect(browserSource).toContain('if (_incognito)');
-    expect(browserSource).toContain('} else if (!_cacheEnabled)');
+    expect(browserSource).toContain('} else {');
     expect(browserScreen).toContain('incognito');
-    expect(browserScreen).toContain('cacheEnabled={false}');
+    expect(browserScreen).toContain(
+      'cacheEnabled={Boolean(siteSettings?.rememberSignIn)}',
+    );
   });
 
   it('switches exact ephemeral browser modes without ever opening the MASQ store directly', () => {
-    expect(nativeSpecSource).toContain(
-      'setBrowserRoutingMode(mode: string)',
-    );
+    expect(nativeSpecSource).toContain('setBrowserRoutingMode(mode: string)');
     const routingBody = bridgeSource.slice(
       bridgeSource.indexOf('- (void)setBrowserRoutingMode:'),
-      bridgeSource.indexOf(
-        '- (std::shared_ptr<facebook::react::TurboModule>)',
-      ),
+      bridgeSource.indexOf('- (std::shared_ptr<facebook::react::TurboModule>)'),
     );
     const blockedStart = routingBody.indexOf(
       'if ([mode isEqualToString:@"blocked"])',
@@ -204,9 +206,7 @@ describe('iOS native MASQ core linkage', () => {
       'configurePrivateBrowserProxy(masqBrowserDataStore()',
     );
     expect(masqBody).toContain('@"connected"');
-    expect(masqBody).toContain(
-      '![status isKindOfClass:[NSDictionary class]]',
-    );
+    expect(masqBody).toContain('![status isKindOfClass:[NSDictionary class]]');
     expect(masqBody).toContain('port.integerValue < 1');
     expect(masqBody).toContain('port.integerValue > 65535');
     expect(masqBody).toContain(
@@ -214,11 +214,12 @@ describe('iOS native MASQ core linkage', () => {
     );
     expect(masqBody).toContain('resolve(@"masq")');
 
-    expect(
-      bridgeSource.match(/setProxyConfigurations:@\[\]/g),
-    ).toHaveLength(1);
+    expect(bridgeSource.match(/setProxyConfigurations:@\[\]/g)).toHaveLength(2);
     expect(bridgeSource).not.toContain(
       '[masqBrowserDataStore() setProxyConfigurations:@[]]',
+    );
+    expect(bridgeSource).not.toContain(
+      '[masqPersistentBrowserDataStore() setProxyConfigurations:@[]]',
     );
   });
 
@@ -238,8 +239,8 @@ describe('iOS native MASQ core linkage', () => {
       'masq_configure_private_browser_content_controller(';
     expect(browserSource).toContain(requiredBinding);
     expect(browserPatch).toContain(requiredBinding);
-    expect(browserSource).toContain('if (_incognito || !_cacheEnabled)');
-    expect(browserPatch).toContain('if (_incognito || !_cacheEnabled)');
+    expect(browserSource).not.toContain('if (_incognito || !_cacheEnabled)');
+    expect(browserPatch).not.toContain('if (_incognito || !_cacheEnabled)');
     expect(browserScreen).toContain(
       'await masqCore.prepareBrowserProtection()',
     );
@@ -249,16 +250,18 @@ describe('iOS native MASQ core linkage', () => {
       bridgeSource.indexOf('- (void)prepareBrowserProtection:'),
       bridgeSource.indexOf('- (void)setBrowserProtection:'),
     );
-    expect(preparationBody).toContain(
-      'clearProtectedBrowserDataStores',
-    );
+    expect(preparationBody).toContain('clearTemporaryBrowserDataStores');
     const protectedDataCleanupBody = bridgeSource.slice(
-      bridgeSource.indexOf('void clearProtectedBrowserDataStores('),
-      bridgeSource.indexOf('BOOL isJsonBoolean('),
+      bridgeSource.indexOf('void clearTemporaryBrowserDataStores('),
+      bridgeSource.indexOf('void clearAllBrowserDataStores('),
     );
     expect(protectedDataCleanupBody).toContain('masqBrowserDataStore()');
     expect(protectedDataCleanupBody).toContain('directBrowserDataStore()');
-    expect(protectedDataCleanupBody).toContain(
+    const genericDataCleanupBody = bridgeSource.slice(
+      bridgeSource.indexOf('void clearBrowserDataStores('),
+      bridgeSource.indexOf('void clearTemporaryBrowserDataStores('),
+    );
+    expect(genericDataCleanupBody).toContain(
       'removeDataOfTypes:WKWebsiteDataStore.allWebsiteDataTypes',
     );
     expect(preparationBody).toContain(
@@ -293,9 +296,7 @@ describe('iOS native MASQ core linkage', () => {
       '@"rejectOptionalCookies"',
       '@"youtubeBestEffort"',
     ]);
-    expect(decoderBody).toContain(
-      'dictionary.count != expectedKeys.count',
-    );
+    expect(decoderBody).toContain('dictionary.count != expectedKeys.count');
     expect(decoderBody).toContain(
       '[[NSSet setWithArray:dictionary.allKeys] isEqualToSet:expectedKeys]',
     );
@@ -308,9 +309,7 @@ describe('iOS native MASQ core linkage', () => {
     expect(defaultsBody).toContain(
       '? @([defaults boolForKey:MasqBrowserRejectOptionalCookiesKey])',
     );
-    expect(defaultsBody).toMatch(
-      /@"rejectOptionalCookies"\s*:[\s\S]*?: @NO,/,
-    );
+    expect(defaultsBody).toMatch(/@"rejectOptionalCookies"\s*:[\s\S]*?: @NO,/);
     expect(bridgeSource).toContain(
       '[preferences[@"rejectOptionalCookies"] boolValue]',
     );
@@ -322,38 +321,6 @@ describe('iOS native MASQ core linkage', () => {
     );
   });
 
-  it('hides the HLN privacy-gate host only on HLN pages without clicking consent', () => {
-    const bannerRulesBody = bridgeSource.slice(
-      bridgeSource.indexOf(
-        'NSArray<NSDictionary *> *cookieBannerRules()',
-      ),
-      bridgeSource.indexOf(
-        '#if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1',
-        bridgeSource.indexOf(
-          'NSArray<NSDictionary *> *cookieBannerRules()',
-        ),
-      ),
-    );
-    const genericSelector = bannerRulesBody.slice(
-      bannerRulesBody.indexOf('#onetrust-banner-sdk'),
-      bannerRulesBody.indexOf(
-        '}),',
-        bannerRulesBody.indexOf('#onetrust-banner-sdk'),
-      ),
-    );
-
-    expect(genericSelector).not.toContain('#pg-shadow-host-dom');
-    expect(bannerRulesBody).toContain(
-      '@"if-domain" : @[ @"hln.be", @"*.hln.be" ]',
-    );
-    expect(bannerRulesBody).toContain(
-      '@"selector" : @"#pg-shadow-host-dom"',
-    );
-    expect(bannerRulesBody).not.toContain('myprivacy.dpgmedia.be');
-    expect(bannerRulesBody.toLowerCase()).not.toContain('click');
-    expect(bannerRulesBody.toLowerCase()).not.toContain('accept');
-  });
-
   it('fails every iOS build when the fail-closed WebView patch is absent', () => {
     expect(spawnSync('bash', [webViewPatchGuardPath]).status).toBe(0);
     expect(projectSource).toContain('Verify Fail-Closed WebView Patch');
@@ -361,17 +328,14 @@ describe('iOS native MASQ core linkage', () => {
       '$(SRCROOT)/../scripts/verify-ios-webview-patch.sh',
     );
     expect(archiveScript).toContain('verify-ios-webview-patch.sh');
+    expect(webViewPatchGuard).toContain('masq_private_browser_data_store()');
+    expect(webViewPatchGuard).toContain('masq_direct_browser_data_store()');
+    expect(webViewPatchGuard).toContain('masq_persistent_browser_data_store()');
     expect(webViewPatchGuard).toContain(
-      'wkWebViewConfig.websiteDataStore = masq_private_browser_data_store();',
-    );
-    expect(webViewPatchGuard).toContain(
-      'wkWebViewConfig.websiteDataStore = masq_direct_browser_data_store();',
+      'masq_direct_persistent_browser_data_store()',
     );
     expect(webViewPatchGuard).toContain(
       'masq_configure_private_browser_content_controller(',
-    );
-    expect(webViewPatchGuard).toContain(
-      'if (_incognito || !_cacheEnabled)',
     );
   });
 
@@ -379,13 +343,11 @@ describe('iOS native MASQ core linkage', () => {
     expect(
       projectSource.match(/MASQ_PRIVATE_YOUTUBE_AD_BLOCKER=0/g),
     ).toHaveLength(2);
-    expect(bridgeSource).toContain(
-      '#if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1',
-    );
+    expect(bridgeSource).toContain('#if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1');
     expect(bridgeSource).toContain('__masqPrivateYouTubeFilter');
     expect(bridgeSource).not.toContain('googlevideo\\\\.com');
     expect(archiveScript).toContain(
-      "rg -a -l '__masqPrivateYouTubeFilter' \"$APP_PATH\"",
+      'rg -a -l \'__masqPrivateYouTubeFilter\' "$APP_PATH"',
     );
     expect(archiveScript).toContain(
       'The private YouTube filter was found in the public App Store archive.',
@@ -393,18 +355,14 @@ describe('iOS native MASQ core linkage', () => {
   });
 
   it('offers a separately signed no-NFT direct-install build with the private filter', () => {
-    expect(directInstallScript).toContain(
-      'MASQ_PRIVATE_YOUTUBE_AD_BLOCKER=1',
-    );
+    expect(directInstallScript).toContain('MASQ_PRIVATE_YOUTUBE_AD_BLOCKER=1');
     expect(directInstallScript).toContain(
       "rg -a -q '__masqPrivateYouTubeFilter'",
     );
     expect(directInstallScript).toContain(
       "rg -a -q 'E_ACCESS_PASS|checkAccessPass|NFT access'",
     );
-    expect(directInstallScript).toContain(
-      'MASQ_BUNDLE_IDENTIFIER',
-    );
+    expect(directInstallScript).toContain('MASQ_BUNDLE_IDENTIFIER');
     expect(directInstallScript).not.toMatch(
       /DEVELOPMENT_TEAM\s*=\s*[A-Z0-9]{10}/,
     );
