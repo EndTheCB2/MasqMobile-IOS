@@ -18,6 +18,17 @@ The Android package ID is `com.endthecb2.masqmobile`.
 
 ## Install
 
+### One-time migration from preview.1
+
+`1.0.0-preview.2` establishes a new permanent Android signing certificate because the password for
+the preview.1 signing key was no longer available. Android therefore cannot install preview.2 over
+preview.1.
+
+Before removing preview.1, write down and verify the wallet's 12-word recovery phrase offline.
+Then uninstall preview.1 and install preview.2 using the steps below. Uninstalling without that
+backup permanently removes the locally encrypted wallet and profile. New installations are not
+affected. Releases after preview.2 must keep the preview.2 certificate.
+
 1. On the Android phone, open the official GitHub Release page.
 2. Download the file named `MASQ-Mobile-Android-v*.apk`. Do not install an APK forwarded through a
    chat message or hosted elsewhere.
@@ -35,17 +46,18 @@ system dialog is expected; MASQ Mobile cannot grant the permission itself.
 ## Check the download
 
 The Release contains `SHA256SUMS.txt` and `SIGNING-CERTIFICATE.txt`. A technical user can compare
-the APK's SHA-256 checksum with `SHA256SUMS.txt`. Every update must have the same signing-certificate
-fingerprint and a higher Android version code.
+the APK's SHA-256 checksum with `SHA256SUMS.txt`. Preview.2 uses certificate SHA-256
+`346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`. Every later update must have
+this same signing-certificate fingerprint and a higher Android version code.
 
 Never install a file when its checksum differs from the value published in the same GitHub
 Release.
 
 ## Update or remove
 
-GitHub installations do not update automatically. Download a newer APK from the same repository
-and install it over the existing app. Android preserves local app data only when the application
-ID and signing certificate match.
+GitHub installations do not update automatically. Starting with preview.2, download a newer APK
+from the same repository and install it over the existing app. Android preserves local app data
+only when the application ID and signing certificate match.
 
 Back up the wallet recovery phrase before uninstalling. Uninstalling MASQ Mobile removes its local
 profile and encrypted wallet data. The recovery phrase is never recoverable from the signing key
