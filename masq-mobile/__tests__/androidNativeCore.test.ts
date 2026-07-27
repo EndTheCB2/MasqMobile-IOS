@@ -25,6 +25,9 @@ describe('Android native MASQ core integration', () => {
     '../masq-node-mobile/node/src/daemon/launch_verifier.rs',
   );
   const manifest = read('android/app/src/main/AndroidManifest.xml');
+  const mainActivity = read(
+    'android/app/src/main/java/com/masqmobile/MainActivity.kt',
+  );
   const vpnService = read(
     'android/app/src/main/java/com/masqmobile/MasqVpnService.kt',
   );
@@ -100,9 +103,11 @@ describe('Android native MASQ core integration', () => {
       'MASQ_ANDROID_KEY_ALIAS="${MASQ_ANDROID_KEY_ALIAS:-masq-mobile-preview2}"',
     );
     expect(releaseBuilder).toContain('SIGNED_TEMP_APK');
+    expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(releaseBuilder).toContain('--v4-signing-enabled false');
     expect(releaseBuilder).toContain('ci\\.invalid\\.example');
     expect(apkVerifier).toContain('com.endthecb2.masqmobile');
+    expect(apkVerifier).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(apkVerifier).toContain('CN=Android Debug');
     expect(apkVerifier).toContain('--verbose --print-certs --Werr');
     expect(apkVerifier).toContain('/Users/[A-Za-z0-9._-]+');
@@ -113,6 +118,11 @@ describe('Android native MASQ core integration', () => {
       'Verify Android native linkage in the assembled APK',
     );
     expect(mobileCi).toContain('npm run verify:android:native:apk');
+  });
+
+  it('protects wallet entry and app previews from Android screen capture', () => {
+    expect(mainActivity).toContain('WindowManager.LayoutParams.FLAG_SECURE');
+    expect(mainActivity).toContain('window.addFlags');
   });
 
   it('supports explicit blocked, MASQ, and direct WebView routing modes', () => {

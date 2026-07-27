@@ -106,8 +106,8 @@ android {
         applicationId "com.endthecb2.masqmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 3
-        versionName "1.0.0-preview.3"
+        versionCode 4
+        versionName "1.0.0-preview.4"
         ndk {
             // The embedded MASQ core is built for modern 64-bit devices and emulators.
             abiFilters "arm64-v8a", "x86_64"

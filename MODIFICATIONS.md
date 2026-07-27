@@ -7,7 +7,8 @@ areas:
 - embedded, consume-only runtime lifecycle for iOS and Android;
 - mobile-safe network discovery, route selection, proxying, and status reporting;
 - configurable hop count and exit-location preferences;
-- wallet import and mobile persistence bridges;
+- wallet import and mobile persistence bridges, with masked recovery-word entry, autofill opt-out
+  and Android screen-capture protection;
 - settlement, receipt-session, and database migration support required by the embedded runtime;
 - React Native user interface and native WebView integration with explicit `blocked`, `masq` and
   `direct` routing states, structurally separate non-persistent iOS data stores and no automatic

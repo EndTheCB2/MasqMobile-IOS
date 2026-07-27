@@ -14,7 +14,7 @@ Download the signed APK, checksum, and signing-certificate fingerprint only from
 distributed outside Google Play, does not update automatically, and has not completed an
 independent mobile security audit.
 
-Preview.2 started the permanent Android signing lineage retained by preview.3 and later. Preview.1
+Preview.2 started the permanent Android signing lineage retained by preview.4 and later. Preview.1
 users must first back up their 12-word recovery phrase, uninstall preview.1, and then install the
 current preview. Preview.2 users can update in place. See the installation guide for the
 certificate fingerprint and migration warning.

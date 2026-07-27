@@ -18,12 +18,12 @@ The Android package ID is `com.endthecb2.masqmobile`.
 
 ## Install
 
-### Updating from preview.2
+### Updating from preview.2 or later
 
-Preview.3 fixes the Android native MASQ-core packaging in preview.2. Install preview.3 directly
-over preview.2; do not uninstall or reset the app. It uses the same package ID and permanent
-signing certificate, so Android preserves the encrypted wallet, browser settings, and network
-profile.
+Preview.3 fixed the Android native MASQ-core packaging in preview.2. Preview.4 and later can be
+installed directly over preview.2 or preview.3; do not uninstall or reset the app. They use the
+same package ID and permanent signing certificate, so Android preserves the encrypted wallet,
+browser settings, and network profile.
 
 ### One-time migration from preview.1
 
