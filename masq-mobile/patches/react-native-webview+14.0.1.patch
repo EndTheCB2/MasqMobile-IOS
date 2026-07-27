@@ -1,8 +1,156 @@
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+index 209b855..7a1d27a 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+@@ -32,6 +32,9 @@ import com.reactnativecommunity.webview.events.TopRenderProcessGoneEvent;
+ import com.reactnativecommunity.webview.events.TopShouldStartLoadWithRequestEvent;
+ import android.webkit.CookieManager;
+ 
++import java.io.ByteArrayInputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.Collections;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+ public class RNCWebViewClient extends WebViewClient {
+@@ -85,6 +88,15 @@ public class RNCWebViewClient extends WebViewClient {
+ 
+     @Override
+     public boolean shouldOverrideUrlLoading(WebView view, String url) {
++        return shouldOverrideUrlLoadingWithMetadata(view, url, "other", false, false);
++    }
++
++    private boolean shouldOverrideUrlLoadingWithMetadata(
++            WebView view,
++            String url,
++            String navigationType,
++            boolean hasGesture,
++            boolean isRedirect) {
+         final RNCWebView rncWebView = (RNCWebView) view;
+         final boolean isJsDebugging = rncWebView.getReactApplicationContext().getJavaScriptContextHolder().get() == 0;
+ 
+@@ -94,6 +106,9 @@ public class RNCWebViewClient extends WebViewClient {
+             final AtomicReference<RNCWebViewModuleImpl.ShouldOverrideUrlLoadingLock.ShouldOverrideCallbackState> lockObject = lock.second;
+ 
+             final WritableMap event = createWebViewEvent(view, url);
++            event.putString("navigationType", navigationType);
++            event.putBoolean("hasGesture", hasGesture);
++            event.putBoolean("isRedirect", isRedirect);
+             event.putDouble("lockIdentifier", lockIdentifier);
+             rncWebView.dispatchDirectShouldStartLoadWithRequest(event);
+ 
+@@ -125,9 +140,13 @@ public class RNCWebViewClient extends WebViewClient {
+             progressChangedFilter.setWaitingForCommandLoadUrl(true);
+ 
+             int reactTag = RNCWebViewWrapper.getReactTagFromWebView(view);
++            final WritableMap event = createWebViewEvent(view, url);
++            event.putString("navigationType", navigationType);
++            event.putBoolean("hasGesture", hasGesture);
++            event.putBoolean("isRedirect", isRedirect);
+             UIManagerHelper.getEventDispatcherForReactTag((ReactContext) view.getContext(), reactTag).dispatchEvent(new TopShouldStartLoadWithRequestEvent(
+                     reactTag,
+-                    createWebViewEvent(view, url)));
++                    event));
+             return true;
+         }
+     }
+@@ -135,7 +154,35 @@ public class RNCWebViewClient extends WebViewClient {
+     @Override
+     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+         final String url = request.getUrl().toString();
+-        return this.shouldOverrideUrlLoading(view, url);
++        final String method = request.getMethod();
++        final String navigationType =
++                method != null && !"GET".equalsIgnoreCase(method) ? "formsubmit" :
++                request.hasGesture() ? "click" :
++                "other";
++        return shouldOverrideUrlLoadingWithMetadata(
++                view,
++                url,
++                navigationType,
++                request.hasGesture(),
++                request.isRedirect());
++    }
++
++    @Override
++    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
++        if (request.isForMainFrame() && !"GET".equalsIgnoreCase(request.getMethod())) {
++            final byte[] blockedBody =
++                    "MASQ Mobile blocked this form submission to protect your browser session."
++                            .getBytes(StandardCharsets.UTF_8);
++            return new WebResourceResponse(
++                    "text/plain",
++                    StandardCharsets.UTF_8.name(),
++                    403,
++                    "Forbidden",
++                    Collections.singletonMap("Cache-Control", "no-store"),
++                    new ByteArrayInputStream(blockedBody));
++        }
++
++        return super.shouldInterceptRequest(view, request);
+     }
+ 
+     @Override
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+index f83033b..eda24ed 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+@@ -16,6 +16,7 @@ import android.webkit.DownloadListener
+ import android.webkit.WebSettings
+ import android.webkit.WebView
+ import androidx.webkit.WebSettingsCompat
++import androidx.webkit.WebViewCompat
+ import androidx.webkit.WebViewFeature
+ import com.facebook.react.bridge.ReadableArray
+ import com.facebook.react.bridge.ReadableMap
+@@ -65,6 +66,19 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+ 
+     fun createViewInstance(context: ThemedReactContext): RNCWebViewWrapper {
+       val webView = createRNCWebViewInstance(context)
++      val profileName =
++          context
++              .getSharedPreferences("masq-mobile-consumer", android.content.Context.MODE_PRIVATE)
++              .getString("browser-profile.active", null)
++      if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
++          if (
++              profileName == null ||
++              !profileName.matches(Regex("^masq_(masq|direct)_[a-f0-9]{64}$"))
++          ) {
++              throw IllegalStateException("MASQ browser profile was not prepared before WebView creation.")
++          }
++          WebViewCompat.setProfile(webView, profileName)
++      }
+       return createViewInstance(context, webView);
+     }
+ 
+@@ -76,6 +90,8 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+         settings.builtInZoomControls = true
+         settings.displayZoomControls = false
+         settings.domStorageEnabled = true
++        settings.savePassword = false
++        settings.saveFormData = false
+         settings.setSupportMultipleWindows(true)
+         settings.allowFileAccess = false
+         settings.allowContentAccess = false
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt
+index da4eb96..29ec849 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt
+@@ -13,7 +13,9 @@ class TopShouldStartLoadWithRequestEvent(viewId: Int, private val mData: Writabl
+   }
+ 
+   init {
+-    mData.putString("navigationType", "other")
++    if (!mData.hasKey("navigationType")) {
++      mData.putString("navigationType", "other")
++    }
+     // Android does not raise shouldOverrideUrlLoading for inner frames
+     mData.putBoolean("isTopFrame", true)
+   }
 diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
-index 266b0c1..a3f3c2d 100644
+index 3890426..8158aa2 100644
 --- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
 +++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
-@@ -17,6 +17,16 @@
+@@ -17,6 +17,18 @@
  
  #import "objc/runtime.h"
  
@@ -12,6 +160,8 @@ index 266b0c1..a3f3c2d 100644
 +// network when the private data-store contract is missing.
 +extern WKWebsiteDataStore *masq_private_browser_data_store(void);
 +extern WKWebsiteDataStore *masq_direct_browser_data_store(void);
++extern WKWebsiteDataStore *masq_persistent_browser_data_store(void);
++extern WKWebsiteDataStore *masq_direct_persistent_browser_data_store(void);
 +extern void masq_configure_private_browser_content_controller(
 +    WKUserContentController *controller);
 +#endif
@@ -19,32 +169,35 @@ index 266b0c1..a3f3c2d 100644
  static NSTimer *keyboardTimer;
  static NSString *const HistoryShimName = @"ReactNativeHistoryShim";
  static NSString *const MessageHandlerName = @"ReactNativeWebView";
-@@ -459,7 +468,15 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
+@@ -459,15 +471,31 @@ - (WKWebViewConfiguration *)setUpWkWebViewConfig
+   if (_prefsUsed) {
      wkWebViewConfig.preferences = prefs;
    }
-   if (_incognito) {
 +#if TARGET_OS_IOS
-+    wkWebViewConfig.websiteDataStore = masq_private_browser_data_store();
++  if (_incognito) {
++    wkWebViewConfig.websiteDataStore = _cacheEnabled
++        ? masq_persistent_browser_data_store()
++        : masq_private_browser_data_store();
++  } else {
++    wkWebViewConfig.websiteDataStore = _cacheEnabled
++        ? masq_direct_persistent_browser_data_store()
++        : masq_direct_browser_data_store();
++  }
 +#else
+   if (_incognito) {
      wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
-+#endif
-+#if TARGET_OS_IOS
-+  } else if (!_cacheEnabled) {
-+    wkWebViewConfig.websiteDataStore = masq_direct_browser_data_store();
-+#endif
    } else if (_cacheEnabled) {
      wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
    }
-@@ -473,5 +491,11 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
++#endif
+   if(self.useSharedProcessPool) {
+     wkWebViewConfig.processPool = [[RNCWKProcessPoolManager sharedManager] sharedProcessPool];
    }
    wkWebViewConfig.userContentController = [WKUserContentController new];
 +#if TARGET_OS_IOS
-+  if (_incognito || !_cacheEnabled) {
-+    masq_configure_private_browser_content_controller(
-+        wkWebViewConfig.userContentController);
-+  }
++  masq_configure_private_browser_content_controller(
++      wkWebViewConfig.userContentController);
 +#endif
--
-+
+ 
  #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* iOS 13 */
    if (@available(iOS 13.0, *)) {

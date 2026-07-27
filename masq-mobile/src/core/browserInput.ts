@@ -1,4 +1,4 @@
-import { normalizeBrowserUrl } from './config';
+import { resolveBrowserUrlTarget, type BrowserTarget } from './browserTarget';
 
 export const TIMPI_HOME_URL = 'https://timpi.com/';
 export const TIMPI_SEARCH_URL = 'https://timpi.com/search';
@@ -8,16 +8,25 @@ const NON_SEARCH_SCHEME_PATTERN =
 const CUSTOM_SCHEME_PATTERN = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//;
 
 export function resolveBrowserInput(input: string): string {
+  return resolveBrowserInputTarget(input).transportUrl;
+}
+
+export function resolveBrowserInputTarget(input: string): BrowserTarget {
   const candidate = input.trim();
   if (!candidate) {
     throw new Error('Enter a web address or search term.');
   }
 
   if (looksLikeWebAddress(candidate)) {
-    return normalizeBrowserUrl(candidate);
+    return resolveBrowserUrlTarget(candidate);
   }
 
-  return `${TIMPI_SEARCH_URL}?q=${encodeURIComponent(candidate)}`;
+  const searchUrl = `${TIMPI_SEARCH_URL}?q=${encodeURIComponent(candidate)}`;
+  return {
+    displayUrl: searchUrl,
+    isEns: false,
+    transportUrl: searchUrl,
+  };
 }
 
 function looksLikeWebAddress(candidate: string): boolean {

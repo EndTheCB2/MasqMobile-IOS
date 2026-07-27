@@ -22,7 +22,7 @@
     "verify": "npm run typecheck && npm run lint && npm test -- --runInBand && npm run test:core",
     "verify:ci:linux": "npm run typecheck && npm run lint && npm run test:ci:linux && npm run test:core && npm run test:engine && npm run test:tunnel && npm run verify:privacy",
     "verify:android:apk": "bash scripts/verify-android-apk-privacy.sh",
-    "verify:privacy": "bash scripts/verify-source-privacy.sh",
+    "verify:privacy": "bash scripts/verify-source-privacy.sh && bash scripts/verify-android-webview-patch.sh",
     "verify:all": "npm run verify && npm run test:engine && npm run test:tunnel && npm run verify:privacy"
   },
   "codegenConfig": {

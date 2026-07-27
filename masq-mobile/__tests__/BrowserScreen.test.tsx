@@ -1,5 +1,5 @@
 import React from 'react';
-import { Platform, TextInput } from 'react-native';
+import { TextInput } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 
 import type {
@@ -75,9 +75,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('first.example');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const webView = renderer.root.findByProps({ testID: 'private-webview' });
     ReactTestRenderer.act(() => {
       webView.props.onError({
@@ -89,8 +87,8 @@ describe('BrowserScreen recovery lifecycle', () => {
       });
       address.props.onChangeText('second.example');
     });
+    await submitAddress(address);
     ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
       jest.advanceTimersByTime(5000);
     });
 
@@ -105,9 +103,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const privateWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
@@ -142,9 +138,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('private mobile browser');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
 
     expect(
       renderer.root.findByProps({ testID: 'private-webview' }).props.source,
@@ -154,15 +148,33 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('opens ENS names through eth.limo while keeping the logical address visible', async () => {
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('project.eth/docs?q=1#intro');
+    });
+    await submitAddress(address);
+
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({
+      uri: 'https://project.eth.limo/docs?q=1#intro',
+    });
+    expect(renderer.root.findByType(TextInput).props.value).toBe(
+      'https://project.eth/docs?q=1#intro',
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('applies fail-closed private-session WebView settings', async () => {
     const renderer = await renderBrowser();
     const address = renderer.root.findByType(TextInput);
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const privateWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
@@ -196,20 +208,20 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('www.deredactie.be');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     let privateWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
 
     let allowed = true;
-    ReactTestRenderer.act(() => {
+    await ReactTestRenderer.act(async () => {
       allowed = privateWebView.props.onShouldStartLoadWithRequest({
         isTopFrame: true,
         navigationType: 'other',
         url: 'http://deredactie.be/',
       });
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
     expect(allowed).toBe(false);
@@ -226,9 +238,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     let privateWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
@@ -294,6 +304,136 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('does not mount a destination before its isolated profile is selected', async () => {
+    let resolveSecondSite!: (
+      value: Awaited<ReturnType<typeof masqCore.getBrowserSiteSettings>>,
+    ) => void;
+    const getSiteSettings = jest
+      .spyOn(masqCore, 'getBrowserSiteSettings')
+      .mockImplementation(async (mode, hostname) => {
+        if (hostname === 'second.example') {
+          return new Promise(resolve => {
+            resolveSecondSite = resolve;
+          });
+        }
+        return {
+          hostname,
+          mode,
+          persistentSessionsSupported: true,
+          protectionDisabled: false,
+          rememberSignIn: hostname === 'first.example',
+        };
+      });
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('first.example');
+    });
+    await ReactTestRenderer.act(async () => {
+      address.props.onSubmitEditing();
+      await Promise.resolve();
+    });
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({ uri: 'https://first.example/' });
+
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('second.example');
+    });
+    await ReactTestRenderer.act(async () => {
+      address.props.onSubmitEditing();
+      await Promise.resolve();
+    });
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+
+    await ReactTestRenderer.act(async () => {
+      resolveSecondSite({
+        hostname: 'second.example',
+        mode: 'masq',
+        persistentSessionsSupported: true,
+        protectionDisabled: false,
+        rememberSignIn: false,
+      });
+      await Promise.resolve();
+    });
+    expect(getSiteSettings).toHaveBeenLastCalledWith(
+      'masq',
+      'second.example',
+    );
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({ uri: 'https://second.example/' });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('switches profiles for cross-site links and server redirects', async () => {
+    const getSiteSettings = jest
+      .spyOn(masqCore, 'getBrowserSiteSettings')
+      .mockImplementation(async (mode, hostname) => ({
+        hostname,
+        mode,
+        persistentSessionsSupported: true,
+        protectionDisabled: false,
+        rememberSignIn: false,
+      }));
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('first.example');
+    });
+    await ReactTestRenderer.act(async () => {
+      address.props.onSubmitEditing();
+      await Promise.resolve();
+    });
+
+    let webView = renderer.root.findByProps({ testID: 'private-webview' });
+    let allowed = true;
+    await ReactTestRenderer.act(async () => {
+      allowed = webView.props.onShouldStartLoadWithRequest({
+        hasGesture: true,
+        isRedirect: false,
+        isTopFrame: true,
+        navigationType: 'click',
+        url: 'https://second.example/',
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(allowed).toBe(false);
+    expect(getSiteSettings).toHaveBeenLastCalledWith(
+      'masq',
+      'second.example',
+    );
+    webView = renderer.root.findByProps({ testID: 'private-webview' });
+    expect(webView.props.source).toEqual({
+      uri: 'https://second.example/',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      allowed = webView.props.onShouldStartLoadWithRequest({
+        hasGesture: false,
+        isRedirect: true,
+        isTopFrame: true,
+        navigationType: 'other',
+        url: 'https://login.example/',
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(allowed).toBe(false);
+    expect(getSiteSettings).toHaveBeenLastCalledWith(
+      'masq',
+      'login.example',
+    );
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({ uri: 'https://login.example/' });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('keeps navigation disabled after preparation fails and retries safely', async () => {
     mockPrepareBrowserProtection
       .mockRejectedValueOnce(new Error('Native content rules are unavailable.'))
@@ -348,13 +488,13 @@ describe('BrowserScreen recovery lifecycle', () => {
     for (const label of [
       'Ads & trackers',
       'Cross-site cookies',
-      'Cookie banners',
+      'Hide resolved banners',
       'Reject optional cookies',
     ]) {
       expect(findProtectionToggle(renderer, label)).toBeDefined();
     }
     expect(JSON.stringify(renderer.toJSON())).toContain(
-      'Optional cookie rejection is off by default',
+      'Consent rejection only uses verified Reject controls',
     );
 
     ReactTestRenderer.act(() => {
@@ -377,7 +517,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     for (const label of [
       'Ads & trackers',
       'Cross-site cookies',
-      'Cookie banners',
+      'Hide resolved banners',
     ]) {
       expect(
         findProtectionToggle(renderer, label).props.accessibilityState,
@@ -394,7 +534,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       disabled: false,
     });
     expect(JSON.stringify(renderer.toJSON())).toContain(
-      'Optional cookie rejection is off by default',
+      'Consent rejection only uses verified Reject controls',
     );
     expect(JSON.stringify(renderer.toJSON())).toContain('never selects Accept');
     expect(
@@ -410,9 +550,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const webView = renderer.root.findByProps({ testID: 'private-webview' });
     expect(webView.props.injectedJavaScript).toContain('[data-ad-slot]');
     expect(webView.props.injectedJavaScript).toContain('#onetrust-banner-sdk');
@@ -435,9 +573,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const initialWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
@@ -496,6 +632,57 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('opts a single MASQ site into its isolated remembered profile', async () => {
+    jest.spyOn(masqCore, 'getBrowserSiteSettings').mockResolvedValue({
+      hostname: 'example.com',
+      mode: 'masq',
+      persistentSessionsSupported: true,
+      protectionDisabled: false,
+      rememberSignIn: false,
+    });
+    const setSiteSettings = jest
+      .spyOn(masqCore, 'setBrowserSiteSettings')
+      .mockResolvedValue({
+        hostname: 'example.com',
+        mode: 'masq',
+        persistentSessionsSupported: true,
+        protectionDisabled: false,
+        rememberSignIn: true,
+      });
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('example.com');
+    });
+    await ReactTestRenderer.act(async () => {
+      address.props.onSubmitEditing();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expandProtectionSettings(renderer);
+
+    await ReactTestRenderer.act(async () => {
+      findProtectionToggle(
+        renderer,
+        'Remember sign-in for this site',
+      ).props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(setSiteSettings).toHaveBeenCalledWith(
+      'masq',
+      'example.com',
+      true,
+      false,
+    );
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props,
+    ).toMatchObject({
+      cacheEnabled: true,
+    });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('keeps the Android cookie prop aligned with the native preference', async () => {
     const renderer = await renderBrowser();
     expandProtectionSettings(renderer);
@@ -503,9 +690,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     expect(
       renderer.root.findByProps({ testID: 'private-webview' }).props
         .thirdPartyCookiesEnabled,
@@ -600,10 +785,10 @@ describe('BrowserScreen recovery lifecycle', () => {
     const renderer = await renderBrowser('direct');
     const initialContent = JSON.stringify(renderer.toJSON());
     expect(initialContent).toContain('DIRECT · MASQ OFF');
-    expect(initialContent).toContain(
+    expect(initialContent).not.toContain(
       'public IP of your current connection or VPN',
     );
-    expect(initialContent).toContain('not routed through MASQ');
+    expect(initialContent).not.toContain('not routed through MASQ');
     expect(initialContent).toContain('Direct browser ready');
     expect(initialContent).not.toContain('MASQ PRIVATE');
     expect(initialContent).not.toContain('Private session ready');
@@ -630,9 +815,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
 
     const directWebView = renderer.root.findByProps({
       testID: 'private-webview',
@@ -642,7 +825,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       allowFileAccessFromFileURLs: false,
       allowUniversalAccessFromFileURLs: false,
       cacheEnabled: false,
-      incognito: Platform.OS !== 'ios',
+      incognito: false,
       mixedContentMode: 'never',
       sharedCookiesEnabled: false,
       thirdPartyCookiesEnabled: false,
@@ -663,9 +846,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
     const directWebView = renderer.root.findByProps({
       testID: 'private-webview',
     });
@@ -692,9 +873,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => {
       address.props.onChangeText('http://example.com');
     });
-    ReactTestRenderer.act(() => {
-      address.props.onSubmitEditing();
-    });
+    await submitAddress(address);
 
     const content = JSON.stringify(renderer.toJSON());
     expect(content).toContain('This browser only allows HTTPS addresses');
@@ -714,6 +893,16 @@ async function renderBrowser(mode: 'masq' | 'direct' = 'masq') {
   });
   expect(mockPrepareBrowserProtection).toHaveBeenCalledTimes(1);
   return renderer;
+}
+
+async function submitAddress(
+  address: ReactTestRenderer.ReactTestInstance,
+) {
+  await ReactTestRenderer.act(async () => {
+    address.props.onSubmitEditing();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 function findProtectionToggle(

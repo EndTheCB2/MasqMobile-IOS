@@ -27,13 +27,19 @@ NSString *const MasqBrowserRejectOptionalCookiesKey =
     @"MASQBrowserRejectOptionalCookies";
 NSString *const MasqBrowserYouTubeBestEffortKey =
     @"MASQBrowserYouTubeBestEffort";
+NSString *const MasqBrowserRememberedMasqSitesKey =
+    @"MASQBrowserRememberedMasqSitesV1";
+NSString *const MasqBrowserRememberedDirectSitesKey =
+    @"MASQBrowserRememberedDirectSitesV1";
+NSString *const MasqBrowserProtectionDisabledSitesKey =
+    @"MASQBrowserProtectionDisabledSitesV1";
 
 NSString *const MasqBrowserCookieRulesIdentifier =
-    @"ai.masq.mobile.browser.cookies.v1";
+    @"ai.masq.mobile.browser.cookies.v2";
 NSString *const MasqBrowserAdRulesIdentifier =
-    @"ai.masq.mobile.browser.ads.v1";
+    @"ai.masq.mobile.browser.ads.v2";
 NSString *const MasqBrowserBannerRulesIdentifier =
-    @"ai.masq.mobile.browser.cookie-banners.v1";
+    @"ai.masq.mobile.browser.cookie-banners.v2";
 #if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1
 NSString *const MasqBrowserYouTubeRulesIdentifier =
     @"ai.masq.mobile.browser.youtube-private.v1";
@@ -130,10 +136,52 @@ WKWebsiteDataStore *directBrowserDataStore() {
   return dataStore;
 }
 
-void clearProtectedBrowserDataStores(void (^completion)(void)) {
+WKWebsiteDataStore *masqPersistentBrowserDataStore() {
+  static WKWebsiteDataStore *dataStore = nil;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    if (@available(iOS 17.0, *)) {
+      NSUUID *identifier = [[NSUUID alloc]
+          initWithUUIDString:@"F29BA5A5-B51C-4B1B-9D4F-1295CF5301A1"];
+      dataStore = [WKWebsiteDataStore dataStoreForIdentifier:identifier];
+    } else {
+      dataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    }
+    configurePrivateBrowserProxy(dataStore, MasqBlockedBrowserProxyPort);
+  });
+  return dataStore;
+}
+
+WKWebsiteDataStore *directPersistentBrowserDataStore() {
+  static WKWebsiteDataStore *dataStore = nil;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    if (@available(iOS 17.0, *)) {
+      NSUUID *identifier = [[NSUUID alloc]
+          initWithUUIDString:@"6C647FF5-9744-4CC6-B0B9-E66D0D91D4BC"];
+      dataStore = [WKWebsiteDataStore dataStoreForIdentifier:identifier];
+    } else {
+      dataStore = [WKWebsiteDataStore nonPersistentDataStore];
+    }
+    configurePrivateBrowserProxy(dataStore, MasqBlockedBrowserProxyPort);
+  });
+  return dataStore;
+}
+
+NSArray<WKWebsiteDataStore *> *allBrowserDataStores() {
+  return @[
+    masqBrowserDataStore(),
+    directBrowserDataStore(),
+    masqPersistentBrowserDataStore(),
+    directPersistentBrowserDataStore(),
+  ];
+}
+
+void clearBrowserDataStores(
+    NSArray<WKWebsiteDataStore *> *dataStores,
+    void (^completion)(void)) {
   dispatch_group_t group = dispatch_group_create();
-  for (WKWebsiteDataStore *dataStore in
-       @[ masqBrowserDataStore(), directBrowserDataStore() ]) {
+  for (WKWebsiteDataStore *dataStore in dataStores) {
     dispatch_group_enter(group);
     [dataStore
         removeDataOfTypes:WKWebsiteDataStore.allWebsiteDataTypes
@@ -143,6 +191,140 @@ void clearProtectedBrowserDataStores(void (^completion)(void)) {
         }];
   }
   dispatch_group_notify(group, dispatch_get_main_queue(), completion);
+}
+
+void clearTemporaryBrowserDataStores(void (^completion)(void)) {
+  clearBrowserDataStores(
+      @[ masqBrowserDataStore(), directBrowserDataStore() ], completion);
+}
+
+void clearAllBrowserDataStores(void (^completion)(void)) {
+  clearBrowserDataStores(allBrowserDataStores(), completion);
+}
+
+BOOL isSafeBrowserHostname(NSString *hostname) {
+  if (![hostname isKindOfClass:[NSString class]] || hostname.length < 3 ||
+      hostname.length > 253 ||
+      ![hostname isEqualToString:hostname.lowercaseString] ||
+      [hostname hasSuffix:@"."] || [hostname isEqualToString:@"localhost"] ||
+      [hostname hasSuffix:@".local"] || [hostname rangeOfString:@"."].location ==
+          NSNotFound) {
+    return NO;
+  }
+  NSRegularExpression *expression = [NSRegularExpression
+      regularExpressionWithPattern:
+          @"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+                         options:0
+                           error:nil];
+  return [expression firstMatchInString:hostname
+                                options:0
+                                  range:NSMakeRange(0, hostname.length)] != nil;
+}
+
+NSString *_Nullable rememberedSitesKeyForMode(NSString *mode) {
+  if ([mode isEqualToString:@"masq"]) {
+    return MasqBrowserRememberedMasqSitesKey;
+  }
+  if ([mode isEqualToString:@"direct"]) {
+    return MasqBrowserRememberedDirectSitesKey;
+  }
+  return nil;
+}
+
+WKWebsiteDataStore *_Nullable persistentBrowserDataStoreForMode(
+    NSString *mode) {
+  if ([mode isEqualToString:@"masq"]) {
+    return masqPersistentBrowserDataStore();
+  }
+  if ([mode isEqualToString:@"direct"]) {
+    return directPersistentBrowserDataStore();
+  }
+  return nil;
+}
+
+NSMutableSet<NSString *> *savedBrowserHostnameSet(NSString *key) {
+  NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:key] ?: @[];
+  NSMutableSet<NSString *> *result = [NSMutableSet set];
+  for (id value in saved) {
+    if ([value isKindOfClass:[NSString class]] &&
+        isSafeBrowserHostname((NSString *)value)) {
+      [result addObject:value];
+    }
+  }
+  return result;
+}
+
+void saveBrowserHostnameSet(NSSet<NSString *> *hostnames, NSString *key) {
+  NSArray<NSString *> *sorted =
+      [hostnames.allObjects sortedArrayUsingSelector:@selector(compare:)];
+  [NSUserDefaults.standardUserDefaults setObject:sorted forKey:key];
+}
+
+NSArray<NSString *> *browserProtectionDisabledDomains() {
+  NSSet<NSString *> *hostnames =
+      savedBrowserHostnameSet(MasqBrowserProtectionDisabledSitesKey);
+  NSMutableArray<NSString *> *domains = [NSMutableArray array];
+  for (NSString *hostname in hostnames) {
+    [domains addObject:hostname];
+    [domains addObject:[@"*" stringByAppendingString:hostname]];
+  }
+  return domains;
+}
+
+NSDictionary *browserSiteSettingsResponse(
+    NSString *mode,
+    NSString *hostname) {
+  NSString *rememberedKey = rememberedSitesKeyForMode(mode);
+  NSSet<NSString *> *remembered =
+      rememberedKey ? savedBrowserHostnameSet(rememberedKey) : [NSSet set];
+  NSSet<NSString *> *disabled =
+      savedBrowserHostnameSet(MasqBrowserProtectionDisabledSitesKey);
+  return @{
+    @"hostname" : hostname,
+    @"mode" : mode,
+    @"persistentSessionsSupported" : @YES,
+    @"protectionDisabled" : @([disabled containsObject:hostname]),
+    @"rememberSignIn" : @([remembered containsObject:hostname]),
+  };
+}
+
+NSString *_Nullable serializeBrowserSiteSettings(
+    NSDictionary *settings) {
+  NSData *data =
+      [NSJSONSerialization dataWithJSONObject:settings options:0 error:nil];
+  return data
+      ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+      : nil;
+}
+
+void clearBrowserWebsiteDataForHostname(
+    WKWebsiteDataStore *dataStore,
+    NSString *hostname,
+    void (^completion)(void)) {
+  NSSet<NSString *> *dataTypes = WKWebsiteDataStore.allWebsiteDataTypes;
+  [dataStore fetchDataRecordsOfTypes:dataTypes
+                  completionHandler:^(NSArray<WKWebsiteDataRecord *> *records) {
+    NSPredicate *matching = [NSPredicate
+        predicateWithBlock:^BOOL(WKWebsiteDataRecord *record,
+                                 NSDictionary *bindings) {
+              NSString *name = record.displayName.lowercaseString;
+              return name.length > 0 &&
+                  ([name isEqualToString:hostname] ||
+                  [name hasSuffix:[@"." stringByAppendingString:hostname]] ||
+                  [hostname hasSuffix:[@"." stringByAppendingString:name]]);
+        }];
+    NSArray<WKWebsiteDataRecord *> *matches =
+        [records filteredArrayUsingPredicate:matching];
+    if (matches.count == 0) {
+      dispatch_async(dispatch_get_main_queue(), completion);
+      return;
+    }
+    [dataStore removeDataOfTypes:dataTypes
+                 forDataRecords:matches
+              completionHandler:^{
+                dispatch_async(dispatch_get_main_queue(), completion);
+              }];
+  }];
 }
 
 BOOL isJsonBoolean(id value) {
@@ -166,7 +348,7 @@ NSDictionary *browserProtectionPreferencesFromDefaults() {
       @"hideCookieBanners" :
           [defaults objectForKey:MasqBrowserHideCookieBannersKey]
               ? @([defaults boolForKey:MasqBrowserHideCookieBannersKey])
-              : @YES,
+              : @NO,
       @"rejectOptionalCookies" :
           [defaults objectForKey:MasqBrowserRejectOptionalCookiesKey]
               ? @([defaults boolForKey:MasqBrowserRejectOptionalCookiesKey])
@@ -247,10 +429,13 @@ void resetBrowserProtectionPreferences() {
     [defaults removeObjectForKey:MasqBrowserHideCookieBannersKey];
     [defaults removeObjectForKey:MasqBrowserRejectOptionalCookiesKey];
     [defaults removeObjectForKey:MasqBrowserYouTubeBestEffortKey];
+    [defaults removeObjectForKey:MasqBrowserRememberedMasqSitesKey];
+    [defaults removeObjectForKey:MasqBrowserRememberedDirectSitesKey];
+    [defaults removeObjectForKey:MasqBrowserProtectionDisabledSitesKey];
     setActiveBrowserContentRuleLists(@[]);
     setCurrentYouTubeBestEffortEnabled(NO);
   }
-  clearProtectedBrowserDataStores(^{});
+  clearAllBrowserDataStores(^{});
 }
 
 NSDictionary *browserProtectionResponse(NSDictionary *preferences) {
@@ -262,7 +447,17 @@ NSDictionary *browserProtectionResponse(NSDictionary *preferences) {
 }
 
 NSDictionary *contentRule(NSDictionary *trigger, NSDictionary *action) {
-  return @{ @"trigger" : trigger, @"action" : action };
+  NSMutableDictionary *protectedTrigger = [trigger mutableCopy];
+  NSMutableOrderedSet<NSString *> *excludedDomains =
+      [NSMutableOrderedSet orderedSetWithArray:
+          [trigger[@"unless-domain"] isKindOfClass:[NSArray class]]
+              ? trigger[@"unless-domain"]
+              : @[]];
+  [excludedDomains addObjectsFromArray:browserProtectionDisabledDomains()];
+  if (excludedDomains.count > 0) {
+    protectedTrigger[@"unless-domain"] = excludedDomains.array;
+  }
+  return @{ @"trigger" : protectedTrigger, @"action" : action };
 }
 
 NSArray<NSDictionary *> *crossSiteCookieRules() {
@@ -342,27 +537,6 @@ NSArray<NSDictionary *> *adAndTrackerRules() {
                              @"ins.adsbygoogle,iframe[id^='google_ads_'],iframe[src*='doubleclick.net'],[data-ad-client],[data-ad-slot],.advertisement,.sponsored-ad,#ad-container,.ad-container",
                        })];
   return rules;
-}
-
-NSArray<NSDictionary *> *cookieBannerRules() {
-  return @[
-    contentRule(
-        @{ @"url-filter" : @".*" },
-        @{
-          @"type" : @"css-display-none",
-          @"selector" :
-              @"#onetrust-banner-sdk,#onetrust-consent-sdk,.onetrust-pc-dark-filter,#CybotCookiebotDialog,#CybotCookiebotDialogBodyUnderlay,.didomi-popup-container,.didomi-popup-backdrop,#usercentrics-root,.qc-cmp2-container,.qc-cmp2-main-messaging,.truste_overlay,.truste_box_overlay,.cookie-banner,.cookie-consent,.cc-window",
-        }),
-    contentRule(
-        @{
-          @"url-filter" : @".*",
-          @"if-domain" : @[ @"hln.be", @"*.hln.be" ],
-        },
-        @{
-          @"type" : @"css-display-none",
-          @"selector" : @"#pg-shadow-host-dom",
-        }),
-  ];
 }
 
 #if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1
@@ -471,12 +645,9 @@ void compileBrowserProtection(
       @"rules" : adAndTrackerRules(),
     }];
   }
-  if ([preferences[@"hideCookieBanners"] boolValue]) {
-    [tasks addObject:@{
-      @"identifier" : MasqBrowserBannerRulesIdentifier,
-      @"rules" : cookieBannerRules(),
-    }];
-  }
+  // Consent surfaces are handled by the versioned page adapters only after a
+  // verified Reject action succeeds. A native CSS rule cannot observe that
+  // state and would risk hiding an unresolved consent gate.
 #if MASQ_PRIVATE_YOUTUBE_AD_BLOCKER == 1
   if ([preferences[@"youtubeBestEffort"] boolValue]) {
     [tasks addObject:@{
@@ -581,6 +752,16 @@ WKWebsiteDataStore *masq_private_browser_data_store(void) {
 extern "C" __attribute__((visibility("default"), used))
 WKWebsiteDataStore *masq_direct_browser_data_store(void) {
   return directBrowserDataStore();
+}
+
+extern "C" __attribute__((visibility("default"), used))
+WKWebsiteDataStore *masq_persistent_browser_data_store(void) {
+  return masqPersistentBrowserDataStore();
+}
+
+extern "C" __attribute__((visibility("default"), used))
+WKWebsiteDataStore *masq_direct_persistent_browser_data_store(void) {
+  return directPersistentBrowserDataStore();
 }
 
 // The react-native-webview patch invokes this for both protected browser variants. Rules are
@@ -1332,7 +1513,7 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
                  error);
           return;
         }
-        clearProtectedBrowserDataStores(^{
+        clearTemporaryBrowserDataStores(^{
               if (!isCurrentBrowserProtectionOperation(generation)) {
                 reject(@"E_BROWSER_PROTECTION_STALE",
                        staleBrowserProtectionError().localizedDescription,
@@ -1383,7 +1564,7 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
                  error);
           return;
         }
-        clearProtectedBrowserDataStores(^{
+        clearTemporaryBrowserDataStores(^{
               if (!isCurrentBrowserProtectionOperation(generation)) {
                 reject(@"E_BROWSER_PROTECTION_STALE",
                        staleBrowserProtectionError().localizedDescription,
@@ -1406,6 +1587,119 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
               }
               resolve(serialized);
             });
+      });
+}
+
+- (void)getBrowserSiteSettings:(NSString *)mode
+                      hostname:(NSString *)hostname
+                       resolve:(RCTPromiseResolveBlock)resolve
+                        reject:(RCTPromiseRejectBlock)reject {
+  NSString *rememberedKey = rememberedSitesKeyForMode(mode);
+  NSString *normalizedHostname = hostname.lowercaseString;
+  if (!rememberedKey || ![hostname isEqualToString:normalizedHostname] ||
+      !isSafeBrowserHostname(normalizedHostname)) {
+    reject(@"E_BROWSER_SITE_SETTINGS",
+           @"Choose a valid MASQ or Direct HTTPS website.", nil);
+    return;
+  }
+  NSString *serialized = serializeBrowserSiteSettings(
+      browserSiteSettingsResponse(mode, normalizedHostname));
+  serialized
+      ? resolve(serialized)
+      : reject(@"E_BROWSER_SITE_SETTINGS",
+               @"Website privacy settings could not be created.", nil);
+}
+
+- (void)setBrowserSiteSettings:(NSString *)mode
+                      hostname:(NSString *)hostname
+                rememberSignIn:(BOOL)rememberSignIn
+            protectionDisabled:(BOOL)protectionDisabled
+                       resolve:(RCTPromiseResolveBlock)resolve
+                        reject:(RCTPromiseRejectBlock)reject {
+  NSString *rememberedKey = rememberedSitesKeyForMode(mode);
+  NSString *normalizedHostname = hostname.lowercaseString;
+  if (!rememberedKey || ![hostname isEqualToString:normalizedHostname] ||
+      !isSafeBrowserHostname(normalizedHostname)) {
+    reject(@"E_BROWSER_SITE_SETTINGS",
+           @"Choose a valid MASQ or Direct HTTPS website.", nil);
+    return;
+  }
+
+  NSMutableSet<NSString *> *remembered =
+      savedBrowserHostnameSet(rememberedKey);
+  NSMutableSet<NSString *> *disabled =
+      savedBrowserHostnameSet(MasqBrowserProtectionDisabledSitesKey);
+  if (rememberSignIn) {
+    [remembered addObject:normalizedHostname];
+  } else {
+    [remembered removeObject:normalizedHostname];
+  }
+  if (protectionDisabled) {
+    [disabled addObject:normalizedHostname];
+  } else {
+    [disabled removeObject:normalizedHostname];
+  }
+  saveBrowserHostnameSet(remembered, rememberedKey);
+  saveBrowserHostnameSet(disabled, MasqBrowserProtectionDisabledSitesKey);
+
+  void (^finish)(void) = ^{
+    NSString *serialized = serializeBrowserSiteSettings(
+        browserSiteSettingsResponse(mode, normalizedHostname));
+    serialized
+        ? resolve(serialized)
+        : reject(@"E_BROWSER_SITE_SETTINGS",
+                 @"Website privacy settings could not be created.", nil);
+  };
+  if (!rememberSignIn) {
+    clearBrowserWebsiteDataForHostname(
+        persistentBrowserDataStoreForMode(mode), normalizedHostname, finish);
+  } else {
+    finish();
+  }
+}
+
+- (void)clearBrowserSiteData:(NSString *)mode
+                    hostname:(NSString *)hostname
+                     resolve:(RCTPromiseResolveBlock)resolve
+                      reject:(RCTPromiseRejectBlock)reject {
+  NSString *rememberedKey = rememberedSitesKeyForMode(mode);
+  NSString *normalizedHostname = hostname.lowercaseString;
+  if (!rememberedKey || ![hostname isEqualToString:normalizedHostname] ||
+      !isSafeBrowserHostname(normalizedHostname)) {
+    reject(@"E_BROWSER_SITE_SETTINGS",
+           @"Choose a valid MASQ or Direct HTTPS website.", nil);
+    return;
+  }
+  NSMutableSet<NSString *> *remembered =
+      savedBrowserHostnameSet(rememberedKey);
+  NSMutableSet<NSString *> *disabled =
+      savedBrowserHostnameSet(MasqBrowserProtectionDisabledSitesKey);
+  [remembered removeObject:normalizedHostname];
+  [disabled removeObject:normalizedHostname];
+  saveBrowserHostnameSet(remembered, rememberedKey);
+  saveBrowserHostnameSet(disabled, MasqBrowserProtectionDisabledSitesKey);
+  clearBrowserWebsiteDataForHostname(
+      persistentBrowserDataStoreForMode(mode), normalizedHostname, ^{
+        NSString *serialized = serializeBrowserSiteSettings(
+            browserSiteSettingsResponse(mode, normalizedHostname));
+        serialized
+            ? resolve(serialized)
+            : reject(@"E_BROWSER_SITE_SETTINGS",
+                     @"Website privacy settings could not be created.", nil);
+      });
+}
+
+- (void)clearRememberedBrowserData:(RCTPromiseResolveBlock)resolve
+                            reject:(RCTPromiseRejectBlock)reject {
+  [NSUserDefaults.standardUserDefaults
+      removeObjectForKey:MasqBrowserRememberedMasqSitesKey];
+  [NSUserDefaults.standardUserDefaults
+      removeObjectForKey:MasqBrowserRememberedDirectSitesKey];
+  clearBrowserDataStores(
+      @[ masqPersistentBrowserDataStore(),
+         directPersistentBrowserDataStore() ],
+      ^{
+        resolve(@"ok");
       });
 }
 
@@ -1717,7 +2011,11 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
       if ([mode isEqualToString:@"blocked"]) {
         configurePrivateBrowserProxy(masqBrowserDataStore(),
                                      MasqBlockedBrowserProxyPort);
+        configurePrivateBrowserProxy(masqPersistentBrowserDataStore(),
+                                     MasqBlockedBrowserProxyPort);
         configurePrivateBrowserProxy(directBrowserDataStore(),
+                                     MasqBlockedBrowserProxyPort);
+        configurePrivateBrowserProxy(directPersistentBrowserDataStore(),
                                      MasqBlockedBrowserProxyPort);
         if (coreAvailable()) {
           NSString *syncResult = invoke(
@@ -1737,13 +2035,18 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
       if ([mode isEqualToString:@"direct"]) {
         configurePrivateBrowserProxy(masqBrowserDataStore(),
                                      MasqBlockedBrowserProxyPort);
+        configurePrivateBrowserProxy(masqPersistentBrowserDataStore(),
+                                     MasqBlockedBrowserProxyPort);
         [directBrowserDataStore() setProxyConfigurations:@[]];
+        [directPersistentBrowserDataStore() setProxyConfigurations:@[]];
         if (coreAvailable()) {
           NSString *syncResult = invoke(
               symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled"),
               false);
           if (!syncResult || !statusSucceeded(syncResult)) {
             configurePrivateBrowserProxy(directBrowserDataStore(),
+                                         MasqBlockedBrowserProxyPort);
+            configurePrivateBrowserProxy(directPersistentBrowserDataStore(),
                                          MasqBlockedBrowserProxyPort);
             reject(@"E_PROXY_STATE",
                    @"The MASQ core could not confirm that browser proxying is disabled.",
@@ -1759,7 +2062,11 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
       // endpoint is checked so that a stale port can never be reused during the transition.
       configurePrivateBrowserProxy(directBrowserDataStore(),
                                    MasqBlockedBrowserProxyPort);
+      configurePrivateBrowserProxy(directPersistentBrowserDataStore(),
+                                   MasqBlockedBrowserProxyPort);
       configurePrivateBrowserProxy(masqBrowserDataStore(),
+                                   MasqBlockedBrowserProxyPort);
+      configurePrivateBrowserProxy(masqPersistentBrowserDataStore(),
                                    MasqBlockedBrowserProxyPort);
       if (!coreAvailable()) {
         reject(@"E_CORE_UNAVAILABLE", @"The native MASQ core is missing from this build.", nil);
@@ -1786,11 +2093,16 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
 
       configurePrivateBrowserProxy(masqBrowserDataStore(),
                                    static_cast<uint16_t>(port.unsignedShortValue));
+      configurePrivateBrowserProxy(
+          masqPersistentBrowserDataStore(),
+          static_cast<uint16_t>(port.unsignedShortValue));
 
       NSString *syncResult = invoke(
           symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled"), true);
       if (!syncResult || !statusSucceeded(syncResult)) {
         configurePrivateBrowserProxy(masqBrowserDataStore(),
+                                     MasqBlockedBrowserProxyPort);
+        configurePrivateBrowserProxy(masqPersistentBrowserDataStore(),
                                      MasqBlockedBrowserProxyPort);
         reject(@"E_PROXY_STATE", @"The MASQ core could not confirm the proxy.", nil);
         return;

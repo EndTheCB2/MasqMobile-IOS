@@ -43,12 +43,20 @@ export function PrivacyScreen({
           text="Browse without MASQ stops any active MASQ connection and system routing, then uses your normal internet connection. Websites see the public IP of your current connection or VPN, while your internet provider and DNS service can see normal connection metadata. MASQ hops and exit-country settings do not apply. The app enters this mode only after you confirm its warning."
         />
         <Disclosure
-          title="Browser sessions are temporary"
+          title="Browser sessions are temporary by default"
           text={
             Platform.OS === 'ios'
-              ? "MASQ Private and Direct use separate, isolated non-persistent website stores. Website cookies, cache and page history are not written to persistent website storage, but may remain in memory until the app's web-content process exits. Closing the browser or backgrounding the app blocks browser routing."
-              : 'Cookies and website storage are cleared when either temporary browser starts and closes. Android WebView may still use app storage while a session is active. Closing the browser or backgrounding the app blocks browser routing.'
+              ? "MASQ Private and Direct use separate temporary website stores. If you explicitly enable Remember sign-in for a site, WebKit retains that session in the selected MASQ or Direct profile. Sign-in providers and other domains reached by redirects may also retain data in that profile. MASQ never extracts or stores the password. Forget this site removes that site's origin data; Clear all remembered sign-ins and Reset everything clear the retained profiles."
+              : "Cookies and website storage are temporary by default. Remember sign-in is offered only when this Android WebView can isolate browser profiles. Sign-in providers and other domains reached by redirects may also retain data in that site's profile. MASQ never extracts or stores the password. Forget and reset controls clear retained profiles."
           }
+        />
+        <Disclosure
+          title="ENS preview uses an HTTPS gateway"
+          text="Normalized ASCII or punycode .eth addresses are translated locally to the matching eth.limo HTTPS gateway address. The original .eth name stays visible in the address bar. eth.limo and its infrastructure can process the requested name, path and normal connection metadata. In MASQ Private it sees the exit IP; in Direct it sees the current public IP. A gateway failure never falls back to search, ordinary DNS or Direct browsing."
+        />
+        <Disclosure
+          title="Cookie protection is local and optional"
+          text="Balanced and Strict protection use versioned rules stored with the app. Supported consent managers are automated only when Reject optional cookies is enabled, and the app never selects Accept. Turning protection off for a site can restore compatibility but allows that site's cookies, ads and trackers under its own policy. MASQ records no browsing telemetry."
         />
         <Disclosure
           title="Free-text searches use Timpi"
@@ -76,7 +84,7 @@ export function PrivacyScreen({
           />
         </View>
         <Text style={styles.footer}>
-          Effective 23 July 2026 · Review the online policy for the current
+          Effective 27 July 2026 · Review the online policy for the current
           maintainer contact and any later changes.
         </Text>
       </ScrollView>

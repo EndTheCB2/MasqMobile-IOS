@@ -106,8 +106,8 @@ android {
         applicationId "com.endthecb2.masqmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0.0-preview.1"
+        versionCode 2
+        versionName "1.0.0-preview.2"
         ndk {
             // The embedded MASQ core is built for modern 64-bit devices and emulators.
             abiFilters "arm64-v8a", "x86_64"
@@ -160,8 +160,14 @@ def buildMasqRustAndroid = tasks.register("buildMasqRustAndroid", Exec) {
     commandLine "bash", "scripts/build-rust-android.sh"
 }
 
+def verifyMasqWebViewProfilePatch = tasks.register("verifyMasqWebViewProfilePatch", Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine "bash", "scripts/verify-android-webview-patch.sh"
+}
+
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(buildMasqRustAndroid)
+    dependsOn(verifyMasqWebViewProfilePatch)
 }
 
 dependencies {

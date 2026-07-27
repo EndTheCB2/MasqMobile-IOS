@@ -31,6 +31,15 @@ describe('browser address and Timpi search input', () => {
     expect(resolveBrowserInput('https://timpi.com/')).toBe(TIMPI_HOME_URL);
   });
 
+  it('loads explicit ENS websites through the HTTPS gateway', () => {
+    expect(resolveBrowserInput('privacy.eth')).toBe(
+      'https://privacy.eth.limo/',
+    );
+    expect(resolveBrowserInput('docs.project.eth/path?q=1#intro')).toBe(
+      'https://docs.project.eth.limo/path?q=1#intro',
+    );
+  });
+
   it.each([
     'http://example.com',
     'file:///etc/passwd',

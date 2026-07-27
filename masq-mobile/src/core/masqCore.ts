@@ -9,6 +9,11 @@ import {
   type BrowserProtectionPreferences,
 } from './browserProtection';
 import {
+  decodeBrowserSiteSettings,
+  type BrowserSiteMode,
+  type BrowserSiteSettings,
+} from './browserSiteSettings';
+import {
   EMPTY_STATUS,
   type CoreStatus,
   type MasqConfig,
@@ -49,9 +54,22 @@ export interface MasqCore {
   setBrowserProtection(
     preferences: BrowserProtectionPreferences,
   ): Promise<BrowserProtectionConfiguration>;
-  setBrowserRoutingMode(
-    mode: BrowserRoutingMode,
-  ): Promise<BrowserRoutingMode>;
+  setBrowserRoutingMode(mode: BrowserRoutingMode): Promise<BrowserRoutingMode>;
+  getBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings>;
+  setBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+    rememberSignIn: boolean,
+    protectionDisabled: boolean,
+  ): Promise<BrowserSiteSettings>;
+  clearBrowserSiteData(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings>;
+  clearRememberedBrowserData(): Promise<void>;
 }
 
 class NativeCore implements MasqCore {
@@ -164,6 +182,47 @@ class NativeCore implements MasqCore {
     return decodeBrowserRoutingMode(
       await NativeMasqCore!.setBrowserRoutingMode(mode),
     );
+  }
+
+  async getBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings> {
+    return decodeBrowserSiteSettings(
+      await NativeMasqCore!.getBrowserSiteSettings(mode, hostname),
+    );
+  }
+
+  async setBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+    rememberSignIn: boolean,
+    protectionDisabled: boolean,
+  ): Promise<BrowserSiteSettings> {
+    return decodeBrowserSiteSettings(
+      await NativeMasqCore!.setBrowserSiteSettings(
+        mode,
+        hostname,
+        rememberSignIn,
+        protectionDisabled,
+      ),
+    );
+  }
+
+  async clearBrowserSiteData(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings> {
+    return decodeBrowserSiteSettings(
+      await NativeMasqCore!.clearBrowserSiteData(mode, hostname),
+    );
+  }
+
+  async clearRememberedBrowserData(): Promise<void> {
+    const result = await NativeMasqCore!.clearRememberedBrowserData();
+    if (result !== 'ok') {
+      throw new Error('The native core did not confirm browser data deletion.');
+    }
   }
 }
 
@@ -293,6 +352,54 @@ class MissingNativeCore implements MasqCore {
     }
     return mode;
   }
+
+  async getBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings> {
+    return {
+      hostname,
+      mode,
+      persistentSessionsSupported: false,
+      protectionDisabled: false,
+      rememberSignIn: false,
+    };
+  }
+
+  async setBrowserSiteSettings(
+    mode: BrowserSiteMode,
+    hostname: string,
+    rememberSignIn: boolean,
+    protectionDisabled: boolean,
+  ): Promise<BrowserSiteSettings> {
+    if (rememberSignIn) {
+      throw new Error(
+        'Isolated persistent browser profiles are unavailable in this build.',
+      );
+    }
+    return {
+      hostname,
+      mode,
+      persistentSessionsSupported: false,
+      protectionDisabled,
+      rememberSignIn: false,
+    };
+  }
+
+  async clearBrowserSiteData(
+    mode: BrowserSiteMode,
+    hostname: string,
+  ): Promise<BrowserSiteSettings> {
+    return {
+      hostname,
+      mode,
+      persistentSessionsSupported: false,
+      protectionDisabled: false,
+      rememberSignIn: false,
+    };
+  }
+
+  async clearRememberedBrowserData(): Promise<void> {}
 }
 
 function decodeBrowserRoutingMode(serialized: string): BrowserRoutingMode {
@@ -301,7 +408,9 @@ function decodeBrowserRoutingMode(serialized: string): BrowserRoutingMode {
     serialized !== 'masq' &&
     serialized !== 'direct'
   ) {
-    throw new Error('The native core returned an invalid browser routing mode.');
+    throw new Error(
+      'The native core returned an invalid browser routing mode.',
+    );
   }
   return serialized;
 }

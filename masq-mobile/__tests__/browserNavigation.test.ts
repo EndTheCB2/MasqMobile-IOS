@@ -21,6 +21,44 @@ describe('fail-closed private browser navigation', () => {
     ).toEqual({ action: 'upgrade', url: 'https://deredactie.be/' });
   });
 
+  it('redirects top-level ENS links to HTTPS transport without Direct fallback', () => {
+    expect(
+      decideBrowserNavigation({
+        isTopFrame: true,
+        navigationType: 'click',
+        url: 'https://docs.project.eth/path?q=1#intro',
+      }),
+    ).toEqual({
+      action: 'redirect',
+      displayUrl: 'https://docs.project.eth/path?q=1#intro',
+      url: 'https://docs.project.eth.limo/path?q=1#intro',
+    });
+  });
+
+  it('blocks raw ENS subframes because they cannot be safely replaced', () => {
+    expect(
+      decideBrowserNavigation({
+        isTopFrame: false,
+        navigationType: 'other',
+        url: 'https://asset.project.eth/script.js',
+      }),
+    ).toEqual({ action: 'block', message: null });
+  });
+
+  it('blocks ENS form rewrites so submitted data is never converted to a GET', () => {
+    expect(
+      decideBrowserNavigation({
+        isTopFrame: true,
+        navigationType: 'formsubmit',
+        url: 'https://project.eth/checkout',
+      }),
+    ).toEqual({
+      action: 'block',
+      message:
+        'The browser blocked an ENS form submission because rewriting it through the gateway cannot preserve its submitted data.',
+    });
+  });
+
   it.each([
     'mailto:news@example.com',
     'tel:+3200000000',

@@ -12,9 +12,13 @@ areas:
 - React Native user interface and native WebView integration with explicit `blocked`, `masq` and
   `direct` routing states, structurally separate non-persistent iOS data stores and no automatic
   direct fallback;
-- local MASQ Mobile-authored ad/tracker, cross-site-cookie and cookie-banner protection, plus an
-  opt-in **Configure → Reject all** flow for supported DPG Media/HLN dialogs, without an external
-  filter list or browsing telemetry; and
+- versioned local ad/tracker, cross-site-cookie and Reject-only consent protection with
+  Balanced/Strict presets, exact-host exceptions and a reviewed last-good fallback, without
+  browsing telemetry;
+- explicit ENS `.eth` translation to eth.limo HTTPS transport with no search or Direct fallback;
+- opt-in exact-host remembered WebView profiles, separated by MASQ/Direct mode and enabled only
+  after AndroidX WebKit confirms multi-profile support, with cross-site transitions re-profiled
+  and Android top-frame non-GET requests blocked fail-closed; and
 - iOS/Android build scripts, tests, diagnostics, and fail-closed security controls.
 
 The standard iOS build compiles YouTube-specific filtering out. Its generic protection deliberately
