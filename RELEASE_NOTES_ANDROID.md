@@ -1,4 +1,4 @@
-# MASQ Mobile Android 1.0.0-preview.2
+# MASQ Mobile Android 1.0.0-preview.3
 
 This is an experimental, independently maintained, consume-only MASQ Mobile preview distributed
 outside Google Play. It is not an official MASQ Project release and has not completed an
@@ -6,7 +6,7 @@ independent mobile security audit.
 
 ## Download
 
-Install `MASQ-Mobile-Android-v1.0.0-preview.2.apk` only from this GitHub Release. The release also
+Install `MASQ-Mobile-Android-v1.0.0-preview.3.apk` only from this GitHub Release. The release also
 contains:
 
 - `SHA256SUMS.txt` for file-integrity verification; and
@@ -14,33 +14,34 @@ contains:
   onward.
 
 Follow the
-[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.2/ANDROID_DIRECT_INSTALL.md)
+[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.3/ANDROID_DIRECT_INSTALL.md)
 before installing or updating.
 
-## Required migration from preview.1
+## Updating
 
-Preview.2 establishes a new permanent Android signing certificate because the password for the
-preview.1 key was no longer available. Android cannot update preview.1 in place. Existing
-preview.1 users must:
+Preview.2 users can install preview.3 directly over the existing app. Do not uninstall or reset
+the app: preview.3 retains the same package ID and signing certificate, so Android preserves local
+wallet and profile data.
+
+Preview.1 used a different signing certificate. Preview.1 users must:
 
 1. write down and verify their 12-word wallet recovery phrase offline;
 2. uninstall preview.1; and
-3. install preview.2 from this Release.
+3. install preview.3 from this Release.
 
 Uninstalling without that backup removes the locally encrypted wallet and profile. New users are
 not affected. Future releases must retain preview.2 certificate SHA-256
 `346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`.
 
-## Changes since preview.1
+## Fixes since preview.2
 
-- Replaced the large Direct-mode warning banner with a compact persistent `DIRECT · MASQ OFF`
-  badge.
-- Added ENS `.eth` navigation through the explicit eth.limo HTTPS gateway boundary.
-- Added opt-in remembered sign-ins for exact hosts on Android WebView runtimes that support
-  isolated profiles; MASQ and Direct profiles stay separate. Cross-site top-frame transitions
-  switch profiles, while non-GET top-frame form navigations are blocked fail-closed.
-- Expanded browser protection with Balanced/Strict presets, exact-host exceptions, versioned
-  rules, and reviewed Reject-only handling for supported consent managers.
+- Fixed the native MASQ core failing to load on Android. Vendored OpenSSL, libsodium, and compiler
+  runtime code are now linked into the core with Android NDK tools for both arm64-v8a phones and
+  x86_64 emulators.
+- Added a strict native linker gate that rejects unresolved symbols during the Rust build.
+- Added an independent ELF audit for both native libraries and both architectures. The same audit
+  now runs against the final APK and in GitHub Actions, preventing an interface-only build from
+  being released again.
 
 ## Included
 
