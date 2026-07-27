@@ -10,11 +10,26 @@ Install `MASQ-Mobile-Android-v1.0.0-preview.2.apk` only from this GitHub Release
 contains:
 
 - `SHA256SUMS.txt` for file-integrity verification; and
-- `SIGNING-CERTIFICATE.txt` for the stable Android signing-certificate fingerprint.
+- `SIGNING-CERTIFICATE.txt` for the stable signing-certificate fingerprint used from preview.2
+  onward.
 
 Follow the
 [Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.2/ANDROID_DIRECT_INSTALL.md)
 before installing or updating.
+
+## Required migration from preview.1
+
+Preview.2 establishes a new permanent Android signing certificate because the password for the
+preview.1 key was no longer available. Android cannot update preview.1 in place. Existing
+preview.1 users must:
+
+1. write down and verify their 12-word wallet recovery phrase offline;
+2. uninstall preview.1; and
+3. install preview.2 from this Release.
+
+Uninstalling without that backup removes the locally encrypted wallet and profile. New users are
+not affected. Future releases must retain preview.2 certificate SHA-256
+`346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`.
 
 ## Changes since preview.1
 
