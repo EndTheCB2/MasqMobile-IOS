@@ -19,7 +19,8 @@ areas:
 - opt-in exact-host remembered WebView profiles, separated by MASQ/Direct mode and enabled only
   after AndroidX WebKit confirms multi-profile support, with cross-site transitions re-profiled
   and Android top-frame non-GET requests blocked fail-closed; and
-- iOS/Android build scripts, tests, diagnostics, and fail-closed security controls.
+- iOS/Android build scripts, tests, diagnostics, and fail-closed security controls, including
+  Android NDK-only native archiving and final-APK ELF linkage verification.
 
 The standard iOS build compiles YouTube-specific filtering out. Its generic protection deliberately
 avoids broad `googlevideo` blocking because those hosts also deliver requested media.

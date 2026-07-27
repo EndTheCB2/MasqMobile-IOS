@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - agent/**
+      - codex/**
 
 permissions:
   contents: read
@@ -147,6 +148,11 @@ jobs:
         env:
           MASQ_NODE_FINDER_URL: https://ci.invalid.example
         run: ./gradlew assembleRelease --no-daemon
+      - name: Verify Android native linkage in the assembled APK
+        working-directory: masq-mobile
+        run: >-
+          ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.1.12297006"
+          npm run verify:android:native:apk
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: masq-mobile-unsigned-android

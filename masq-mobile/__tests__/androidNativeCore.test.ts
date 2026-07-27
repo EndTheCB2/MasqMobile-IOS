@@ -40,6 +40,7 @@ describe('Android native MASQ core integration', () => {
   const webViewClientSource = read(
     'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java',
   );
+  const mobileCi = read('../.github/workflows/mobile-ci.yml');
 
   it('builds and packages the real Rust node engine for supported Android ABIs', () => {
     const buildScript = read('scripts/build-rust-android.sh');
@@ -53,8 +54,16 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).not.toContain('signingConfig signingConfigs.debug');
     expect(buildScript).toContain('--features node-engine');
     expect(buildScript).toContain('--remap-path-prefix=$HOME=/build/source');
-    expect(buildScript).toContain("! -name 'libmasq_mobile_core.so'");
-    expect(buildScript).toContain("! -name 'libmasq_packet_tunnel.so'");
+    expect(buildScript).toContain('llvm-ar');
+    expect(buildScript).toContain('llvm-ranlib');
+    expect(buildScript).toContain('-Clink-arg=-Wl,-z,defs');
+    expect(buildScript.match(/--link-builtins/g)).toHaveLength(2);
+    expect(buildScript).toContain(
+      'verify-android-native-elf.js" --jni-dir "$OUTPUT_DIR"',
+    );
+    expect(buildScript).toContain("-name 'libsysinfo-*.so'");
+    expect(buildScript).toContain("-name 'libtun2proxy-*.so'");
+    expect(buildScript).not.toContain("! -name 'libmasq_mobile_core.so'");
     expect(buildScript).toContain('cd "$(dirname "$MANIFEST")"');
     expect(buildScript).toContain(
       'RUSTC="$(rustup which --toolchain "$RUST_TOOLCHAIN" rustc)"',
@@ -87,6 +96,9 @@ describe('Android native MASQ core integration', () => {
 
     expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_CERT_SHA256');
     expect(releaseBuilder).toContain('ALLOW_DEVELOPMENT_NODE_FINDER=YES');
+    expect(releaseBuilder).toContain(
+      'MASQ_ANDROID_KEY_ALIAS="${MASQ_ANDROID_KEY_ALIAS:-masq-mobile-preview2}"',
+    );
     expect(releaseBuilder).toContain('SIGNED_TEMP_APK');
     expect(releaseBuilder).toContain('--v4-signing-enabled false');
     expect(releaseBuilder).toContain('ci\\.invalid\\.example');
@@ -94,6 +106,13 @@ describe('Android native MASQ core integration', () => {
     expect(apkVerifier).toContain('CN=Android Debug');
     expect(apkVerifier).toContain('--verbose --print-certs --Werr');
     expect(apkVerifier).toContain('/Users/[A-Za-z0-9._-]+');
+    expect(apkVerifier).toContain(
+      'verify-android-native-elf.js" --apk "$APK_PATH"',
+    );
+    expect(mobileCi).toContain(
+      'Verify Android native linkage in the assembled APK',
+    );
+    expect(mobileCi).toContain('npm run verify:android:native:apk');
   });
 
   it('supports explicit blocked, MASQ, and direct WebView routing modes', () => {

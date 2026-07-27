@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APK_PATH="${1:-}"
 if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
   echo "usage: $0 /path/to/signed-release.apk" >&2
@@ -127,6 +128,7 @@ if unzip -Z1 "$APK_PATH" | rg '^lib/(armeabi|armeabi-v7a|x86)/' >/dev/null; then
   echo "error: APK contains an unsupported 32-bit native architecture." >&2
   exit 1
 fi
+"$ROOT_DIR/scripts/verify-android-native-elf.js" --apk "$APK_PATH"
 
 CERTIFICATE_REPORT="$TEMP_DIR/certificate.txt"
 "$APKSIGNER" verify --verbose --print-certs --Werr "$APK_PATH" >"$CERTIFICATE_REPORT"

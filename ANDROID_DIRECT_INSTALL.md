@@ -18,6 +18,13 @@ The Android package ID is `com.endthecb2.masqmobile`.
 
 ## Install
 
+### Updating from preview.2
+
+Preview.3 fixes the Android native MASQ-core packaging in preview.2. Install preview.3 directly
+over preview.2; do not uninstall or reset the app. It uses the same package ID and permanent
+signing certificate, so Android preserves the encrypted wallet, browser settings, and network
+profile.
+
 ### One-time migration from preview.1
 
 `1.0.0-preview.2` establishes a new permanent Android signing certificate because the password for
@@ -25,9 +32,9 @@ the preview.1 signing key was no longer available. Android therefore cannot inst
 preview.1.
 
 Before removing preview.1, write down and verify the wallet's 12-word recovery phrase offline.
-Then uninstall preview.1 and install preview.2 using the steps below. Uninstalling without that
-backup permanently removes the locally encrypted wallet and profile. New installations are not
-affected. Releases after preview.2 must keep the preview.2 certificate.
+Then uninstall preview.1 and install the current preview using the steps below. Uninstalling
+without that backup permanently removes the locally encrypted wallet and profile. New
+installations are not affected. Releases after preview.2 must keep the preview.2 certificate.
 
 1. On the Android phone, open the official GitHub Release page.
 2. Download the file named `MASQ-Mobile-Android-v*.apk`. Do not install an APK forwarded through a
