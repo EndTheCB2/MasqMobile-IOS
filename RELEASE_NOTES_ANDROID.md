@@ -1,4 +1,4 @@
-# MASQ Mobile Android 1.0.0-preview.5
+# MASQ Mobile Android 1.0.0-preview.6
 
 This is an experimental, independently maintained, consume-only MASQ Mobile preview distributed
 outside Google Play. It is not an official MASQ Project release and has not completed an
@@ -6,7 +6,7 @@ independent mobile security audit.
 
 ## Download
 
-Install `MASQ-Mobile-Android-v1.0.0-preview.5.apk` only from this GitHub Release. The release also
+Install `MASQ-Mobile-Android-v1.0.0-preview.6.apk` only from this GitHub Release. The release also
 contains:
 
 - `SHA256SUMS.txt` for file-integrity verification; and
@@ -14,44 +14,33 @@ contains:
   onward.
 
 Follow the
-[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.5/ANDROID_DIRECT_INSTALL.md)
+[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.6/ANDROID_DIRECT_INSTALL.md)
 before installing or updating.
 
 ## Updating
 
-Preview.2, preview.3 and preview.4 users can install preview.5 directly over the existing app. Do
-not uninstall or reset the app: preview.5 retains the same package ID and signing certificate, so
+Preview.2 through preview.5 users can install preview.6 directly over the existing app. Do not
+uninstall or reset the app: preview.6 retains the same package ID and signing certificate, so
 Android preserves local wallet and profile data.
 
 Preview.1 used a different signing certificate. Preview.1 users must:
 
 1. write down and verify their 12-word wallet recovery phrase offline;
 2. uninstall preview.1; and
-3. install preview.5 from this Release.
+3. install preview.6 from this Release.
 
 Uninstalling without that backup removes the locally encrypted wallet and profile. New users are
 not affected. Future releases must retain preview.2 certificate SHA-256
 `346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`.
 
-## Improvements since preview.4
+## Improvements since preview.5
 
-- Android's Back button now walks the embedded browser's page history before closing the browser.
-  On setup, routing and privacy screens it returns to Home; Home keeps Android's normal exit
-  behavior.
-- Closing or backgrounding the browser immediately removes the WebView and waits for an exact
-  native `blocked` acknowledgement. If native shutdown fails, the page stays unmounted and a safe
-  retry-close screen is shown instead of resuming browsing.
-- Repeated browser-close actions are deduplicated so rapid taps cannot race the fail-closed
-  teardown.
-- Connect followed quickly by Cancel now invalidates stale entry-node discovery and native start
-  work, serializes native stop behind any in-flight call, and allows a later retry to start a
-  fresh connection attempt.
-- Late results from cancelled connection attempts can no longer overwrite the refreshed profile
-  or reopen a route after the user has disconnected.
-- Public documentation now states explicitly that whole-device and selected-app routing remain
-  unavailable, matching the enforced safety gate.
-- The direct-release builder pins the established update certificate and keeps signing passwords
-  out of Gradle, Cargo and Node build subprocesses.
+- Profile-dependent actions remain disabled until saved native status and configuration have both
+  been restored, preventing startup taps from using temporary defaults.
+- A configured native core without a matching saved profile now fails closed with a retry action
+  instead of silently creating or overwriting a profile.
+- Retrying controller initialization preserves the existing profile and editable settings; only a
+  genuinely unconfigured installation receives the deterministic default profile.
 
 ## Included
 

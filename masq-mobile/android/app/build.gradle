@@ -106,8 +106,8 @@ android {
         applicationId "com.endthecb2.masqmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 5
-        versionName "1.0.0-preview.5"
+        versionCode 6
+        versionName "1.0.0-preview.6"
         buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"
         ndk {
             // The embedded MASQ core is built for modern 64-bit devices and emulators.
