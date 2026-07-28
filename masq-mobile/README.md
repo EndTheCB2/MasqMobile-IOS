@@ -14,8 +14,9 @@ exit services to other nodes.
   unlocked-only Keychain item; Android encrypts it with a non-exportable Android Keystore key.
 - Automatic RPC health checking with chain verification and public fallback endpoints.
 - Automatic selection, reachability testing, retry, and last-known-good caching of two entry nodes.
-- Single-flight connection control with cancellable node refresh when the user disconnects, resets,
-  backgrounds the app, or taps connect more than once.
+- Single-flight connection control with generation-checked Android native start/stop serialization
+  and cancellable node refresh when the user disconnects, resets, backgrounds the app, or taps
+  connect more than once.
 - An explicit cancel action while a route is being built, with fail-safe shutdown that still stops
   the core if browser-proxy cleanup itself reports an error.
 - Actionable, privacy-safe issue categories that route the user to retry, device settings, the
@@ -67,8 +68,10 @@ exit services to other nodes.
   of the mesh and system tunnel while retaining the wallet and profile; MASQ can reconnect later
   in the same app process.
 - Race-free native status polling, iOS/Android network-path monitoring, foreground recovery, and
-  fail-closed browser shutdown when the app enters the background. Browser mode is never
-  persisted, and backgrounding always selects `blocked`.
+  fail-closed browser shutdown when the app enters the background. Android removes the WebView
+  immediately and requires an exact native `blocked` acknowledgement before leaving the browser;
+  a failed acknowledgement stays on a non-browsing retry screen. Browser mode is never persisted,
+  and backgrounding always selects `blocked`.
 - Separate wallet, network-profile, and full resets, plus redacted diagnostics sharing.
 
 The iOS build intentionally remains browser-only. Whole-device routing needs a separately signed

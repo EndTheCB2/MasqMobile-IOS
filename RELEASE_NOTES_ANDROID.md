@@ -1,4 +1,4 @@
-# MASQ Mobile Android 1.0.0-preview.4
+# MASQ Mobile Android 1.0.0-preview.5
 
 This is an experimental, independently maintained, consume-only MASQ Mobile preview distributed
 outside Google Play. It is not an official MASQ Project release and has not completed an
@@ -6,7 +6,7 @@ independent mobile security audit.
 
 ## Download
 
-Install `MASQ-Mobile-Android-v1.0.0-preview.4.apk` only from this GitHub Release. The release also
+Install `MASQ-Mobile-Android-v1.0.0-preview.5.apk` only from this GitHub Release. The release also
 contains:
 
 - `SHA256SUMS.txt` for file-integrity verification; and
@@ -14,37 +14,40 @@ contains:
   onward.
 
 Follow the
-[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.4/ANDROID_DIRECT_INSTALL.md)
+[Android installation guide](https://github.com/EndTheCB2/MasqMobile-IOS/blob/android-v1.0.0-preview.5/ANDROID_DIRECT_INSTALL.md)
 before installing or updating.
 
 ## Updating
 
-Preview.2 and preview.3 users can install preview.4 directly over the existing app. Do not
-uninstall or reset the app: preview.4 retains the same package ID and signing certificate, so
+Preview.2, preview.3 and preview.4 users can install preview.5 directly over the existing app. Do
+not uninstall or reset the app: preview.5 retains the same package ID and signing certificate, so
 Android preserves local wallet and profile data.
 
 Preview.1 used a different signing certificate. Preview.1 users must:
 
 1. write down and verify their 12-word wallet recovery phrase offline;
 2. uninstall preview.1; and
-3. install preview.4 from this Release.
+3. install preview.5 from this Release.
 
 Uninstalling without that backup removes the locally encrypted wallet and profile. New users are
 not affected. Future releases must retain preview.2 certificate SHA-256
 `346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`.
 
-## Improvements since preview.3
+## Improvements since preview.4
 
-- Recovery words are masked by default and require an explicit Show action before they become
-  visible.
-- Recovery-word fields opt out of Android and iOS autofill suggestions.
-- Android blocks screenshots, screen recordings and recent-app previews of MASQ Mobile to prevent
-  wallet or browser content from being captured accidentally.
-- Direct-distribution verification now requires the exact Android version code in addition to the
-  version name, package ID, signer, native libraries and alignment.
-- Unvalidated Android whole-device/per-app controls and Always-on VPN support are withheld until
-  process-death, network-handover and leak tests pass. Installing preview.4 stops any system
-  tunnel left by an earlier experimental build.
+- Android's Back button now walks the embedded browser's page history before closing the browser.
+  On setup, routing and privacy screens it returns to Home; Home keeps Android's normal exit
+  behavior.
+- Closing or backgrounding the browser immediately removes the WebView and waits for an exact
+  native `blocked` acknowledgement. If native shutdown fails, the page stays unmounted and a safe
+  retry-close screen is shown instead of resuming browsing.
+- Repeated browser-close actions are deduplicated so rapid taps cannot race the fail-closed
+  teardown.
+- Connect followed quickly by Cancel now invalidates stale entry-node discovery and native start
+  work, serializes native stop behind any in-flight call, and allows a later retry to start a
+  fresh connection attempt.
+- Late results from cancelled connection attempts can no longer overwrite the refreshed profile
+  or reopen a route after the user has disconnected.
 
 ## Included
 

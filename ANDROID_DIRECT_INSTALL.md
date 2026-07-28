@@ -20,10 +20,10 @@ The Android package ID is `com.endthecb2.masqmobile`.
 
 ### Updating from preview.2 or later
 
-Preview.3 fixed the Android native MASQ-core packaging in preview.2. Preview.4 and later can be
-installed directly over preview.2 or preview.3; do not uninstall or reset the app. They use the
-same package ID and permanent signing certificate, so Android preserves the encrypted wallet,
-browser settings, and network profile.
+Preview.3 fixed the Android native MASQ-core packaging in preview.2. Every release after preview.2
+can be installed directly over preview.2 or another later preview; do not uninstall or reset the
+app. They use the same package ID and permanent signing certificate, so Android preserves the
+encrypted wallet, browser settings, and network profile.
 
 ### One-time migration from preview.1
 
@@ -47,9 +47,9 @@ installations are not affected. Releases after preview.2 must keep the preview.2
    APK as harmful, stop and report the exact warning on this repository instead of bypassing it.
 6. After installation, turn **Allow from this source** off again for the browser or Files app.
 
-Preview.4 does not offer whole-device or selected-app routing. Android Always-on VPN support is
-disabled until process-death, network-handover and leak tests pass. If an earlier experimental
-preview left a system tunnel active, installing preview.4 stops it.
+The current preview does not offer whole-device or selected-app routing. Android Always-on VPN
+support is disabled until process-death, network-handover and leak tests pass. If an earlier
+experimental preview left a system tunnel active, installing the current preview stops it.
 
 ## Check the download
 
