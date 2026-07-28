@@ -20,7 +20,10 @@ import {
 } from './src/core/browserSession';
 import { buildRedactedDiagnostics } from './src/core/diagnostics';
 import { classifyMasqIssue } from './src/core/issues';
-import { useMasqController } from './src/hooks/useMasqController';
+import {
+  PROFILE_NOT_READY_MESSAGE,
+  useMasqController,
+} from './src/hooks/useMasqController';
 import {
   BrowserScreen,
   type BrowserCloseReason,
@@ -132,6 +135,10 @@ function AppContent() {
 
   const openSetup = () => {
     setDirectBrowserError(null);
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     if (
       ['connecting', 'connected', 'paused', 'stopping'].includes(
         controller.status.phase,
@@ -148,6 +155,10 @@ function AppContent() {
 
   const connect = () => {
     setDirectBrowserError(null);
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     setRouteError(null);
     controller.connect().catch(() => undefined);
   };
@@ -159,6 +170,10 @@ function AppContent() {
   };
 
   const openMasqBrowser = async () => {
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     if (browserOpenInFlight.current) {
       return;
     }
@@ -264,6 +279,11 @@ function AppContent() {
   };
 
   const confirmDirectBrowser = () => {
+    if (!controller.profileReady) {
+      setDirectBrowserError(null);
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     Alert.alert(
       'Browse without MASQ?',
       'This stops any active MASQ connection and system routing, then uses your normal internet connection. Websites see the public IP used by your current connection or VPN. Your internet provider and DNS service can see normal connection metadata. MASQ hops and exit-country settings do not apply.',
@@ -383,17 +403,30 @@ function AppContent() {
         <HomeScreen
           busy={controller.busy || browserOpening}
           connectionProgress={controller.connectionProgress}
+          profileReady={controller.profileReady}
+          initializationState={controller.initializationState}
           network={controller.network}
           entryNodeRefresh={controller.entryNodeRefresh}
           issue={activeIssue}
           walletBalance={controller.walletBalance}
           systemTunnel={controller.systemTunnel}
           onConnect={connect}
+          onRetryInitialization={() => {
+            setDirectBrowserError(null);
+            setRouteError(null);
+            controller.retryInitialization().catch(() => undefined);
+          }}
           onDisconnect={disconnect}
           onOpenBrowser={openMasqBrowser}
           onOpenDirectBrowser={confirmDirectBrowser}
           onOpenSetup={openSetup}
-          onOpenTrafficRouting={() => setRoute('routing')}
+          onOpenTrafficRouting={() => {
+            if (!controller.profileReady) {
+              setRouteError(PROFILE_NOT_READY_MESSAGE);
+              return;
+            }
+            setRoute('routing');
+          }}
           onOpenPrivacy={() => setRoute('privacy')}
           onReset={confirmReset}
           onResetNetwork={confirmNetworkReset}

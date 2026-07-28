@@ -43,11 +43,18 @@ const UNKNOWN_NETWORK: NetworkStatus = {
   generation: 0,
 };
 
+export type ControllerInitializationState = 'loading' | 'ready' | 'error';
+
+export const PROFILE_NOT_READY_MESSAGE =
+  'MASQ has not finished loading the saved Node and wallet profile. Wait for profile loading to complete and try again.';
+
 export function useMasqController() {
   const [status, setStatus] = useState<CoreStatus>(EMPTY_STATUS);
   const [network, setNetwork] = useState<NetworkStatus>(UNKNOWN_NETWORK);
   const [draft, setDraft] = useState<SetupDraft>(DEFAULT_SETUP);
   const [busy, setBusy] = useState(true);
+  const [initializationState, setInitializationState] =
+    useState<ControllerInitializationState>('loading');
   const [issue, setIssue] = useState<MasqIssue | null>(null);
   const [entryNodeRefresh, setEntryNodeRefresh] = useState<{
     attempt: number;
@@ -65,6 +72,8 @@ export function useMasqController() {
   const balanceAbort = useRef<AbortController | null>(null);
   const connectFlight = useRef(new SingleFlight<CoreStatus>());
   const desiredConnected = useRef(false);
+  const initializationEpoch = useRef(0);
+  const profileReadyRef = useRef(false);
   const statusRef = useRef(status);
   const networkRef = useRef(network);
 
@@ -99,6 +108,64 @@ export function useMasqController() {
     }
   }, []);
 
+  const requireProfileReady = useCallback(() => {
+    if (!profileReadyRef.current) {
+      throw new Error(PROFILE_NOT_READY_MESSAGE);
+    }
+  }, []);
+
+  const initialize = useCallback(async () => {
+    const initialization = ++initializationEpoch.current;
+    profileReadyRef.current = false;
+    setInitializationState('loading');
+    setBusy(true);
+    setIssue(null);
+    try {
+      const [initialStatus, initialNetwork, saved] = await Promise.all([
+        masqCore.getStatus(),
+        masqCore.getNetworkStatus().catch(() => UNKNOWN_NETWORK),
+        masqCore.getSavedConfiguration(),
+      ]);
+      if (initialization !== initializationEpoch.current) {
+        return;
+      }
+      if (
+        initialStatus.chain !== null &&
+        (!saved || saved.chain !== initialStatus.chain)
+      ) {
+        throw new Error(
+          'The saved MASQ configuration is missing or does not match the active native network profile.',
+        );
+      }
+      const loadedDraft: SetupDraft = saved
+        ? {
+            ...DEFAULT_SETUP,
+            ...saved,
+            neighbors: [...saved.neighbors],
+            walletSecret: '',
+          }
+        : { ...DEFAULT_SETUP, neighbors: [], walletSecret: '' };
+      setStatus(initialStatus);
+      setNetwork(initialNetwork);
+      setDraft(loadedDraft);
+      profileReadyRef.current = true;
+      setInitializationState('ready');
+    } catch (caught) {
+      if (initialization !== initializationEpoch.current) {
+        return;
+      }
+      profileReadyRef.current = false;
+      setInitializationState('error');
+      setIssue(
+        classifyMasqIssue(caught, networkRef.current, statusRef.current),
+      );
+    } finally {
+      if (initialization === initializationEpoch.current) {
+        setBusy(false);
+      }
+    }
+  }, []);
+
   const cancelConnectionAttempt = useCallback(() => {
     connectAbort.current?.abort();
     connectAbort.current = null;
@@ -108,6 +175,7 @@ export function useMasqController() {
   const refresh = useCallback(() => run(() => masqCore.getStatus()), [run]);
 
   const refreshWalletBalance = useCallback(async () => {
+    requireProfileReady();
     const walletAddress = status.walletAddress;
     const chain = status.chain;
     if (!walletAddress || !chain) {
@@ -153,10 +221,16 @@ export function useMasqController() {
         balanceAbort.current = null;
       }
     }
-  }, [draft.rpcUrl, status.chain, status.walletAddress]);
+  }, [
+    draft.rpcUrl,
+    requireProfileReady,
+    status.chain,
+    status.walletAddress,
+  ]);
 
   const updateSystemTunnel = useCallback(
     async (mode: SystemTunnelMode, selectedApps: string[]) => {
+      requireProfileReady();
       setSystemTunnelBusy(true);
       try {
         const next = await masqCore.setSystemTunnel(mode, selectedApps);
@@ -166,7 +240,7 @@ export function useMasqController() {
         setSystemTunnelBusy(false);
       }
     },
-    [],
+    [requireProfileReady],
   );
 
   const disableSystemTunnel = useCallback(async () => {
@@ -187,6 +261,7 @@ export function useMasqController() {
 
   const saveSetup = useCallback(
     async (nextDraft: SetupDraft) => {
+      requireProfileReady();
       desiredConnected.current = false;
       cancelConnectionAttempt();
       let savedDraft = nextDraft;
@@ -205,10 +280,13 @@ export function useMasqController() {
       });
       setDraft({ ...savedDraft, configVersion: 2, walletSecret: '' });
     },
-    [cancelConnectionAttempt, run],
+    [cancelConnectionAttempt, requireProfileReady, run],
   );
 
   const connect = useCallback(() => {
+    if (!profileReadyRef.current) {
+      return Promise.reject(new Error(PROFILE_NOT_READY_MESSAGE));
+    }
     desiredConnected.current = true;
     const flight = connectFlight.current;
     if (flight.isRunning) {
@@ -267,14 +345,16 @@ export function useMasqController() {
 
   const updateMinHops = useCallback(
     async (minHops: number) => {
+      requireProfileReady();
       const next = await run(() => masqCore.updateMinHops(minHops));
       setDraft(current => ({ ...current, minHops }));
       return next;
     },
-    [run],
+    [requireProfileReady, run],
   );
 
   const reset = useCallback(async () => {
+    requireProfileReady();
     desiredConnected.current = false;
     cancelConnectionAttempt();
     const next = await run(async () => {
@@ -283,9 +363,15 @@ export function useMasqController() {
     });
     setDraft({ ...DEFAULT_SETUP, neighbors: [] });
     return next;
-  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+  }, [
+    cancelConnectionAttempt,
+    disableSystemTunnel,
+    requireProfileReady,
+    run,
+  ]);
 
   const resetNetworkProfile = useCallback(async () => {
+    requireProfileReady();
     desiredConnected.current = false;
     cancelConnectionAttempt();
     const next = await run(async () => {
@@ -299,9 +385,15 @@ export function useMasqController() {
       neighbors: [],
     }));
     return next;
-  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+  }, [
+    cancelConnectionAttempt,
+    disableSystemTunnel,
+    requireProfileReady,
+    run,
+  ]);
 
   const removeWallet = useCallback(async () => {
+    requireProfileReady();
     desiredConnected.current = false;
     cancelConnectionAttempt();
     const next = await run(async () => {
@@ -310,37 +402,20 @@ export function useMasqController() {
     });
     setDraft(current => ({ ...current, walletSecret: '' }));
     return next;
-  }, [cancelConnectionAttempt, disableSystemTunnel, run]);
+  }, [
+    cancelConnectionAttempt,
+    disableSystemTunnel,
+    requireProfileReady,
+    run,
+  ]);
 
   useEffect(() => {
-    let cancelled = false;
-    const epoch = operationEpoch.current;
-    Promise.all([
-      masqCore.getStatus(),
-      masqCore.getNetworkStatus().catch(() => UNKNOWN_NETWORK),
-      masqCore.getSavedConfiguration(),
-    ])
-      .then(([initialStatus, initialNetwork, saved]) => {
-        if (cancelled || epoch !== operationEpoch.current) return;
-        setStatus(initialStatus);
-        setNetwork(initialNetwork);
-        if (saved) {
-          setDraft(current => ({ ...current, ...saved, walletSecret: '' }));
-        }
-      })
-      .catch(caught => {
-        if (cancelled) return;
-        setIssue(
-          classifyMasqIssue(caught, networkRef.current, statusRef.current),
-        );
-      })
-      .finally(() => {
-        if (!cancelled && epoch === operationEpoch.current) setBusy(false);
-      });
+    initialize().catch(() => undefined);
     return () => {
-      cancelled = true;
+      initializationEpoch.current += 1;
+      profileReadyRef.current = false;
     };
-  }, []);
+  }, [initialize]);
 
   useEffect(() => {
     let cancelled = false;
@@ -371,7 +446,11 @@ export function useMasqController() {
   }, []);
 
   useEffect(() => {
-    if (!status.walletAddress || !status.chain) {
+    if (
+      initializationState !== 'ready' ||
+      !status.walletAddress ||
+      !status.chain
+    ) {
       balanceAbort.current?.abort();
       balanceAbort.current = null;
       setWalletBalance(EMPTY_WALLET_BALANCE);
@@ -388,7 +467,12 @@ export function useMasqController() {
       balanceAbort.current?.abort();
       balanceAbort.current = null;
     };
-  }, [refreshWalletBalance, status.chain, status.walletAddress]);
+  }, [
+    initializationState,
+    refreshWalletBalance,
+    status.chain,
+    status.walletAddress,
+  ]);
 
   // The next poll is scheduled only after the previous native call settles.
   // The epoch prevents an old poll from overwriting a newer user operation.
@@ -453,6 +537,7 @@ export function useMasqController() {
         if (
           changed &&
           next.available &&
+          profileReadyRef.current &&
           desiredConnected.current &&
           statusRef.current.phase !== 'connected' &&
           !reconnecting
@@ -489,6 +574,7 @@ export function useMasqController() {
           setStatus(nextStatus);
           setNetwork(nextNetwork);
           if (
+            profileReadyRef.current &&
             desiredConnected.current &&
             nextNetwork.available &&
             !['connected', 'connecting'].includes(nextStatus.phase)
@@ -522,13 +608,15 @@ export function useMasqController() {
     connectionProgress,
     draft,
     busy,
+    profileReady: initializationState === 'ready',
+    initializationState,
     issue,
     entryNodeRefresh,
     walletBalance,
     systemTunnel,
     routableApps,
     systemTunnelBusy,
-    setDraft,
+    retryInitialization: initialize,
     saveSetup,
     connect,
     disconnect,

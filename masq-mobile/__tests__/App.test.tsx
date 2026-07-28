@@ -9,6 +9,7 @@ import {
   BackHandler,
   Platform,
   Text,
+  TextInput,
   type AppStateStatus,
 } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
@@ -32,6 +33,8 @@ const HARDWARE_BACK_EVENT = {
 };
 const mockController = {
   busy: false,
+  profileReady: true,
+  initializationState: 'ready' as 'loading' | 'ready' | 'error',
   connectionProgress: { step: 1, total: 5, label: 'Ready' },
   draft: DEFAULT_SETUP,
   entryNodeRefresh: null,
@@ -44,6 +47,7 @@ const mockController = {
     interface: 'wifi',
   } as NetworkStatus,
   refresh: jest.fn().mockResolvedValue(EMPTY_STATUS),
+  retryInitialization: jest.fn().mockResolvedValue(undefined),
   refreshWalletBalance: jest.fn().mockResolvedValue(undefined),
   removeWallet: jest.fn().mockResolvedValue(undefined),
   reset: jest.fn().mockResolvedValue(undefined),
@@ -121,9 +125,14 @@ describe('App browser routing modes', () => {
       .mockImplementation(async (_core, mode) => mode);
     mockCloseBrowserSession.mockReset().mockResolvedValue('blocked');
     mockController.refresh.mockClear();
+    mockController.retryInitialization.mockClear();
     mockController.connect.mockClear();
     mockController.disconnect.mockClear();
     mockController.systemTunnel = UNSUPPORTED_SYSTEM_TUNNEL;
+    mockController.profileReady = true;
+    mockController.initializationState = 'ready';
+    mockController.busy = false;
+    mockController.draft = DEFAULT_SETUP;
     mockController.status = { ...EMPTY_STATUS };
     mockController.network = {
       available: true,
@@ -643,6 +652,80 @@ describe('App browser routing modes', () => {
 
     ReactTestRenderer.act(() => renderer.unmount());
     expect(remove).toHaveBeenCalled();
+  });
+
+  it('does not capture defaults before the complete saved profile is ready', async () => {
+    const savedDraft = {
+      ...DEFAULT_SETUP,
+      rpcUrl: 'https://saved-profile.example',
+      neighbors: [
+        'masq://base-mainnet:key-one@198.51.100.10:443',
+        'masq://base-mainnet:key-two@198.51.100.11:443',
+      ],
+      minHops: 5,
+    };
+    mockController.busy = true;
+    mockController.profileReady = false;
+    mockController.initializationState = 'loading';
+    mockController.draft = DEFAULT_SETUP;
+    const renderer = await renderApp();
+
+    const settings = findButton(renderer, 'Node & wallet settings');
+    expect(settings.props.disabled).toBe(true);
+    expect(settings.props.accessibilityState).toEqual({ disabled: true });
+    expect(
+      findButton(renderer, 'Browse without MASQ').props.disabled,
+    ).toBe(true);
+    expect(
+      renderer.root.findByProps({
+        accessibilityLabel: 'Loading saved Node and wallet profile',
+      }).props.disabled,
+    ).toBe(true);
+
+    ReactTestRenderer.act(() => settings.props.onPress());
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Set up MASQ');
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Node and wallet actions stay locked until the complete saved profile is available',
+    );
+
+    mockController.busy = false;
+    mockController.profileReady = true;
+    mockController.initializationState = 'ready';
+    mockController.draft = savedDraft;
+    await ReactTestRenderer.act(async () => {
+      renderer.update(<App />);
+      await Promise.resolve();
+    });
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Node & wallet settings').props.onPress(),
+    );
+
+    expect(JSON.stringify(renderer.toJSON())).toContain('Set up MASQ');
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Advanced network settings').props.onPress(),
+    );
+    expect(
+      renderer.root
+        .findAllByType(TextInput)
+        .some(input => input.props.value === savedDraft.rpcUrl),
+    ).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('offers an explicit retry after profile initialization fails', async () => {
+    mockController.profileReady = false;
+    mockController.initializationState = 'error';
+    const renderer = await renderApp();
+
+    const retry = findButton(renderer, 'Retry profile loading');
+    expect(retry.props.disabled).toBeFalsy();
+    ReactTestRenderer.act(() => retry.props.onPress());
+
+    expect(mockController.retryInitialization).toHaveBeenCalledTimes(1);
+    expect(
+      findButton(renderer, 'Node & wallet settings').props.disabled,
+    ).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
   });
 });
 

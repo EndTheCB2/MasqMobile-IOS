@@ -20,6 +20,8 @@ import { colors, radii } from '../ui/theme';
 interface Props {
   status: CoreStatus;
   busy: boolean;
+  profileReady: boolean;
+  initializationState: 'loading' | 'ready' | 'error';
   network: NetworkStatus;
   connectionProgress: { step: number; total: number; label: string };
   entryNodeRefresh: { attempt: number; maxAttempts: number } | null;
@@ -27,6 +29,7 @@ interface Props {
   walletBalance: WalletBalanceState;
   systemTunnel: SystemTunnelStatus;
   onConnect: () => void;
+  onRetryInitialization: () => void;
   onDisconnect: () => void;
   onReset: () => void;
   onResetNetwork: () => void;
@@ -46,6 +49,8 @@ interface Props {
 export function HomeScreen({
   status,
   busy,
+  profileReady,
+  initializationState,
   network,
   connectionProgress,
   entryNodeRefresh,
@@ -53,6 +58,7 @@ export function HomeScreen({
   walletBalance,
   systemTunnel,
   onConnect,
+  onRetryInitialization,
   onDisconnect,
   onReset,
   onResetNetwork,
@@ -68,8 +74,10 @@ export function HomeScreen({
   onUpdateMinHops,
   onRefreshWalletBalance,
 }: Props) {
-  const connected = status.phase === 'connected';
-  const configured = Boolean(status.chain && status.walletAddress);
+  const connected = profileReady && status.phase === 'connected';
+  const configured = Boolean(
+    profileReady && status.chain && status.walletAddress,
+  );
 
   return (
     <View style={styles.screen}>
@@ -84,8 +92,13 @@ export function HomeScreen({
             {issue.action === 'retry' ? (
               <Pressable
                 accessibilityRole="button"
+                accessibilityState={{ disabled: !profileReady }}
+                disabled={!profileReady}
                 onPress={onRetry}
-                style={styles.errorAction}
+                style={[
+                  styles.errorAction,
+                  !profileReady && styles.profileActionDisabled,
+                ]}
               >
                 <Text style={styles.errorActionText}>Retry connection</Text>
               </Pressable>
@@ -102,8 +115,13 @@ export function HomeScreen({
             {issue.action === 'network-profile' || issue.action === 'wallet' ? (
               <Pressable
                 accessibilityRole="button"
+                accessibilityState={{ disabled: !profileReady }}
+                disabled={!profileReady}
                 onPress={onOpenSetup}
-                style={styles.errorAction}
+                style={[
+                  styles.errorAction,
+                  !profileReady && styles.profileActionDisabled,
+                ]}
               >
                 <Text style={styles.errorActionText}>
                   {issue.action === 'wallet'
@@ -135,9 +153,19 @@ export function HomeScreen({
             />
             <Text style={styles.badgeText}>MASQ DMESH · CONSUME</Text>
           </View>
-          <Text style={styles.state}>{phaseLabel(status)}</Text>
+          <Text style={styles.state}>
+            {profileReady
+              ? phaseLabel(status)
+              : initializationState === 'loading'
+              ? 'Loading saved profile…'
+              : 'Saved profile unavailable'}
+          </Text>
           <Text style={styles.subtitle}>
-            {connected
+            {!profileReady
+              ? initializationState === 'loading'
+                ? 'Node and wallet actions stay locked until the complete saved profile is available.'
+                : 'Retry profile loading before changing Node, wallet or routing settings.'
+              : connected
               ? `${
                   status.routeHops
                     ? `${status.routeHops} ${
@@ -165,7 +193,27 @@ export function HomeScreen({
         </View>
 
         <View style={styles.actions}>
-          {connected ? (
+          {!profileReady ? (
+            <Button
+              accessibilityLabel={
+                initializationState === 'loading'
+                  ? 'Loading saved Node and wallet profile'
+                  : 'Retry saved profile loading'
+              }
+              accessibilityState={{
+                busy: initializationState === 'loading',
+                disabled: initializationState === 'loading',
+              }}
+              label={
+                initializationState === 'loading'
+                  ? 'Loading saved profile…'
+                  : 'Retry profile loading'
+              }
+              onPress={onRetryInitialization}
+              busy={initializationState === 'loading'}
+              disabled={initializationState === 'loading'}
+            />
+          ) : connected ? (
             <>
               <Button
                 label={
@@ -216,7 +264,9 @@ export function HomeScreen({
             onPress={onOpenDirectBrowser}
             tone="secondary"
             disabled={
-              busy || (!network.available && network.interface !== 'unknown')
+              !profileReady ||
+              busy ||
+              (!network.available && network.interface !== 'unknown')
             }
           />
         </View>
@@ -376,9 +426,15 @@ export function HomeScreen({
         ) : null}
 
         <Pressable
+          accessibilityState={{ disabled: !profileReady }}
           accessibilityRole="button"
+          disabled={!profileReady}
           onPress={onOpenSetup}
-          style={({ pressed }) => [styles.settings, pressed && styles.pressed]}
+          style={({ pressed }) => [
+            styles.settings,
+            !profileReady && styles.profileActionDisabled,
+            pressed && styles.pressed,
+          ]}
         >
           <Card>
             <View style={styles.settingsRow}>
@@ -386,7 +442,11 @@ export function HomeScreen({
                 <Text style={styles.settingsEyebrow}>CONNECTION PROFILE</Text>
                 <Text style={styles.settingsTitle}>Node & wallet settings</Text>
                 <Text numberOfLines={1} style={styles.settingsMeta}>
-                  {status.walletAddress
+                  {!profileReady
+                    ? initializationState === 'loading'
+                      ? 'Loading the complete saved profile…'
+                      : 'Retry profile loading to edit safely'
+                    : status.walletAddress
                     ? `${status.chain} · ${status.minHops} ${
                         status.minHops === 1 ? 'hop' : 'hops'
                       } · ${exitCountryName(status.exitCountry)}`
@@ -624,6 +684,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 11,
     paddingVertical: 9,
   },
+  profileActionDisabled: { opacity: 0.48 },
   errorActionText: { color: colors.white, fontSize: 12, fontWeight: '700' },
   actions: { gap: 11 },
   statsRow: { flexDirection: 'row', gap: 12, marginTop: 22 },

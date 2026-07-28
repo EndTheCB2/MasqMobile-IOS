@@ -27,8 +27,12 @@ function homeScreen(
   statusOverrides: Partial<CoreStatus> = {},
   options: {
     busy?: boolean;
+    profileReady?: boolean;
+    initializationState?: 'loading' | 'ready' | 'error';
     network?: NetworkStatus;
     onOpenDirectBrowser?: () => void;
+    onOpenSetup?: () => void;
+    onRetryInitialization?: () => void;
     onOpenTrafficRouting?: () => void;
     systemTunnel?: SystemTunnelStatus;
   } = {},
@@ -36,6 +40,8 @@ function homeScreen(
   return (
     <HomeScreen
       busy={options.busy ?? true}
+      profileReady={options.profileReady ?? true}
+      initializationState={options.initializationState ?? 'ready'}
       connectionProgress={{ step: 2, total: 5, label: 'Finding nodes' }}
       entryNodeRefresh={{ attempt: 1, maxAttempts: 3 }}
       issue={null}
@@ -43,10 +49,11 @@ function homeScreen(
       systemTunnel={options.systemTunnel ?? UNSUPPORTED_SYSTEM_TUNNEL}
       network={options.network ?? network}
       onConnect={jest.fn()}
+      onRetryInitialization={options.onRetryInitialization ?? jest.fn()}
       onDisconnect={onDisconnect}
       onOpenBrowser={jest.fn()}
       onOpenDirectBrowser={options.onOpenDirectBrowser ?? jest.fn()}
-      onOpenSetup={jest.fn()}
+      onOpenSetup={options.onOpenSetup ?? jest.fn()}
       onOpenTrafficRouting={options.onOpenTrafficRouting ?? jest.fn()}
       onOpenPrivacy={jest.fn()}
       onOpenSystemSettings={jest.fn()}
@@ -185,6 +192,76 @@ describe('HomeScreen connection controls', () => {
     );
     ReactTestRenderer.act(() => control.props.onPress());
     expect(onOpenTrafficRouting).toHaveBeenCalledTimes(1);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('locks profile-dependent actions while the saved profile is loading', () => {
+    const onOpenSetup = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          {
+            chain: 'base-mainnet',
+            phase: 'ready',
+            walletAddress: '0x1234567890abcdef',
+          },
+          {
+            busy: true,
+            initializationState: 'loading',
+            onOpenSetup,
+            profileReady: false,
+          },
+        ),
+      );
+    });
+
+    const settings = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Node & wallet settings'),
+    );
+    expect(settings.props.disabled).toBe(true);
+    expect(settings.props.accessibilityState).toEqual({ disabled: true });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Loading the complete saved profile',
+    );
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
+      'CONSUMER FUNDS',
+    );
+    expect(onOpenSetup).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('retries failed profile initialization without opening settings', () => {
+    const onRetryInitialization = jest.fn();
+    const onOpenSetup = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(jest.fn(), { phase: 'unconfigured' }, {
+          busy: false,
+          initializationState: 'error',
+          onOpenSetup,
+          onRetryInitialization,
+          profileReady: false,
+        }),
+      );
+    });
+
+    const retry = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Retry profile loading'),
+    );
+    ReactTestRenderer.act(() => retry.props.onPress());
+    expect(onRetryInitialization).toHaveBeenCalledTimes(1);
+    expect(onOpenSetup).not.toHaveBeenCalled();
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
