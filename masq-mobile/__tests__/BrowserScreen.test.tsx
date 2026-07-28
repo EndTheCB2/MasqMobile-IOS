@@ -1,5 +1,11 @@
 import React from 'react';
-import { TextInput } from 'react-native';
+import {
+  AppState,
+  BackHandler,
+  Platform,
+  TextInput,
+  type AppStateStatus,
+} from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 
 import type {
@@ -11,6 +17,11 @@ const mockReload = jest.fn();
 const mockGoBack = jest.fn();
 const mockPrepareBrowserProtection = jest.fn();
 const mockSetBrowserProtection = jest.fn();
+const TEST_PLATFORM_OS = Platform.OS;
+const HARDWARE_BACK_EVENT = {
+  timeStamp: 0,
+  type: 'hardwareBackPress',
+};
 const PUBLIC_PROTECTION: BrowserProtectionConfiguration = {
   blockAdsAndTrackers: true,
   blockCrossSiteCookies: true,
@@ -64,8 +75,155 @@ describe('BrowserScreen recovery lifecycle', () => {
   });
 
   afterEach(() => {
+    (Platform as unknown as { OS: string }).OS = TEST_PLATFORM_OS;
     jest.restoreAllMocks();
     jest.useRealTimers();
+  });
+
+  it('uses Android hardware back for WebView history before closing', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    let hardwareBack:
+      | ((event: typeof HARDWARE_BACK_EVENT) => boolean | null | undefined)
+      | undefined;
+    const remove = jest.fn();
+    jest
+      .spyOn(BackHandler, 'addEventListener')
+      .mockImplementation((_event, listener) => {
+        hardwareBack = listener;
+        return { remove };
+      });
+    const onClose = jest.fn().mockResolvedValue(undefined);
+    const renderer = await renderBrowser('masq', onClose);
+    const address = renderer.root.findByType(TextInput);
+
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const webView = renderer.root.findByProps({ testID: 'private-webview' });
+    ReactTestRenderer.act(() => {
+      webView.props.onNavigationStateChange({
+        canGoBack: true,
+        url: 'https://example.com/page',
+      });
+    });
+
+    expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
+    expect(mockGoBack).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    ReactTestRenderer.act(() => {
+      webView.props.onNavigationStateChange({
+        canGoBack: false,
+        url: 'https://example.com/',
+      });
+    });
+    await ReactTestRenderer.act(async () => {
+      expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    expect(
+      renderer.root.findByProps({ testID: 'browser-close-state' }),
+    ).toBeDefined();
+    ReactTestRenderer.act(() => renderer.unmount());
+    expect(remove).toHaveBeenCalled();
+  });
+
+  it('unmounts browsing immediately, deduplicates close, and retries only blocking', async () => {
+    let rejectClose!: (reason: Error) => void;
+    const onClose = jest
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectClose = reject;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    const renderer = await renderBrowser('masq', onClose);
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const close = renderer.root.findByProps({
+      accessibilityLabel: 'Close private browser',
+    });
+
+    ReactTestRenderer.act(() => {
+      close.props.onPress();
+      close.props.onPress();
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The page is closed while MASQ confirms',
+    );
+
+    await ReactTestRenderer.act(async () => {
+      rejectClose(new Error('Native mode was direct.'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Browser close needs confirmation',
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'browsing will not resume',
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Native mode was direct.',
+    );
+
+    await ReactTestRenderer.act(async () => {
+      renderer.root
+        .findByProps({ accessibilityLabel: 'Retry closing browser' })
+        .props.onPress();
+      await Promise.resolve();
+    });
+    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('closes an active WebView fail-closed when the app is backgrounded', async () => {
+    const appStateChanges: Array<(state: AppStateStatus) => void> = [];
+    jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_event, listener) => {
+        appStateChanges.push(listener);
+        return { remove: jest.fn() };
+      });
+    const onClose = jest.fn().mockResolvedValue(undefined);
+    const renderer = await renderBrowser('direct', onClose);
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).not.toHaveLength(0);
+
+    await ReactTestRenderer.act(async () => {
+      appStateChanges.forEach(listener => listener('background'));
+      await Promise.resolve();
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('background');
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    ReactTestRenderer.act(() => renderer.unmount());
   });
 
   it('cancels a scheduled retry when the user navigates elsewhere', async () => {
@@ -359,10 +517,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       });
       await Promise.resolve();
     });
-    expect(getSiteSettings).toHaveBeenLastCalledWith(
-      'masq',
-      'second.example',
-    );
+    expect(getSiteSettings).toHaveBeenLastCalledWith('masq', 'second.example');
     expect(
       renderer.root.findByProps({ testID: 'private-webview' }).props.source,
     ).toEqual({ uri: 'https://second.example/' });
@@ -403,10 +558,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       await Promise.resolve();
     });
     expect(allowed).toBe(false);
-    expect(getSiteSettings).toHaveBeenLastCalledWith(
-      'masq',
-      'second.example',
-    );
+    expect(getSiteSettings).toHaveBeenLastCalledWith('masq', 'second.example');
     webView = renderer.root.findByProps({ testID: 'private-webview' });
     expect(webView.props.source).toEqual({
       uri: 'https://second.example/',
@@ -424,10 +576,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       await Promise.resolve();
     });
     expect(allowed).toBe(false);
-    expect(getSiteSettings).toHaveBeenLastCalledWith(
-      'masq',
-      'login.example',
-    );
+    expect(getSiteSettings).toHaveBeenLastCalledWith('masq', 'login.example');
     expect(
       renderer.root.findByProps({ testID: 'private-webview' }).props.source,
     ).toEqual({ uri: 'https://login.example/' });
@@ -882,11 +1031,14 @@ describe('BrowserScreen recovery lifecycle', () => {
   });
 });
 
-async function renderBrowser(mode: 'masq' | 'direct' = 'masq') {
+async function renderBrowser(
+  mode: 'masq' | 'direct' = 'masq',
+  onClose: (reason?: 'user' | 'background') => Promise<void> | void = jest.fn(),
+) {
   let renderer!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
     renderer = ReactTestRenderer.create(
-      <BrowserScreen mode={mode} onClose={jest.fn()} />,
+      <BrowserScreen mode={mode} onClose={onClose} />,
     );
     await Promise.resolve();
     await Promise.resolve();
@@ -895,9 +1047,7 @@ async function renderBrowser(mode: 'masq' | 'direct' = 'masq') {
   return renderer;
 }
 
-async function submitAddress(
-  address: ReactTestRenderer.ReactTestInstance,
-) {
+async function submitAddress(address: ReactTestRenderer.ReactTestInstance) {
   await ReactTestRenderer.act(async () => {
     address.props.onSubmitEditing();
     await Promise.resolve();

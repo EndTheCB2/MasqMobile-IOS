@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   AppState,
+  BackHandler,
   Linking,
+  Platform,
   Share,
   StatusBar,
   StyleSheet,
@@ -21,6 +23,7 @@ import { classifyMasqIssue } from './src/core/issues';
 import { useMasqController } from './src/hooks/useMasqController';
 import {
   BrowserScreen,
+  type BrowserCloseReason,
   type BrowserMode,
 } from './src/screens/BrowserScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
@@ -79,11 +82,16 @@ function AppContent() {
       setPrivacyShielded(state !== 'active');
       if (state !== 'active') {
         browserOperation.current += 1;
+        // An active BrowserScreen immediately unmounts its WebView and owns the
+        // acknowledged close/retry lifecycle. This listener handles only a
+        // session that is still opening and has no WebView yet.
+        if (route === 'browser' && browserMode) {
+          return;
+        }
         closeBrowserSession(masqCore).catch(() => undefined);
         setBrowserMode(null);
-        if (route === 'browser' || browserOpening) {
-          const interruptedMode =
-            browserMode ?? openingBrowserMode.current;
+        if (browserOpening) {
+          const interruptedMode = browserMode ?? openingBrowserMode.current;
           setRoute('home');
           if (interruptedMode === 'masq') {
             setDirectBrowserError(null);
@@ -101,6 +109,26 @@ function AppContent() {
     });
     return () => subscription.remove();
   }, [browserMode, browserOpening, route]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (route === 'setup' || route === 'routing' || route === 'privacy') {
+          setRoute('home');
+          return true;
+        }
+        // BrowserScreen owns WebView history and fail-closed session shutdown.
+        // Returning false lets its later listener handle the same event. Home
+        // also returns false so Android keeps its normal app-exit behavior.
+        return false;
+      },
+    );
+    return () => subscription.remove();
+  }, [route]);
 
   const openSetup = () => {
     setDirectBrowserError(null);
@@ -264,11 +292,25 @@ function AppContent() {
     });
   };
 
-  const closeBrowser = async () => {
+  const closeBrowser = async (reason: BrowserCloseReason = 'user') => {
+    const closingMode = browserMode;
     browserOperation.current += 1;
-    await closeBrowserSession(masqCore).catch(() => undefined);
+    await closeBrowserSession(masqCore);
     setBrowserMode(null);
     await controller.refresh().catch(() => undefined);
+    if (reason === 'background') {
+      if (closingMode === 'masq') {
+        setDirectBrowserError(null);
+        setRouteError(
+          'MASQ Private was closed while the app was in the background. Reopen it to run a new route check.',
+        );
+      } else {
+        setRouteError(null);
+        setDirectBrowserError(
+          'The direct browser was closed while the app was in the background. Reopen it explicitly to start a new session.',
+        );
+      }
+    }
     setRoute('home');
   };
 

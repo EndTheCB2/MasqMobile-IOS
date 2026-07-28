@@ -4,9 +4,7 @@ import type { CoreStatus } from './types';
 export type BrowserSessionMode = Exclude<BrowserRoutingMode, 'blocked'>;
 
 interface BrowserSessionCore {
-  setBrowserRoutingMode(
-    mode: BrowserRoutingMode,
-  ): Promise<BrowserRoutingMode>;
+  setBrowserRoutingMode(mode: BrowserRoutingMode): Promise<BrowserRoutingMode>;
   preflightBrowserProxy(): Promise<CoreStatus>;
 }
 
@@ -15,7 +13,7 @@ export async function prepareBrowserSession(
   mode: BrowserSessionMode,
 ): Promise<BrowserRoutingMode> {
   try {
-    await core.setBrowserRoutingMode('blocked');
+    await closeBrowserSession(core);
     const appliedMode = await core.setBrowserRoutingMode(mode);
     if (appliedMode !== mode) {
       throw new Error('The browser routing mode could not be confirmed.');
@@ -25,7 +23,13 @@ export async function prepareBrowserSession(
     }
     return appliedMode;
   } catch (error) {
-    await core.setBrowserRoutingMode('blocked').catch(() => 'blocked');
+    try {
+      await closeBrowserSession(core);
+    } catch {
+      throw new Error(
+        'The browser session failed and browser traffic could not be confirmed blocked.',
+      );
+    }
     throw error;
   }
 }
@@ -33,5 +37,9 @@ export async function prepareBrowserSession(
 export async function closeBrowserSession(
   core: Pick<BrowserSessionCore, 'setBrowserRoutingMode'>,
 ): Promise<BrowserRoutingMode> {
-  return core.setBrowserRoutingMode('blocked');
+  const appliedMode = await core.setBrowserRoutingMode('blocked');
+  if (appliedMode !== 'blocked') {
+    throw new Error('Browser traffic could not be confirmed blocked.');
+  }
+  return appliedMode;
 }
