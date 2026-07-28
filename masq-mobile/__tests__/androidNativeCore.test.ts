@@ -98,6 +98,9 @@ describe('Android native MASQ core integration', () => {
     const apkVerifier = read('scripts/verify-android-apk-privacy.sh');
 
     expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_CERT_SHA256');
+    expect(releaseBuilder).toContain(
+      'APPROVED_CERT_SHA256="346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41"',
+    );
     expect(releaseBuilder).toContain('ALLOW_DEVELOPMENT_NODE_FINDER=YES');
     expect(releaseBuilder).toContain(
       'MASQ_ANDROID_KEY_ALIAS="${MASQ_ANDROID_KEY_ALIAS:-masq-mobile-preview2}"',
@@ -105,6 +108,20 @@ describe('Android native MASQ core integration', () => {
     expect(releaseBuilder).toContain('SIGNED_TEMP_APK');
     expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(releaseBuilder).toContain('--v4-signing-enabled false');
+    expect(releaseBuilder).toContain(
+      'unset MASQ_ANDROID_KEY_PASSWORD MASQ_ANDROID_KEYSTORE_PASSWORD',
+    );
+    expect(releaseBuilder).not.toContain(
+      'export MASQ_ANDROID_KEY_PASSWORD MASQ_ANDROID_KEYSTORE_PASSWORD',
+    );
+    expect(
+      releaseBuilder.indexOf(
+        'unset MASQ_ANDROID_KEY_PASSWORD MASQ_ANDROID_KEYSTORE_PASSWORD',
+      ),
+    ).toBeLessThan(releaseBuilder.indexOf('./gradlew clean assembleRelease'));
+    expect(releaseBuilder).toContain(
+      'MASQ_ANDROID_KEYSTORE_PASSWORD="$KEYSTORE_PASSWORD_VALUE"',
+    );
     expect(releaseBuilder).toContain('ci\\.invalid\\.example');
     expect(apkVerifier).toContain('com.endthecb2.masqmobile');
     expect(apkVerifier).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');

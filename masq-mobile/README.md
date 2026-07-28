@@ -168,9 +168,11 @@ privacy-scans a versioned APK. It requires `MASQ_ANDROID_KEYSTORE`,
 `MASQ_ANDROID_KEYSTORE_PASSWORD`, an optional `MASQ_ANDROID_KEY_PASSWORD` and
 `MASQ_NODE_FINDER_URL` in the local environment. It also requires
 `MASQ_ANDROID_EXPECTED_CERT_SHA256`, copied from the approved keystore's public certificate
-fingerprint, so an accidental signing-key change cannot produce a release. Read it with
+fingerprint. The official direct-release script also pins the preview.2 certificate, so changing
+only the environment cannot silently produce an incompatible update. Read the fingerprint with
 `keytool -list -v -keystore "$MASQ_ANDROID_KEYSTORE"` and remove the displayed colon separators.
-The keystore and passwords must remain outside the repository. End-user installation and update
+The keystore and passwords must remain outside the repository; the script exposes the passwords
+only to the signing subprocess, after compilation has finished. End-user installation and update
 instructions are in
 [`../ANDROID_DIRECT_INSTALL.md`](../ANDROID_DIRECT_INSTALL.md).
 
@@ -189,8 +191,9 @@ instructions are in
    Exact-host protection exceptions and remembered sign-ins are opt-in.
 9. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
    the logical ENS address in the bar.
-10. On Android, optionally open Traffic scope and protect the whole device or selected apps. Android
-   asks once for VPN permission; the selected package names stay on the device.
+10. In public Android previews, only traffic from the embedded **MASQ Private** browser can use
+    MASQ. Whole-device and selected-app routing remain unavailable until lifecycle, handover and
+    leak tests pass.
 
 A real route requires reachable entry nodes and a wallet that meets the network requirements. No
 community nodes or private keys are intentionally hardcoded in the source code.

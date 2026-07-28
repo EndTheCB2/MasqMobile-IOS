@@ -48,6 +48,10 @@ not affected. Future releases must retain preview.2 certificate SHA-256
   fresh connection attempt.
 - Late results from cancelled connection attempts can no longer overwrite the refreshed profile
   or reopen a route after the user has disconnected.
+- Public documentation now states explicitly that whole-device and selected-app routing remain
+  unavailable, matching the enforced safety gate.
+- The direct-release builder pins the established update certificate and keeps signing passwords
+  out of Gradle, Cargo and Node build subprocesses.
 
 ## Included
 
