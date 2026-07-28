@@ -4,7 +4,7 @@ import type { CoreStatus, NetworkStatus } from '../core/types';
 import type { MasqIssue } from '../core/issues';
 import type { WalletBalanceState } from '../core/walletBalance';
 import {
-  SYSTEM_TUNNEL_PUBLICLY_ENABLED,
+  systemTunnelTrafficDisposition,
   type SystemTunnelStatus,
 } from '../core/systemTunnel';
 import { HOP_OPTIONS, exitCountryName } from '../core/routingPreferences';
@@ -415,14 +415,15 @@ export function HomeScreen({
           </View>
         ) : null}
 
-        {configured &&
-        systemTunnel.supported &&
-        (SYSTEM_TUNNEL_PUBLICLY_ENABLED || systemTunnel.phase !== 'off') ? (
+        {systemTunnel.supported ? (
           <Pressable
+            accessibilityState={{ disabled: !profileReady }}
             accessibilityRole="button"
+            disabled={!profileReady}
             onPress={onOpenTrafficRouting}
             style={({ pressed }) => [
               styles.trafficRouting,
+              !profileReady && styles.profileActionDisabled,
               pressed && styles.pressed,
             ]}
           >
@@ -431,14 +432,10 @@ export function HomeScreen({
                 <View style={styles.settingsBody}>
                   <Text style={styles.settingsEyebrow}>TRAFFIC SCOPE</Text>
                   <Text style={styles.settingsTitle}>
-                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
-                      ? systemTunnelTitle(systemTunnel)
-                      : 'Turn off experimental system routing'}
+                    {systemTunnelTitle(systemTunnel)}
                   </Text>
                   <Text style={styles.settingsMeta}>
-                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
-                      ? 'Configure whole-device or per-app routing'
-                      : 'New system tunnels are disabled in this preview'}
+                    {systemTunnelDetail(systemTunnel)}
                   </Text>
                 </View>
                 <Text style={styles.chevron}>›</Text>
@@ -593,20 +590,44 @@ function shortAddress(address: string): string {
 }
 
 function systemTunnelTitle(status: SystemTunnelStatus): string {
-  if (status.phase === 'blocked') {
-    return status.active
-      ? 'System traffic blocked'
-      : 'System routing unavailable';
+  const disposition = systemTunnelTrafficDisposition(status);
+  if (disposition === 'directRisk') {
+    return 'Traffic may be direct — check routing';
   }
-  if (status.mode === 'wholeDevice' && status.active) {
-    return 'Whole device protected';
+  if (disposition === 'blocked') {
+    return 'Captured system traffic is blocked';
   }
-  if (status.mode === 'selectedApps' && status.active) {
+  if (
+    disposition === 'masq' &&
+    status.mode === 'wholeDevice' &&
+    status.active
+  ) {
+    return 'Whole-device dogfood route active';
+  }
+  if (
+    disposition === 'masq' &&
+    status.mode === 'selectedApps' &&
+    status.active
+  ) {
     return `${status.selectedApps.length} selected app${
       status.selectedApps.length === 1 ? '' : 's'
-    } protected`;
+    } in active dogfood route`;
   }
   return 'Private browser only';
+}
+
+function systemTunnelDetail(status: SystemTunnelStatus): string {
+  const disposition = systemTunnelTrafficDisposition(status);
+  if (disposition === 'directRisk') {
+    return 'Android cannot confirm capture. Open Traffic scope and turn the route off or recover it.';
+  }
+  if (disposition === 'blocked') {
+    return 'Captured traffic is being held while the MASQ dogfood route is unavailable.';
+  }
+  if (disposition === 'masq') {
+    return 'IPv4 TCP/443 is reported through MASQ; dogfood limitations still apply.';
+  }
+  return 'Configure unsafe device or selected-app dogfood routing';
 }
 
 const styles = StyleSheet.create({

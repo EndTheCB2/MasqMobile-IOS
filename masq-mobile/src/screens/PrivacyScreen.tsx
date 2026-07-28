@@ -8,6 +8,7 @@ interface Props {
   onOpenPrivacyPolicy: () => void;
   onOpenSource: () => void;
   onOpenSupport: () => void;
+  systemRoutingSupported: boolean;
 }
 
 export function PrivacyScreen({
@@ -15,6 +16,7 @@ export function PrivacyScreen({
   onOpenPrivacyPolicy,
   onOpenSource,
   onOpenSupport,
+  systemRoutingSupported,
 }: Props) {
   return (
     <View style={styles.screen}>
@@ -62,6 +64,12 @@ export function PrivacyScreen({
           title="Free-text searches use Timpi"
           text="Text that is not recognized as a public web address is sent to the public Timpi Search website. In MASQ Private, Timpi sees the exit node's IP address; in Direct, it sees the public IP of your current connection or VPN. Timpi may process search queries, approximate location and service logs under its own privacy policy. The app does not separately log or synchronize your searches."
         />
+        {Platform.OS === 'android' && systemRoutingSupported ? (
+          <Disclosure
+            title="Android dogfood system routing is limited"
+            text="Only the separately compiled MASQ Dogfood (Unsafe) build can capture whole-device or selected-app traffic. It translates captured IPv4 TCP/443 and virtual DNS through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and unknown transports—is blocked only while capture remains valid. Activation opens a real CONNECT tunnel to example.com:443 through the MASQ exit to test reachability, without requesting a page or body. Selected package IDs and the consent timestamp stay on this device. Android snapshots package-to-UID scope when the route is created: shared-UID apps can share routing, attached restricted profiles may receive the scope, and work profiles are separate. Turn routing off before installing, removing, enabling, disabling or updating apps, then reapply it. Android 13 or later must grant notification permission before activation so the ongoing unsafe-routing state stays visible; turning routing off never requires that permission. VPN revocation or service/app-process death can restore direct traffic; Always-on/lockdown is unsupported. The temporary loopback MASQ proxy is unauthenticated, so a malicious local app that discovers its port could consume the route and wallet funds. This internal build must not be distributed publicly until package-change recovery and local proxy authentication are implemented."
+          />
+        ) : null}
         <Disclosure
           title="Independent open-source build"
           text="This is not an official MASQ Project release. The source is provided under GPL-3.0-only and third-party components retain their own licences. MASQ names and marks belong to their respective owner."

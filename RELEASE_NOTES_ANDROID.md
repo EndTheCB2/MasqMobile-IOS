@@ -47,6 +47,10 @@ not affected. Future releases must retain preview.2 certificate SHA-256
   settings, verifies that MASQ stopped, and preserves the consumer wallet.
 - Status and network polling remain paused until initialization has committed one current profile
   snapshot, so an older startup result cannot overwrite fresher native state.
+- Public documentation now states explicitly that whole-device and selected-app routing remain
+  unavailable, matching the enforced safety gate.
+- The direct-release builder pins the established update certificate and keeps signing passwords
+  out of Gradle, Cargo and Node build subprocesses.
 
 ## Included
 

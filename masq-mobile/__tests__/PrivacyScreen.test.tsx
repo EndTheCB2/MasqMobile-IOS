@@ -1,5 +1,5 @@
 import React from 'react';
-import { Text } from 'react-native';
+import { Platform, Text } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 
 import { PrivacyScreen } from '../src/screens/PrivacyScreen';
@@ -18,6 +18,7 @@ describe('PrivacyScreen', () => {
           onOpenPrivacyPolicy={onOpenPrivacyPolicy}
           onOpenSource={onOpenSource}
           onOpenSupport={onOpenSupport}
+          systemRoutingSupported={false}
         />,
       );
     });
@@ -70,5 +71,49 @@ describe('PrivacyScreen', () => {
     expect(onOpenSource).toHaveBeenCalledTimes(1);
     expect(onOpenSupport).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('shows complete system-routing data flow only in supported Android dogfood', () => {
+    const originalPlatform = Platform.OS;
+    Object.defineProperty(Platform, 'OS', {
+      configurable: true,
+      value: 'android',
+    });
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    try {
+      ReactTestRenderer.act(() => {
+        renderer = ReactTestRenderer.create(
+          <PrivacyScreen
+            onBack={jest.fn()}
+            onOpenPrivacyPolicy={jest.fn()}
+            onOpenSource={jest.fn()}
+            onOpenSupport={jest.fn()}
+            systemRoutingSupported
+          />,
+        );
+      });
+      const content = JSON.stringify(renderer.toJSON());
+      expect(content).toContain('Android dogfood system routing is limited');
+      expect(content).toContain('IPv4 TCP/443 and virtual DNS');
+      expect(content).toContain('All other captured IP traffic');
+      expect(content).toContain('ICMP and unknown transports');
+      expect(content).toContain('example.com:443');
+      expect(content).toContain('Selected package IDs and the consent timestamp');
+      expect(content).toContain('shared-UID apps can share routing');
+      expect(content).toContain('attached restricted profiles');
+      expect(content).toContain('work profiles are separate');
+      expect(content).toContain('Turn routing off before installing');
+      expect(content).toContain('must grant notification permission');
+      expect(content).toContain('turning routing off never requires');
+      expect(content).toContain('service/app-process death can restore direct');
+      expect(content).toContain('loopback MASQ proxy is unauthenticated');
+      expect(content).toContain('must not be distributed publicly');
+    } finally {
+      ReactTestRenderer.act(() => renderer?.unmount());
+      Object.defineProperty(Platform, 'OS', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
   });
 });

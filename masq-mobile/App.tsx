@@ -501,6 +501,7 @@ function AppContent() {
           onOpenSupport={() =>
             openExternalLink(SUPPORT_URL).catch(() => undefined)
           }
+          systemRoutingSupported={controller.systemTunnel.supported}
         />
       ) : null}
       {privacyShielded ? (

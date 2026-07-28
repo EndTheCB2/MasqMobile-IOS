@@ -605,9 +605,11 @@ describe('App browser routing modes', () => {
     };
     mockController.systemTunnel = {
       ...UNSUPPORTED_SYSTEM_TUNNEL,
-      lastError: 'Previous tunnel was blocked.',
-      phase: 'blocked',
+      active: true,
+      mode: 'wholeDevice',
+      phase: 'active',
       supported: true,
+      trafficDisposition: 'masq',
     };
     let hardwareBack:
       | ((event: typeof HARDWARE_BACK_EVENT) => boolean | null | undefined)
@@ -643,10 +645,7 @@ describe('App browser routing modes', () => {
     });
 
     ReactTestRenderer.act(() =>
-      findButton(
-        renderer,
-        'Turn off experimental system routing',
-      ).props.onPress(),
+      findButton(renderer, 'Whole-device dogfood route active').props.onPress(),
     );
     expect(JSON.stringify(renderer.toJSON())).toContain('Traffic routing');
     ReactTestRenderer.act(() => {

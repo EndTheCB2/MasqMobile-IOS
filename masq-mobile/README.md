@@ -93,8 +93,26 @@ React Native UI
 Android apps (optional)
   -> Android VpnService TUN
   -> isolated tun2proxy Rust library
-  -> the same fail-closed local CONNECT port
+  -> IPv4 TCP/443 plus virtual DNS only
+  -> the same local MASQ CONNECT port
 ```
+
+The optional path above exists only in the separately compiled
+`com.endthecb2.masqmobile.dogfood` package. The public build keeps it disabled. The dogfood
+`VpnService` captures either device scope or selected Android package UIDs and stores package IDs
+plus the consent timestamp locally. MASQ packages installed when the route is created are excluded.
+Android snapshots package-to-UID rules at that moment, so turn routing off before package changes
+and reapply it. Shared-UID apps can share routing behavior, attached restricted profiles may also
+receive the scope, and work-profile copies are a separate user scope. All other captured IP
+traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and unknown transports—is blocked only
+while Android capture remains valid. Activation opens a real CONNECT tunnel to `example.com:443`
+through the MASQ exit to test reachability without requesting a page/body. Service/process death or
+VPN revocation can restore direct networking, and Always-on/lockdown are unsupported. On Android
+13+, the native service refuses both new and sticky-recovered activation when notification
+permission is unavailable; OFF cleanup remains available without it. The loopback
+proxy has no per-run authentication; another malicious local app that discovers its temporary port
+could consume the route and wallet funds. This internal package is blocked from public distribution
+until package-change recovery and local proxy authentication or peer-UID enforcement exist.
 
 The mobile app is located in this directory. The adapted upstream Node worktree is located next to
 it at `../masq-node-mobile`. Additional technical context is available in
@@ -294,10 +312,11 @@ self-contained unsigned Android release APK with commit-pinned actions.
 - After import, the wallet secret is removed from React state and temporary Rust copies are
   zeroized. iOS persists it with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; Android uses
   AES-GCM with a non-exportable key held by Android Keystore.
-- The Android `VpnService` keeps an established TUN descriptor open when its translator stops, but
-  whole-device and selected-app routing remain disabled in public previews until process-death,
-  service restart, network handover and leak testing also pass. Android Always-on VPN support is
-  disabled while that validation is incomplete.
+- The Android dogfood `VpnService` keeps an established, still-valid TUN descriptor open when its
+  translator stops, but this blocks only the scope Android continues to capture. Revocation and
+  service/process death can restore direct traffic. Whole-device and selected-app routing remain
+  disabled in public previews until process-death, service restart, network handover and leak
+  testing pass. Android Always-on VPN and lockdown remain unsupported.
 - iOS system routing returns an explicit unsupported result until a correctly provisioned Packet
   Tunnel extension exists.
 - MASQ Node remains beta software. Before store publication, conduct a mobile security review,

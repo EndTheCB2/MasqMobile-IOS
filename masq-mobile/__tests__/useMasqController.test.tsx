@@ -3,7 +3,10 @@ import { AppState, type AppStateStatus } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
 
 import { masqCore, SavedProfileError } from '../src/core/masqCore';
-import { UNSUPPORTED_SYSTEM_TUNNEL } from '../src/core/systemTunnel';
+import {
+  UNSUPPORTED_SYSTEM_TUNNEL,
+  type SystemTunnelStatus,
+} from '../src/core/systemTunnel';
 import {
   DEFAULT_SETUP,
   EMPTY_STATUS,
@@ -48,6 +51,30 @@ const CONFIGURED_STATUS: CoreStatus = {
   minHops: SAVED_PROFILE.minHops,
   phase: 'ready',
   walletAddress: '0x1234567890abcdef',
+};
+const SYSTEM_TUNNEL_OFF: SystemTunnelStatus = {
+  active: false,
+  appliedMode: 'off',
+  appliedRevision: null,
+  appliedSelectedApps: [],
+  lastError: null,
+  mode: 'off',
+  phase: 'off',
+  selectedApps: [],
+  supported: true,
+  trafficDisposition: 'off',
+};
+const SYSTEM_TUNNEL_ACTIVE: SystemTunnelStatus = {
+  active: true,
+  appliedMode: 'wholeDevice',
+  appliedRevision: 81,
+  appliedSelectedApps: [],
+  lastError: null,
+  mode: 'wholeDevice',
+  phase: 'active',
+  selectedApps: [],
+  supported: true,
+  trafficDisposition: 'masq',
 };
 
 describe('useMasqController profile readiness', () => {
@@ -637,6 +664,79 @@ describe('useMasqController profile readiness', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('ignores a deferred tunnel poll after a newer OFF operation commits', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(
+      SAVED_PROFILE,
+    );
+    jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
+    const staleTunnelPoll = deferred<SystemTunnelStatus>();
+    const getSystemTunnelStatus = jest
+      .spyOn(masqCore, 'getSystemTunnelStatus')
+      .mockResolvedValueOnce(SYSTEM_TUNNEL_ACTIVE)
+      .mockReturnValueOnce(staleTunnelPoll.promise)
+      .mockResolvedValue(SYSTEM_TUNNEL_OFF);
+    jest
+      .spyOn(masqCore, 'setSystemTunnel')
+      .mockResolvedValue(SYSTEM_TUNNEL_OFF);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    expect(current.profileReady).toBe(true);
+    expect(current.systemTunnel).toEqual(SYSTEM_TUNNEL_ACTIVE);
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+    });
+    expect(getSystemTunnelStatus).toHaveBeenCalledTimes(2);
+
+    await ReactTestRenderer.act(async () => {
+      await current.updateSystemTunnel('off', []);
+    });
+    expect(current.systemTunnel).toEqual(SYSTEM_TUNNEL_OFF);
+
+    await ReactTestRenderer.act(async () => {
+      staleTunnelPoll.resolve(SYSTEM_TUNNEL_ACTIVE);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(current.systemTunnel).toEqual(SYSTEM_TUNNEL_OFF);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('ignores a deferred initial tunnel snapshot after a newer operation commits', async () => {
+    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(
+      SAVED_PROFILE,
+    );
+    jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
+    const staleInitialTunnel = deferred<SystemTunnelStatus>();
+    jest
+      .spyOn(masqCore, 'getSystemTunnelStatus')
+      .mockReturnValueOnce(staleInitialTunnel.promise)
+      .mockResolvedValue(SYSTEM_TUNNEL_OFF);
+    jest
+      .spyOn(masqCore, 'setSystemTunnel')
+      .mockResolvedValue(SYSTEM_TUNNEL_OFF);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    expect(current.profileReady).toBe(true);
+    await ReactTestRenderer.act(async () => {
+      await current.updateSystemTunnel('off', []);
+    });
+    expect(current.systemTunnel).toEqual(SYSTEM_TUNNEL_OFF);
+
+    await ReactTestRenderer.act(async () => {
+      staleInitialTunnel.resolve(SYSTEM_TUNNEL_ACTIVE);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(current.systemTunnel).toEqual(SYSTEM_TUNNEL_OFF);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('ignores a deferred AppState refresh after a newer initialization snapshot commits', async () => {
     let appStateListener!: (state: AppStateStatus) => void;
     jest
@@ -689,6 +789,42 @@ describe('useMasqController profile readiness', () => {
     });
     expect(current.status).toEqual(freshStatus);
     expect(current.network).toEqual(freshNetwork);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('routes a full reset directly to the native recovery path without requiring a refused tunnel stop', async () => {
+    jest
+      .spyOn(masqCore, 'getStatus')
+      .mockResolvedValue({ ...CONFIGURED_STATUS });
+    jest
+      .spyOn(masqCore, 'getSavedConfiguration')
+      .mockResolvedValue(SAVED_PROFILE);
+    jest.spyOn(masqCore, 'getSystemTunnelStatus').mockResolvedValue({
+      active: false,
+      appliedMode: 'off',
+      appliedRevision: null,
+      appliedSelectedApps: [],
+      lastError: 'unsupported_policy_schema',
+      mode: 'off',
+      phase: 'blocked',
+      selectedApps: [],
+      supported: true,
+    });
+    const setSystemTunnel = jest.spyOn(masqCore, 'setSystemTunnel');
+    const reset = jest
+      .spyOn(masqCore, 'reset')
+      .mockResolvedValue({ ...EMPTY_STATUS });
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      await current.reset();
+    });
+
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(setSystemTunnel).not.toHaveBeenCalled();
+    expect(current.draft).toEqual(DEFAULT_SETUP);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });

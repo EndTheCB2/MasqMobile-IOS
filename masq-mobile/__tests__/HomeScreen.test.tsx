@@ -140,7 +140,8 @@ describe('HomeScreen connection controls', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('hides unvalidated Android system-routing controls while the tunnel is off', () => {
+  it('shows dogfood controls only when native system routing is supported', () => {
+    const onOpenTrafficRouting = jest.fn();
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
       renderer = ReactTestRenderer.create(
@@ -148,6 +149,7 @@ describe('HomeScreen connection controls', () => {
           jest.fn(),
           { phase: 'ready' },
           {
+            onOpenTrafficRouting,
             systemTunnel: {
               ...UNSUPPORTED_SYSTEM_TUNNEL,
               supported: true,
@@ -157,11 +159,58 @@ describe('HomeScreen connection controls', () => {
       );
     });
 
-    expect(JSON.stringify(renderer.toJSON())).not.toContain('TRAFFIC SCOPE');
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('TRAFFIC SCOPE');
+    expect(rendered).toContain('Private browser only');
+    expect(rendered).toContain(
+      'Configure unsafe device or selected-app dogfood routing',
+    );
+    const control = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Private browser only'),
+    );
+    ReactTestRenderer.act(() => control.props.onPress());
+    expect(onOpenTrafficRouting).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('keeps a shutdown path visible for a tunnel left by an earlier preview', () => {
+  it('keeps native-supported routing visible but disabled until the profile is ready', () => {
+    const onOpenTrafficRouting = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          { phase: 'ready' },
+          {
+            onOpenTrafficRouting,
+            profileReady: false,
+            systemTunnel: {
+              ...UNSUPPORTED_SYSTEM_TUNNEL,
+              supported: true,
+            },
+          },
+        ),
+      );
+    });
+
+    const control = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Private browser only'),
+    );
+    expect(control.props.accessibilityState.disabled).toBe(true);
+    expect(control.props.disabled).toBe(true);
+    expect(onOpenTrafficRouting).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('shows the native-reported active scope', () => {
     const onOpenTrafficRouting = jest.fn();
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
@@ -178,6 +227,7 @@ describe('HomeScreen connection controls', () => {
               phase: 'active',
               selectedApps: [],
               supported: true,
+              trafficDisposition: 'masq',
             },
           },
         ),
@@ -191,13 +241,77 @@ describe('HomeScreen connection controls', () => {
           .findAllByType(Text)
           .some(
             text =>
-              text.props.children === 'Turn off experimental system routing',
+              text.props.children === 'Whole-device dogfood route active',
           ),
     );
     ReactTestRenderer.act(() => control.props.onPress());
     expect(onOpenTrafficRouting).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
+
+  it('surfaces native direct-risk state instead of claiming an active route', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          { phase: 'connected' },
+          {
+            systemTunnel: {
+              active: false,
+              appliedMode: 'off',
+              appliedRevision: null,
+              appliedSelectedApps: [],
+              lastError: 'PROCESS_RESTARTED',
+              mode: 'wholeDevice',
+              phase: 'blocked',
+              selectedApps: [],
+              supported: true,
+              trafficDisposition: 'directRisk',
+            },
+          },
+        ),
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('Traffic may be direct');
+    expect(rendered).toContain('Android cannot confirm capture');
+    expect(rendered).not.toContain('dogfood route active');
+    expect(rendered.toLowerCase()).not.toContain('protected');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it.each(['blocked', 'stopping'] as const)(
+    'does not render legacy active %s state as a MASQ route',
+    phase => {
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      ReactTestRenderer.act(() => {
+        renderer = ReactTestRenderer.create(
+          homeScreen(
+            jest.fn(),
+            { phase: 'connected' },
+            {
+              systemTunnel: {
+                active: true,
+                lastError: 'LEGACY_STOP_STATE',
+                mode: 'wholeDevice',
+                phase,
+                selectedApps: [],
+                supported: true,
+              },
+            },
+          ),
+        );
+      });
+
+      const rendered = JSON.stringify(renderer.toJSON());
+      expect(rendered).toContain('Captured system traffic is blocked');
+      expect(rendered).not.toContain('dogfood route active');
+      expect(rendered.toLowerCase()).not.toContain('protected');
+      ReactTestRenderer.act(() => renderer.unmount());
+    },
+  );
 
   it('locks profile-dependent actions while the saved profile is loading', () => {
     const onOpenSetup = jest.fn();

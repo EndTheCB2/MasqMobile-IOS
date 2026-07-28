@@ -25,6 +25,7 @@ describe('Android native MASQ core integration', () => {
     '../masq-node-mobile/node/src/daemon/launch_verifier.rs',
   );
   const manifest = read('android/app/src/main/AndroidManifest.xml');
+  const strings = read('android/app/src/main/res/values/strings.xml');
   const mainActivity = read(
     'android/app/src/main/java/com/masqmobile/MainActivity.kt',
   );
@@ -33,6 +34,25 @@ describe('Android native MASQ core integration', () => {
   );
   const packetJni = read(
     'android/app/src/main/java/com/masqmobile/MasqPacketTunnelJni.kt',
+  );
+  const packetTranslator = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingTranslator.kt',
+  );
+  const terminalCoordinator = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingTerminalCoordinator.kt',
+  );
+  const startAuthority = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingStartAuthority.kt',
+  );
+  const notificationPermission = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingNotificationPermission.kt',
+  );
+  const routingPolicyStore = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingPolicyStore.kt',
+  );
+  const packetTunnelRust = read('native/masq-packet-tunnel/src/lib.rs');
+  const packetTunnelLifecycle = read(
+    'native/masq-packet-tunnel/src/lifecycle.rs',
   );
   const coreJni = read(
     'android/app/src/main/java/com/masqmobile/MasqCoreJni.kt',
@@ -182,10 +202,10 @@ describe('Android native MASQ core integration', () => {
     expect(directRouting).toContain(
       'if (tunnelPhase != "off" || tunnelActive)',
     );
+    expect(vpnService).toContain('SystemRoutingDiagnostic.TRANSLATOR_RETURNED');
     expect(vpnService).toContain(
-      '"The MASQ packet translator stopped. Traffic remains blocked.",',
+      '"Captured traffic is blocked because the dogfood translator returned."',
     );
-    expect(vpnService).toContain('"blocked",\n              true,');
     expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(false)');
     expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(true)');
     expect(moduleSource).toContain('browserRoutingQueue');
@@ -290,17 +310,80 @@ describe('Android native MASQ core integration', () => {
 
   it('packages the Android system packet tunnel behind a public safety gate', () => {
     const buildScript = read('scripts/build-rust-android.sh');
+    const directReleaseBuilder = read(
+      'scripts/build-android-direct-release.sh',
+    );
     const systemTunnel = read('src/core/systemTunnel.ts');
 
     expect(manifest).toContain('android.permission.BIND_VPN_SERVICE');
     expect(manifest).toContain('android.net.VpnService');
     expect(manifest).toContain('android.net.VpnService.SUPPORTS_ALWAYS_ON');
     expect(manifest).toContain('android:value="false"');
+    expect(manifest).toContain(
+      '<package android:name="com.endthecb2.masqmobile" />',
+    );
+    expect(manifest).toContain(
+      '<package android:name="com.endthecb2.masqmobile.dogfood" />',
+    );
     expect(gradle).toContain(
+      'System.getenv("MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD") == "YES"',
+    );
+    expect(gradle).toContain(
+      'def applicationLabelResource = unsafeSystemRoutingDogfoodEnabled ?',
+    );
+    expect(gradle).toContain('applicationId "com.endthecb2.masqmobile"');
+    expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
+    expect(gradle).toContain('applicationIdSuffix ".dogfood"');
+    expect(gradle).toContain('versionNameSuffix "-dogfood"');
+    expect(gradle).toContain('versionCode 6006');
+    expect(gradle).toContain(
+      'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
+    );
+    expect(manifest.match(/android:label="\$\{masqAppLabel\}"/g)).toHaveLength(
+      2,
+    );
+    expect(strings).toContain(
+      '<string name="app_name_dogfood">MASQ Dogfood (Unsafe)</string>',
+    );
+    expect(gradle).toContain(
+      '"MASQ_SYSTEM_TUNNEL_ENABLED",\n            unsafeSystemRoutingDogfoodEnabled.toString()',
+    );
+    expect(gradle).not.toContain(
       'buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"',
     );
-    expect(systemTunnel).toContain(
-      'export const SYSTEM_TUNNEL_PUBLICLY_ENABLED = false',
+    expect(systemTunnel).not.toContain('SYSTEM_TUNNEL_PUBLICLY_ENABLED');
+    expect(directReleaseBuilder).toContain(
+      'if [ "${MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD:-NO}" = "YES" ]',
+    );
+    expect(directReleaseBuilder).toContain(
+      'direct public releases cannot enable unsafe system-routing dogfood',
+    );
+    expect(directReleaseBuilder).toContain(
+      'unset MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD',
+    );
+    expect(
+      directReleaseBuilder.indexOf(
+        'if [ "${MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD:-NO}" = "YES" ]',
+      ),
+    ).toBeLessThan(
+      directReleaseBuilder.indexOf(
+        ': "${MASQ_NODE_FINDER_URL:?Set MASQ_NODE_FINDER_URL',
+      ),
+    );
+    expect(vpnService).toContain(
+      'PUBLIC_MASQ_PACKAGE_ID = "com.endthecb2.masqmobile"',
+    );
+    expect(vpnService).toContain(
+      'DOGFOOD_MASQ_PACKAGE_ID = "com.endthecb2.masqmobile.dogfood"',
+    );
+    expect(moduleSource).toContain(
+      'if (isMasqControlPlanePackage(packageName))',
+    );
+    expect(moduleSource).toContain(
+      'if (apps.any(::isMasqControlPlanePackage))',
+    );
+    expect(vpnService).toContain(
+      'builder.addDisallowedApplication(packageId)',
     );
     expect(vpnService).toContain('BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED &&');
     expect(moduleSource).toContain('"E_VPN_PREVIEW_DISABLED"');
@@ -310,12 +393,12 @@ describe('Android native MASQ core integration', () => {
     expect(vpnService).toContain('.addRoute("0.0.0.0", 0)');
     expect(vpnService).toContain('.addRoute("::", 0)');
     expect(vpnService).toContain(
-      'builder.addDisallowedApplication(packageName)',
+      'MASQ_CONTROL_PLANE_PACKAGE_IDS.forEach { packageId ->',
     );
     expect(vpnService).toContain(
-      'selectedApps.forEach(builder::addAllowedApplication)',
+      'policy.selectedApps.forEach(builder::addAllowedApplication)',
     );
-    expect(vpnService).toContain('Traffic remains blocked');
+    expect(vpnService).toContain('traffic remains blocked');
     expect(packetJni).toContain('System.loadLibrary("masq_packet_tunnel")');
     expect(buildScript).toContain('native/masq-packet-tunnel/Cargo.toml');
     expect(buildScript).toContain('--package masq-packet-tunnel');
@@ -324,7 +407,36 @@ describe('Android native MASQ core integration', () => {
     );
   });
 
-  it('waits for confirmed Android VPN descriptor shutdown before resolving off', () => {
+  it('exposes a generation-safe native packet-tunnel lifecycle', () => {
+    expect(packetJni).toContain('external fun nativeStateJson(): String');
+    expect(packetJni).toContain('START_UNEXPECTED_CLEAN_RETURN = -2');
+    expect(packetTunnelRust).toContain(
+      'Java_com_masqmobile_MasqPacketTunnelJni_nativeStateJson',
+    );
+    expect(packetTunnelRust).toContain('START_STALE_COMPLETION');
+    expect(packetTunnelRust).not.toContain('TUNNEL_CANCELLATION');
+    expect(packetTunnelLifecycle).toContain('struct ActiveSession');
+    expect(packetTunnelLifecycle).toContain('generation: u64');
+    expect(packetTunnelLifecycle).toContain('TunnelState::Starting');
+    expect(packetTunnelLifecycle).toContain('TunnelState::Running');
+    expect(packetTunnelLifecycle).toContain(
+      'lifecycle.state = TunnelState::Stopping',
+    );
+    expect(packetTunnelLifecycle).toContain('lifecycle.active = None');
+    expect(
+      packetTunnelLifecycle.indexOf('pub(crate) fn request_stop'),
+    ).toBeLessThan(packetTunnelLifecycle.indexOf('pub(crate) fn complete'));
+    expect(packetTunnelLifecycle).toContain(
+      'stale_completion_cannot_remove_or_cancel_the_new_generation',
+    );
+    expect(packetTranslator).toContain('expectedNativeGeneration');
+    expect(packetTranslator).toContain('TranslatorStartResult.NativeBusy');
+    expect(packetTranslator).toContain(
+      'snapshot.generation == run.expectedNativeGeneration',
+    );
+  });
+
+  it('persists exact revisions and waits for native return before closing the VPN', () => {
     const stopDispatch = moduleSource.slice(
       moduleSource.indexOf('private fun stopSystemTunnel(promise: Promise)'),
       moduleSource.indexOf(
@@ -332,42 +444,482 @@ describe('Android native MASQ core integration', () => {
       ),
     );
     const serviceStop = vpnService.slice(
-      vpnService.indexOf('private fun stopTunnel('),
-      vpnService.indexOf('private fun notification('),
+      vpnService.indexOf('private fun handleStop('),
+      vpnService.indexOf('private fun ensureBlockingTun('),
+    );
+    const safeClose = vpnService.slice(
+      vpnService.indexOf('private fun stopAndCloseAllTunnelsSafely('),
+      vpnService.indexOf('private fun publish('),
+    );
+    const startDispatch = moduleSource.slice(
+      moduleSource.indexOf('private fun persistAndStartSystemTunnel('),
+      moduleSource.indexOf('private fun ifCoreAvailable('),
     );
 
-    expect(moduleSource).not.toContain(
-      'promise.resolve(MasqVpnService.markOff())',
+    expect(startDispatch).toContain(
+      'systemRoutingPolicyStore.persistBeforeStart(',
     );
+    expect(startDispatch).toContain('failClosedDesired = false');
+    expect(startDispatch).toContain(
+      'MasqVpnService.registerStartAcknowledgement(requestId)',
+    );
+    expect(startDispatch).not.toContain('promise.resolve(status)');
+    expect(startDispatch).toContain(
+      '.putExtra(MasqVpnService.EXTRA_POLICY_REVISION, policy.revision)',
+    );
+    expect(startDispatch).not.toContain('MasqVpnService.EXTRA_MODE');
+    expect(startDispatch).not.toContain('MasqVpnService.EXTRA_APPS');
+    expect(stopDispatch).toContain('systemRoutingPolicyStore.persistOff(');
     expect(stopDispatch).toContain(
       'MasqVpnService.registerStopAcknowledgement(requestId)',
     );
     expect(stopDispatch).toContain(
-      '.putExtra(MasqVpnService.EXTRA_STOP_REQUEST_ID, requestId)',
+      '.putExtra(MasqVpnService.EXTRA_POLICY_REVISION, offPolicy.revision)',
     );
     expect(stopDispatch).toContain('stopAcknowledgementExecutor.schedule(');
     expect(stopDispatch).toContain('E_VPN_STOP_TIMEOUT');
     expect(stopDispatch).toContain('E_VPN_STOP_DISPATCH');
     expect(stopDispatch).toContain('if (dispatched == null)');
     expect(vpnService).toContain(
-      'intent.getLongExtra(EXTRA_STOP_REQUEST_ID, NO_STOP_REQUEST)',
+      'intent.getLongExtra(EXTRA_POLICY_REVISION, NO_REVISION)',
     );
-    expect(vpnService).toContain(
-      'stopTunnel(requestId.takeIf { it != NO_STOP_REQUEST })',
+    expect(serviceStop).toContain('stopAndCloseAllTunnelsSafely()');
+    expect(safeClose).toContain(
+      'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
     );
-    expect(serviceStop).toContain('descriptor?.close()');
-    expect(serviceStop.indexOf('descriptor?.close()')).toBeLessThan(
-      serviceStop.indexOf('updateStatus("off"'),
+    expect(safeClose).toContain('stopTranslatorSafely(');
+    expect(safeClose).toContain('terminalCoordinator.retain(');
+    expect(safeClose).not.toContain('descriptor?.close()');
+    expect(safeClose.indexOf('terminalCoordinator.retain(')).toBeLessThan(
+      safeClose.indexOf('adoptedTerminalLeaseEpoch = retainResult?.epoch'),
     );
-    expect(serviceStop.indexOf('updateStatus("off"')).toBeLessThan(
-      serviceStop.indexOf('acknowledgeStop(it, status, null)'),
+    expect(
+      safeClose.indexOf('adoptedTerminalLeaseEpoch = retainResult?.epoch'),
+    ).toBeLessThan(safeClose.indexOf('tunnelDescriptor = null'));
+    expect(safeClose.indexOf('terminalCoordinator.retain(')).toBeLessThan(
+      safeClose.indexOf(
+        'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
+      ),
     );
-    expect(vpnService).toContain('currentPhase = "blocked"');
-    expect(vpnService).toContain('currentActive = true');
-    expect(vpnService).toContain('stopAcknowledgements.remove(requestId)');
+    expect(safeClose.indexOf('tunnelDescriptor = null')).toBeLessThan(
+      safeClose.indexOf(
+        'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
+      ),
+    );
+    expect(serviceStop.indexOf('stopAndCloseAllTunnelsSafely()')).toBeLessThan(
+      serviceStop.indexOf('settleStop(it, status, null)'),
+    );
+    expect(packetTranslator).toContain(
+      'run.future.get(remainingNanos, TimeUnit.NANOSECONDS)',
+    );
+    expect(packetTranslator).toContain(
+      'TranslatorStopResult.TimedOutKeepBlocking',
+    );
+    expect(routingPolicyStore).toContain('synchronized(processLock)');
+    expect(moduleSource).toContain('values.get(index) as? String');
+    expect(moduleSource).not.toContain(
+      '.filterNot { it == reactApplicationContext.packageName }',
+    );
+    expect(
+      vpnService.indexOf('validateInstalledPackages(policy)'),
+    ).toBeLessThan(vpnService.indexOf('val builder ='));
   });
 
-  it('cleans up Android native executors and pending stop acknowledgements', () => {
+  it('runs full reset through an acknowledged service-owned safe-close path', () => {
+    const resetService = vpnService.slice(
+      vpnService.indexOf('private fun handleExplicitReset('),
+      vpnService.indexOf('private fun ensureBlockingTun('),
+    );
+    const resetModule = moduleSource.slice(
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+      moduleSource.indexOf('override fun resetNetworkProfile(promise: Promise)'),
+    );
+    const safeClose = vpnService.slice(
+      vpnService.indexOf('private fun stopAndCloseAllTunnelsSafely('),
+      vpnService.indexOf('private fun publish('),
+    );
+
+    expect(vpnService).toContain(
+      'const val ACTION_RESET = "com.masqmobile.RESET_SYSTEM_TUNNEL"',
+    );
+    expect(resetModule).toContain('resetSystemTunnelForFullReset(promise)');
+    expect(resetModule).toContain(
+      'MasqVpnService.registerResetAcknowledgement(requestId)',
+    );
+    expect(resetModule).toContain('.setAction(MasqVpnService.ACTION_RESET)');
+    expect(resetModule).toContain('finishFullReset(promise)');
+    expect(resetService).toContain('policyStore.clearAfterExplicitReset()');
+    expect(resetService).not.toContain('persistOff(');
+    expect(resetService).toContain('terminalCoordinator.beginExplicitReset()');
+    expect(resetService.indexOf('stopAndCloseAllTunnelsSafely()')).toBeLessThan(
+      resetService.indexOf('policyStore.clearAfterExplicitReset()'),
+    );
+    expect(safeClose.indexOf('terminalCoordinator.retain(')).toBeLessThan(
+      safeClose.indexOf(
+        'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
+      ),
+    );
+    expect(
+      resetService.indexOf('policyStore.clearAfterExplicitReset()'),
+    ).toBeLessThan(resetService.indexOf('settleReset(it, statusJson(), null)'));
+    expect(resetService).toContain('terminalCoordinator.snapshot() != null');
+    expect(resetService).toContain('!processNativeReleaseConfirmed()');
+    expect(resetService).toContain(
+      'is SystemRoutingPolicyClearResult.IndeterminateClear',
+    );
+    expect(resetService).toContain('SystemRoutingTransition.BLOCKED');
+  });
+
+  it('publishes terminal truth synchronously and no-TUN only after ordered cleanup', () => {
+    const destruction = vpnService.slice(
+      vpnService.indexOf('override fun onDestroy()'),
+      vpnService.indexOf('private fun currentAlwaysOn()'),
+    );
+    const publish = vpnService.slice(
+      vpnService.indexOf('private fun publish('),
+      vpnService.indexOf('override fun onRevoke()'),
+    );
+
+    const firstTerminalPublish = destruction.indexOf(
+      'publishServiceDestroyed(',
+    );
+    const asyncCleanup = destruction.indexOf('controlExecutor.execute');
+    const safeClose = destruction.indexOf(
+      'stopAndCloseTunnelSafely()',
+      asyncCleanup,
+    );
+    const finalPublish = destruction.indexOf(
+      'publishServiceDestroyed(',
+      safeClose,
+    );
+    expect(destruction.indexOf('destroyed = true')).toBeLessThan(
+      firstTerminalPublish,
+    );
+    expect(firstTerminalPublish).toBeLessThan(asyncCleanup);
+    expect(asyncCleanup).toBeLessThan(safeClose);
+    expect(safeClose).toBeLessThan(finalPublish);
+    expect(destruction).toContain('ServiceDestructionSnapshot(');
+    expect(destruction).toContain(
+      'terminalCoordinator.retain(',
+    );
+    expect(destruction).toContain(
+      'retainedAppliedPolicy = terminalSnapshot.retainedAppliedPolicy',
+    );
+    expect(destruction).toContain('tunPresent = terminalSnapshot.tunPresent');
+    expect(destruction).toContain(
+      'captureValid = terminalSnapshot.captureValid',
+    );
+    expect(
+      destruction.indexOf('terminalCoordinator.retain('),
+    ).toBeLessThan(destruction.indexOf('tunnelDescriptor = null'));
+    expect(destruction.indexOf('tunnelDescriptor = null')).toBeLessThan(
+      destruction.indexOf('terminalCoordinator.snapshot()'),
+    );
+    expect(destruction).toContain('stopAndCloseTunnelSafely()');
+    expect(destruction).toContain(
+      'retainedAppliedPolicy = retainedAfterClose.first',
+    );
+    expect(destruction).toContain('tunPresent = retainedAfterClose.second');
+    expect(destruction).toContain('settleOwnedRequests(');
+    expect(destruction).not.toContain('acknowledgeAllStarts(');
+    expect(destruction).not.toContain('acknowledgeAllStops(');
+    expect(destruction).not.toContain('acknowledgeAllResets(');
+    expect(destruction).toContain('ownerEpoch = serviceEpoch');
+    expect(publish).toContain('if (destroyed) return');
+    expect(vpnService).toContain('currentProxyPort = null');
+    expect(vpnService).toContain('systemRoutingStatusAfterServiceDestroyed(');
+  });
+
+  it('requires semantic start acceptance under the exact core generation lock', () => {
+    const startDispatch = moduleSource.slice(
+      moduleSource.indexOf('private fun startSystemTunnel('),
+      moduleSource.indexOf(
+        '@Suppress("DEPRECATION")\n  private fun isInstalledPackage',
+      ),
+    );
+    const activation = vpnService.slice(
+      vpnService.indexOf('TranslatorReadiness.Ready ->'),
+      vpnService.indexOf(
+        'private fun startTranslatorForCapturedDescriptor(',
+      ),
+    );
+
+    expect(startDispatch).toContain(
+      'tunnelStartAcknowledgementIsSemanticallyAccepted(',
+    );
+    expect(moduleSource).toContain(
+      'private const val START_TUNNEL_TIMEOUT_MS = 40_000L',
+    );
+    expect(startDispatch).toContain(
+      'currentCoreGeneration = currentCoreGeneration',
+    );
+    expect(startDispatch).toContain(
+      'return@completeTunnelStart false',
+    );
+    expect(startDispatch).toContain('promise.resolve(serialized)');
+    expect(startDispatch).toContain('\n              true');
+    expect(startAuthority).toContain(
+      'expectedCoreGeneration == currentCoreGeneration',
+    );
+    expect(startAuthority).toContain(
+      'status.appliedRevision == expectedPolicyRevision',
+    );
+    expect(activation).toContain(
+      'synchronized(MasqCoreLifecycle.lock)',
+    );
+    expect(activation).toContain('acknowledgementAccepted &&');
+    const acknowledgement = activation.indexOf(
+      'settleStart(requestId, candidateStatus, null)',
+    );
+    expect(acknowledgement).toBeGreaterThan(-1);
+    expect(activation.indexOf('coreGeneration ==', acknowledgement))
+      .toBeGreaterThan(acknowledgement);
+    expect(activation.indexOf('authorityStillExact')).toBeLessThan(
+      activation.indexOf('SystemRoutingTransition.IDLE'),
+    );
+  });
+
+  it('coordinates retained TUN ownership across service recreation and rejects stale callbacks', () => {
+    const resetService = vpnService.slice(
+      vpnService.indexOf('private fun handleExplicitReset('),
+      vpnService.indexOf('private fun ensureBlockingTun('),
+    );
+    const translatorReturn = vpnService.slice(
+      vpnService.indexOf('private fun handleTranslatorReturn('),
+      vpnService.indexOf('private fun handleStop('),
+    );
+
+    expect(terminalCoordinator).toContain(
+      'val translator: SystemRoutingTranslator',
+    );
+    expect(terminalCoordinator).toContain('val resource: Resource');
+    expect(terminalCoordinator).toContain(
+      'var cleanup: CompletableFuture<TerminalLeaseCloseResult>?',
+    );
+    expect(terminalCoordinator).toContain('var captureValid: Boolean');
+    expect(terminalCoordinator).toContain('fun invalidateCapture(');
+    expect(terminalCoordinator).toContain('adoptedEpoch: Long? = null');
+    expect(terminalCoordinator).toContain(
+      'candidate.translator.stopAndAwait(',
+    );
+    expect(terminalCoordinator).toContain(
+      'candidate.translator.confirmsProcessReleased(candidate.ownership)',
+    );
+    expect(
+      terminalCoordinator.indexOf(
+        'candidate.translator.confirmsProcessReleased(candidate.ownership)',
+      ),
+    ).toBeLessThan(
+      terminalCoordinator.indexOf('closeResource(candidate.resource)'),
+    );
+    expect(resetService).toContain('stopAndCloseAllTunnelsSafely()');
+    expect(resetService).toContain('policyStore.clearAfterExplicitReset()');
+    expect(translatorReturn).toContain(
+      'runAttemptEpoch',
+    );
+    expect(packetTranslator).toContain(
+      'finalSnapshot.generation == run.expectedNativeGeneration',
+    );
+    expect(packetTranslator).toContain('val runAttemptEpoch: Long');
+    expect(packetTranslator).toContain('proof?.ownership == expectedOwnership');
+    expect(vpnService).toContain('claimStatusEpoch(serviceEpoch)');
+    expect(vpnService).toContain(
+      'if (ownerEpoch < currentStatusOwnerEpoch)',
+    );
+    expect(vpnService).toContain('ownedResetRequests');
+  });
+
+  it('treats revoked capture as direct-risk cleanup ownership and republishes terminal handoff', () => {
+    const revoke = vpnService.slice(
+      vpnService.indexOf('override fun onRevoke()'),
+      vpnService.indexOf('override fun onDestroy()'),
+    );
+    const destruction = vpnService.slice(
+      vpnService.indexOf('override fun onDestroy()'),
+      vpnService.indexOf('private fun currentAlwaysOn()'),
+    );
+    const sticky = vpnService.slice(
+      vpnService.indexOf('private fun handleStickyRestart()'),
+      vpnService.indexOf('private fun restoreBlockingTun('),
+    );
+    const start = vpnService.slice(
+      vpnService.indexOf('private fun handleStart('),
+      vpnService.indexOf('private fun handleStartWithPermit('),
+    );
+
+    expect(revoke.indexOf('revoked = true')).toBeLessThan(
+      revoke.indexOf('terminalCoordinator.invalidateCapture('),
+    );
+    expect(revoke.indexOf('terminalCoordinator.invalidateCapture(')).toBeLessThan(
+      revoke.indexOf('controlExecutor.execute'),
+    );
+    expect(revoke).toContain('tunPresentOverride = false');
+    expect(destruction).toContain(
+      'captureValid = terminalSnapshot.captureValid',
+    );
+    expect(revoke).toContain(
+      'Pair(tunnelDescriptor, adoptedTerminalLeaseEpoch)',
+    );
+    expect(revoke).toContain('adoptedEpoch = revokedOwnership.second');
+    expect(destruction.indexOf('terminalCoordinator.retain(')).toBeLessThan(
+      destruction.indexOf(
+        'adoptedTerminalLeaseEpoch = retainResult?.epoch',
+      ),
+    );
+    expect(
+      destruction.indexOf(
+        'adoptedTerminalLeaseEpoch = retainResult?.epoch',
+      ),
+    ).toBeLessThan(destruction.indexOf('tunnelDescriptor = null'));
+    expect(destruction).toContain(
+      'SystemRoutingDiagnostic.PERMISSION_REVOKED',
+    );
+    expect(sticky).toContain(
+      'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
+    );
+    expect(sticky).toContain('handleStickyRestart()');
+    expect(start).toContain(
+      'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
+    );
+    expect(start).toContain(
+      'handleStart(revision, proxyPort, coreGeneration, requestId)',
+    );
+    expect(vpnService).toContain(
+      'terminalCoordinator.snapshot()?.captureValid == true',
+    );
+  });
+
+  it('retries a retained terminal lease when sticky ExplicitOff cleanup fails', () => {
+    const stopWithPermit = vpnService.slice(
+      vpnService.indexOf('private fun handleStopWithPermit('),
+      vpnService.indexOf('private fun handleExplicitReset('),
+    );
+    const stop = vpnService.slice(
+      vpnService.indexOf('private fun handleStop('),
+      vpnService.indexOf('private fun handleStopWithPermit('),
+    );
+    const retry = vpnService.slice(
+      vpnService.indexOf('private fun scheduleTerminalCleanupRetryIfBlocked()'),
+      vpnService.indexOf('private fun terminalCloseResult('),
+    );
+
+    expect(stopWithPermit.match(/scheduleTerminalCleanupRetryIfBlocked\(\)/g))
+      .toHaveLength(2);
+    expect(stop).toContain('scheduleTerminalCleanupRetryIfBlocked()');
+    expect(retry).toContain('terminalCoordinator.blocksNewStart()');
+    expect(retry).toContain('scheduleStickyHandoffRetry()');
+    expect(vpnService).toContain(
+      'is SystemRoutingPolicyLoadResult.ExplicitOff ->\n          handleStop(load.policy.revision, requestId = null)',
+    );
+  });
+
+  it('requires deterministic native initialization pending before translator readiness', () => {
+    const run = packetTunnelRust.slice(
+      packetTunnelRust.indexOf('fn run('),
+      packetTunnelRust.indexOf('fn stop()'),
+    );
+
+    expect(run).toContain('worker.as_mut().poll(context)');
+    expect(run).toContain('Poll::Pending => None');
+    expect(run).toContain('if let Some(result) = immediate');
+    expect(run.indexOf('worker.as_mut().poll(context)')).toBeLessThan(
+      run.indexOf('TUNNEL_LIFECYCLE.mark_running(generation)'),
+    );
+    expect(vpnService).toContain('translator.awaitReadiness');
+  });
+
+  it('guards notification channels on API 24 and labels system routing as limited dogfood', () => {
+    const creation = vpnService.slice(
+      vpnService.indexOf('override fun onCreate()'),
+      vpnService.indexOf('override fun onStartCommand('),
+    );
+
+    expect(creation).toContain(
+      'if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)',
+    );
+    expect(creation.indexOf('Build.VERSION_CODES.O')).toBeLessThan(
+      creation.indexOf('NotificationChannel('),
+    );
+    expect(vpnService).toContain(
+      'only captured IPv4 TCP/443 and virtual DNS are translated through MASQ',
+    );
+    expect(vpnService).toContain(
+      'All other captured IP traffic, including other TCP ports, non-DNS UDP, IPv6, ICMP',
+    );
+    expect(vpnService).toContain(
+      'Installed MASQ packages are excluded when the route is created.',
+    );
+    expect(vpnService).toContain('Package IDs and');
+    expect(vpnService).toContain('consent timestamps stay on-device');
+    expect(vpnService).toContain('Shared-UID apps and attached restricted');
+    expect(vpnService).toContain(
+      'work profiles are separate.',
+    );
+    expect(vpnService).toContain('real CONNECT to example.com:443');
+    expect(vpnService).toContain('temporary loopback proxy');
+    expect(packetTunnelRust).toContain('args.ipv6_enabled = false');
+    expect(vpnService).toContain(
+      'Direct traffic can resume after service or process death.',
+    );
+    expect(vpnService).toContain('Android Always-on VPN and');
+    expect(vpnService).toContain(
+      '\\"Block connections without VPN\\" are unsupported.',
+    );
+    expect(vpnService).not.toContain('Device traffic is protected by MASQ.');
+  });
+
+  it('enforces Android 13 notification permission natively for recovered activation', () => {
+    const stickyRestore = vpnService.slice(
+      vpnService.indexOf('private fun restoreBlockingTun('),
+      vpnService.indexOf('private fun handleStart('),
+    );
+    const start = vpnService.slice(
+      vpnService.indexOf('private fun handleStartWithPermit('),
+      vpnService.indexOf(
+        'private fun startTranslatorForCapturedDescriptor(',
+      ),
+    );
+    const establish = vpnService.slice(
+      vpnService.indexOf('private fun ensureBlockingTun('),
+      vpnService.indexOf('private fun validateInstalledPackages('),
+    );
+    const stop = vpnService.slice(
+      vpnService.indexOf('private fun handleStopWithPermit('),
+      vpnService.indexOf('private fun handleExplicitReset('),
+    );
+
+    expect(manifest).toContain('android.permission.POST_NOTIFICATIONS');
+    expect(notificationPermission).toContain(
+      'sdkInt >= ANDROID_POST_NOTIFICATIONS_API_LEVEL',
+    );
+    expect(notificationPermission).toContain(
+      'desiredMode != SystemRoutingMode.OFF',
+    );
+    expect(stickyRestore).toContain(
+      'refuseActivationWithoutNotification(load, requestId = null)',
+    );
+    expect(start).toContain(
+      'refuseActivationWithoutNotification(load, requestId)',
+    );
+    expect(establish.indexOf('notificationPermissionDiagnostic(policy)'))
+      .toBeLessThan(establish.indexOf('builder.establish()'));
+    expect(establish.lastIndexOf('notificationPermissionDiagnostic(policy)'))
+      .toBeGreaterThan(establish.indexOf('builder.establish()'));
+    expect(establish.indexOf('tunnelDescriptor = descriptor')).toBeLessThan(
+      establish.lastIndexOf('notificationPermissionDiagnostic(policy)'),
+    );
+    expect(establish).not.toContain('descriptor.close()');
+    expect(start.match(/refuseActivationWithoutNotification\(/g))
+      .toHaveLength(2);
+    expect(stickyRestore.match(/refuseActivationWithoutNotification\(/g))
+      .toHaveLength(2);
+    expect(stop).not.toContain('notificationPermissionDiagnostic(');
+    expect(notificationPermission).toContain(
+      'SystemRoutingDiagnostic.NOTIFICATION_PERMISSION_REQUIRED',
+    );
+  });
+
+  it('cleans up Android native executors and pending tunnel acknowledgements', () => {
     const invalidation = moduleSource.slice(
       moduleSource.indexOf('override fun invalidate()'),
       moduleSource.indexOf(
@@ -376,13 +928,25 @@ describe('Android native MASQ core integration', () => {
     );
 
     expect(moduleSource).toContain(
+      'pendingTunnelStarts = mutableMapOf<Long, PendingTunnelStart>()',
+    );
+    expect(moduleSource).toContain(
       'pendingTunnelStops = mutableMapOf<Long, PendingTunnelStop>()',
+    );
+    expect(moduleSource).toContain(
+      'pendingTunnelResets = mutableMapOf<Long, PendingTunnelReset>()',
     );
     expect(moduleSource).toContain(
       'operation.completed.compareAndSet(false, true)',
     );
     expect(invalidation).toContain(
+      'MasqVpnService.cancelStartAcknowledgement(operation.requestId)',
+    );
+    expect(invalidation).toContain(
       'MasqVpnService.cancelStopAcknowledgement(operation.requestId)',
+    );
+    expect(invalidation).toContain(
+      'MasqVpnService.cancelResetAcknowledgement(operation.requestId)',
     );
     expect(invalidation).toContain(
       'operation.timeoutFuture.getAndSet(null)?.cancel(false)',
@@ -390,6 +954,45 @@ describe('Android native MASQ core integration', () => {
     expect(invalidation).toContain('stopAcknowledgementExecutor.shutdownNow()');
     expect(invalidation).not.toContain('MasqCoreLifecycle.executor.shutdown');
     expect(invalidation).toContain('super.invalidate()');
+  });
+
+  it('restores a persisted scope as a blocker and reports revocation honestly', () => {
+    const sticky = vpnService.slice(
+      vpnService.indexOf('private fun handleStickyRestart()'),
+      vpnService.indexOf('private fun handleStart('),
+    );
+
+    expect(vpnService).toContain('return START_STICKY');
+    expect(sticky).toContain('policyStore.loadForServiceStart()');
+    expect(sticky).toContain('ensureBlockingTun(load.policy)');
+    expect(sticky).not.toContain('translator.start(');
+    expect(vpnService).toContain('override fun onRevoke()');
+    expect(vpnService).toContain('SystemRoutingTransition.REVOKED');
+    expect(vpnService).toContain('tunPresentOverride = false');
+    expect(vpnService).toContain('currentLockdown()');
+    expect(vpnService).toContain(
+      'SystemRoutingDiagnostic.LOCKDOWN_UNSUPPORTED',
+    );
+  });
+
+  it('rejects stale tunnel commands without mutating the current runtime status', () => {
+    const staleStart = vpnService.slice(
+      vpnService.indexOf('if (load !is SystemRoutingPolicyLoadResult.Ready ||'),
+      vpnService.indexOf('val policy = load.policy'),
+    );
+    const staleStop = vpnService.slice(
+      vpnService.indexOf(
+        'if (load !is SystemRoutingPolicyLoadResult.ExplicitOff ||',
+      ),
+      vpnService.indexOf(
+        'publish(\n        load,\n        SystemRoutingTransition.STOPPING',
+      ),
+    );
+
+    expect(staleStart).toContain('settleStart(');
+    expect(staleStart).not.toContain('publish(');
+    expect(staleStop).toContain('settleStop(');
+    expect(staleStop).not.toContain('publish(');
   });
 
   it('exposes an acknowledged full core teardown for explicit direct browsing', () => {
@@ -569,7 +1172,7 @@ describe('Android native MASQ core integration', () => {
       configureIndex,
     );
 
-    expect(moduleSource).toContain('private object MasqCoreLifecycle');
+    expect(moduleSource).toContain('internal object MasqCoreLifecycle');
     expect(moduleSource).toContain('val startGeneration = AtomicLong(0L)');
     expect(moduleSource).toContain(
       'val executor = Executors.newSingleThreadExecutor()',
@@ -578,9 +1181,7 @@ describe('Android native MASQ core integration', () => {
       'MasqCoreLifecycle.startGeneration.incrementAndGet()',
     );
     expect(start).toContain('catch (_: StaleStartException)');
-    expect(start).not.toContain(
-      'promise.resolve(MasqCoreJni.nativeStart())',
-    );
+    expect(start).not.toContain('promise.resolve(MasqCoreJni.nativeStart())');
     expect(start.indexOf('requireCurrentStart(generation)')).toBeLessThan(
       start.indexOf('entryNodeDiscovery.discover'),
     );
@@ -591,20 +1192,17 @@ describe('Android native MASQ core integration', () => {
       ),
     ).toBeLessThan(start.indexOf('MasqCoreJni.nativeConfigure'));
     expect(
-      start.indexOf(
-        'requireCurrentStart(generation)',
-        configureIndex,
-      ),
+      start.indexOf('requireCurrentStart(generation)', configureIndex),
     ).toBeLessThan(configuredStartIndex);
     expect(
       resolution.indexOf(
         'MasqCoreLifecycle.startGeneration.get() != generation',
       ),
-    ).toBeLessThan(
-      resolution.indexOf('preferences.edit()'),
-    );
+    ).toBeLessThan(resolution.indexOf('preferences.edit()'));
     expect(configuredStartIndex).toBeLessThan(
-      start.indexOf('resolveStart(generation, promise, started, refreshedConfig)'),
+      start.indexOf(
+        'resolveStart(generation, promise, started, refreshedConfig)',
+      ),
     );
     expect(stop.indexOf('invalidatePendingStarts()')).toBeLessThan(
       stop.indexOf('MasqCoreLifecycle.executor.execute'),

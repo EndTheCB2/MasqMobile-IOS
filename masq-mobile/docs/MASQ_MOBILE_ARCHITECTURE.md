@@ -59,12 +59,18 @@ cause an invisible direct connection. Direct browsing is a separately confirmed 
 recovery path. Browser routing mode is not persisted, and closing or backgrounding the browser
 selects `blocked`.
 
-Android can additionally capture IP packets from a system `VpnService` TUN. A separately locked
-Rust library converts TCP and virtual-DNS flows to the local MASQ HTTP CONNECT proxy. The MASQ app
-UID is excluded so Node and the translator cannot route their own proxy sockets back into the TUN.
-If translation exits unexpectedly, Android keeps the TUN descriptor established and marks the
-scope blocked; captured apps therefore do not fall back to their direct connection. UDP other than
-DNS is currently unsupported and blocked.
+The separately compiled Android dogfood package can additionally capture IP packets from a system
+`VpnService` TUN. A separately locked Rust library converts only IPv4 TCP/443 and virtual-DNS flows
+to the local MASQ HTTP CONNECT proxy. All other captured IP traffic—including other TCP ports,
+non-DNS UDP, IPv6, ICMP and unknown transports—remains blocked while capture is valid. MASQ packages
+installed when the TUN is created are excluded so Node, explicit Direct browsing and translator
+control sockets do not loop through that TUN. Android snapshots package-to-UID scope at establish
+time; dogfood users must turn routing off before package changes and reapply it. If translation
+exits unexpectedly, Android retains an exact still-valid TUN lease as a blocker until explicit
+cleanup or safe same-descriptor recovery. Activation makes a real CONNECT to `example.com:443`
+through the exit as a no-page/body reachability check. Revocation invalidates capture immediately,
+and service/process death can restore direct traffic. The temporary loopback proxy is unauthenticated,
+which blocks external dogfood distribution pending per-run authentication or peer-UID enforcement.
 
 ## Platform choices
 
@@ -91,8 +97,13 @@ DNS is currently unsupported and blocked.
 - Entering `blocked` also clears WebView cookies and website storage. Android WebView may use
   app-private storage while a temporary session is active; each session starts and closes through
   `blocked`.
-- `VpnService` can capture all other apps or an allowlist of launchable package IDs. Android owns
-  the one-time consent dialog; selected package IDs are not uploaded.
+- Dogfood `VpnService` can capture device scope or an allowlist of launchable package IDs. Android
+  owns the one-time consent dialog; package IDs and its timestamp remain local. Android applies
+  policy by UID, so shared-UID apps can share routing behavior, attached restricted profiles can
+  also receive scope and work-profile copies are a separate user scope. Always-on VPN and lockdown
+  are unsupported. On Android 13+, native new/sticky activation is refused without notification
+  permission so the ongoing routing-state notice cannot be silently omitted; OFF cleanup is always
+  allowed.
 - The proxy rule and TUN translator refer exclusively to the local MASQ listener.
 - The Node wrapper is built with Rust 1.77.2. The independently locked `tun2proxy` adapter is built
   with Rust 1.97.1. `cargo-ndk` packages both as `.so` files for arm64 and x86_64.

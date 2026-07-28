@@ -88,6 +88,8 @@ export function useMasqController() {
   const [routableApps, setRoutableApps] = useState<RoutableApp[]>([]);
   const [systemTunnelBusy, setSystemTunnelBusy] = useState(false);
   const operationEpoch = useRef(0);
+  const systemTunnelOperationEpoch = useRef(0);
+  const systemTunnelOperationInFlight = useRef(false);
   const connectAbort = useRef<AbortController | null>(null);
   const balanceAbort = useRef<AbortController | null>(null);
   const connectFlight = useRef(new SingleFlight<CoreStatus>());
@@ -271,32 +273,57 @@ export function useMasqController() {
   const updateSystemTunnel = useCallback(
     async (mode: SystemTunnelMode, selectedApps: string[]) => {
       requireProfileReady();
+      const operation = ++systemTunnelOperationEpoch.current;
+      systemTunnelOperationInFlight.current = true;
       setSystemTunnelBusy(true);
       try {
         const next = await masqCore.setSystemTunnel(mode, selectedApps);
-        setSystemTunnel(next);
+        if (operation === systemTunnelOperationEpoch.current) {
+          setSystemTunnel(next);
+        }
         return next;
       } finally {
-        setSystemTunnelBusy(false);
+        if (operation === systemTunnelOperationEpoch.current) {
+          // Invalidate any poll that began while the native mutation was in
+          // flight before exposing the operation as complete.
+          systemTunnelOperationEpoch.current += 1;
+          systemTunnelOperationInFlight.current = false;
+          setSystemTunnelBusy(false);
+        }
       }
     },
     [requireProfileReady],
   );
 
   const disableSystemTunnel = useCallback(async () => {
-    const current = await masqCore.getSystemTunnelStatus();
-    setSystemTunnel(current);
-    if (!current.supported) {
-      return current;
+    const operation = ++systemTunnelOperationEpoch.current;
+    systemTunnelOperationInFlight.current = true;
+    setSystemTunnelBusy(true);
+    try {
+      const current = await masqCore.getSystemTunnelStatus();
+      if (operation === systemTunnelOperationEpoch.current) {
+        setSystemTunnel(current);
+      }
+      if (!current.supported) {
+        return current;
+      }
+      const next = await masqCore.setSystemTunnel('off', []);
+      if (operation === systemTunnelOperationEpoch.current) {
+        setSystemTunnel(next);
+      }
+      if (next.active || next.phase !== 'off' || next.mode !== 'off') {
+        throw new Error(
+          'MASQ could not confirm that system routing stopped.',
+        );
+      }
+      return next;
+    } finally {
+      if (operation === systemTunnelOperationEpoch.current) {
+        systemTunnelOperationEpoch.current += 1;
+        systemTunnelOperationInFlight.current = false;
+        setSystemTunnelBusy(false);
+      }
     }
-    const next = await masqCore.setSystemTunnel('off', []);
-    setSystemTunnel(next);
-    if (next.active || next.phase !== 'off' || next.mode !== 'off') {
-      throw new Error(
-        'MASQ could not confirm that system routing stopped.',
-      );
-    }
-    return next;
   }, []);
 
   const saveSetup = useCallback(
@@ -397,18 +424,10 @@ export function useMasqController() {
     requireProfileReady();
     desiredConnected.current = false;
     cancelConnectionAttempt();
-    const next = await run(async () => {
-      await disableSystemTunnel();
-      return masqCore.reset();
-    });
+    const next = await run(() => masqCore.reset());
     setDraft({ ...DEFAULT_SETUP, neighbors: [] });
     return next;
-  }, [
-    cancelConnectionAttempt,
-    disableSystemTunnel,
-    requireProfileReady,
-    run,
-  ]);
+  }, [cancelConnectionAttempt, requireProfileReady, run]);
 
   const resetNetworkProfile = useCallback(async () => {
     requireProfileReady();
@@ -519,18 +538,31 @@ export function useMasqController() {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const initialTunnelEpoch = systemTunnelOperationEpoch.current;
     Promise.all([masqCore.getSystemTunnelStatus(), masqCore.getRoutableApps()])
       .then(([tunnel, apps]) => {
         if (!cancelled) {
-          setSystemTunnel(tunnel);
+          if (
+            !systemTunnelOperationInFlight.current &&
+            initialTunnelEpoch === systemTunnelOperationEpoch.current
+          ) {
+            setSystemTunnel(tunnel);
+          }
           setRoutableApps(apps);
         }
       })
       .catch(() => undefined);
     const poll = async () => {
+      const pollEpoch = systemTunnelOperationEpoch.current;
       try {
         const next = await masqCore.getSystemTunnelStatus();
-        if (!cancelled) setSystemTunnel(next);
+        if (
+          !cancelled &&
+          !systemTunnelOperationInFlight.current &&
+          pollEpoch === systemTunnelOperationEpoch.current
+        ) {
+          setSystemTunnel(next);
+        }
       } catch {
         // The MASQ connection status remains usable if the optional tunnel API is unavailable.
       } finally {

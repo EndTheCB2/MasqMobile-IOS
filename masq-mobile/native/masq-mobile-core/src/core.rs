@@ -297,8 +297,8 @@ impl MobileCore {
         use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
         use std::time::Duration;
 
-        if !self.proxy_enabled || !matches!(self.phase, Phase::Connected) {
-            return self.fail("Enable a connected MASQ browser route before testing it.");
+        if !matches!(self.phase, Phase::Connected) {
+            return self.fail("Connect a MASQ route before testing it.");
         }
         let port = self
             .proxy_port
