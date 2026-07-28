@@ -7,7 +7,9 @@ cd "$ROOT_DIR"
 scan() {
   local expression="$1"
   local description="$2"
+  # Ordinary checkouts use a .git directory; linked worktrees use a .git pointer file.
   if rg -n --hidden \
+      --glob '!.git' \
       --glob '!.git/**' \
       --glob '!**/build/**' \
       --glob '!**/target/**' \
@@ -28,5 +30,18 @@ scan 'DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*[A-Z0-9]{10}' 'an Apple team iden
 scan 'PROVISIONING_PROFILE_SPECIFIER[[:space:]]*=[[:space:]]*[^;[:space:]]+' 'a provisioning profile'
 scan 'Apple Development:[[:space:]]+[^;]+' 'a personal signing identity'
 scan 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' 'private key material'
+
+while IFS= read -r -d '' link_path; do
+  if [[ "$(readlink "$link_path")" = /* ]]; then
+    echo "error: source privacy check found an absolute symbolic-link target" >&2
+    exit 1
+  fi
+done < <(
+  find . \
+    -type d \
+    \( -name .git -o -name build -o -name target -o -name node_modules -o -name Pods \) \
+    -prune \
+    -o -type l -print0
+)
 
 echo "Source privacy check passed."

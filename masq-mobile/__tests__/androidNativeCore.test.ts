@@ -96,6 +96,7 @@ describe('Android native MASQ core integration', () => {
   it('builds direct-distribution APKs with pinned signing and privacy gates', () => {
     const releaseBuilder = read('scripts/build-android-direct-release.sh');
     const apkVerifier = read('scripts/verify-android-apk-privacy.sh');
+    const sourcePrivacy = read('scripts/verify-source-privacy.sh');
 
     expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_CERT_SHA256');
     expect(releaseBuilder).toContain(
@@ -131,6 +132,7 @@ describe('Android native MASQ core integration', () => {
     expect(apkVerifier).toContain(
       'verify-android-native-elf.js" --apk "$APK_PATH"',
     );
+    expect(sourcePrivacy).toContain("--glob '!.git'");
     expect(mobileCi).toContain(
       'Verify Android native linkage in the assembled APK',
     );
@@ -386,7 +388,7 @@ describe('Android native MASQ core integration', () => {
       'operation.timeoutFuture.getAndSet(null)?.cancel(false)',
     );
     expect(invalidation).toContain('stopAcknowledgementExecutor.shutdownNow()');
-    expect(invalidation).toContain('ioExecutor.shutdownNow()');
+    expect(invalidation).not.toContain('MasqCoreLifecycle.executor.shutdown');
     expect(invalidation).toContain('super.invalidate()');
   });
 
@@ -410,6 +412,124 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain('walletStore.save(privateKey)');
     expect(moduleSource).toContain('val savedWallet = walletStore.load()');
     expect(moduleSource).toContain('walletStore.delete()');
+  });
+
+  it('keeps encrypted wallet storage untouched during network-profile recovery', () => {
+    const networkReset = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+    );
+    const rustNetworkReset = rustCore.slice(
+      rustCore.indexOf('pub fn reset_network_profile(&mut self)'),
+      rustCore.indexOf('pub fn remove_wallet(&mut self)'),
+    );
+
+    expect(networkReset).toContain('.remove(SAVED_CONFIG_KEY)');
+    expect(networkReset).toContain('MasqCoreJni.nativeResetNetworkProfile()');
+    expect(
+      networkReset.match(/walletStore\.readForPreservation\(\)/g),
+    ).toHaveLength(2);
+    expect(networkReset).not.toContain('walletStore.load()');
+    expect(networkReset).toContain(
+      'MasqCoreJni.nativeImportWallet(savedWalletAfterReset)',
+    );
+    expect(networkReset).toContain(
+      'walletSecretsMatch(savedWalletBeforeReset, savedWalletAfterReset)',
+    );
+    expect(networkReset).toContain(
+      'isExactNetworkProfileResetStatus(finalStatus)',
+    );
+    expect(networkReset).toContain(
+      'isExactNetworkProfileResetStatus(importStatus)',
+    );
+    expect(networkReset).toContain(
+      'finalWalletAddress != importedWalletAddress',
+    );
+    expect(networkReset).toContain('rejectWalletPreservation(promise');
+    expect(networkReset).toContain('rejectNetworkProfileReset(promise');
+    expect(moduleSource).toContain('"E_WALLET_PRESERVATION"');
+    expect(moduleSource).toContain('"E_NETWORK_PROFILE_RESET"');
+    expect(moduleSource).toContain('routeStage.toDouble() == 0.0');
+    expect(moduleSource).toContain('routeHops.toDouble() == 0.0');
+    expect(moduleSource).toContain('minHops.toDouble() == 1.0');
+    expect(moduleSource).toContain('availableExitCountries.length() == 0');
+    expect(networkReset).not.toContain('walletStore.delete()');
+    expect(rustNetworkReset).toContain('self.config = None');
+    expect(rustNetworkReset).not.toContain('self.wallet = None');
+  });
+
+  it('reads wallet preservation state without deleting unreadable ciphertext', () => {
+    const preservationRead = walletStore.slice(
+      walletStore.indexOf('fun readForPreservation()'),
+      walletStore.indexOf('fun delete()'),
+    );
+    const ordinaryLoad = walletStore.slice(
+      walletStore.indexOf('fun load()'),
+      walletStore.indexOf('fun readForPreservation()'),
+    );
+
+    expect(walletStore).toContain('sealed class PreservationRead');
+    expect(walletStore).toContain(
+      'override fun toString(): String = "Readable([REDACTED])"',
+    );
+    expect(walletStore).not.toContain('data class Readable');
+    expect(preservationRead).toContain(
+      'encryptedValue == null && initializationVector == null',
+    );
+    expect(preservationRead).toContain(
+      'encryptedValue == null || initializationVector == null',
+    );
+    expect(preservationRead).toContain('?: return PreservationRead.Unreadable');
+    expect(preservationRead).toContain('catch (_: Exception)');
+    expect(preservationRead.match(/PreservationRead\.Unreadable/g)?.length).toBeGreaterThanOrEqual(
+      4,
+    );
+    expect(preservationRead).not.toContain('deleteEncryptedValue()');
+    expect(preservationRead).not.toContain('walletStore.delete()');
+    expect(ordinaryLoad).toContain('PreservationRead.Unreadable');
+    expect(ordinaryLoad).toContain('throw UnreadableException()');
+    expect(ordinaryLoad).not.toContain('deleteEncryptedValue()');
+  });
+
+  it('surfaces unreadable encrypted wallet storage without inviting overwrite', () => {
+    const getStatus = moduleSource.slice(
+      moduleSource.indexOf('override fun getStatus(promise: Promise)'),
+      moduleSource.indexOf('override fun getNetworkStatus(promise: Promise)'),
+    );
+    const restore = moduleSource.slice(
+      moduleSource.indexOf('private fun restoreCoreIfNeeded()'),
+      moduleSource.indexOf('private fun prepareNativeConfig('),
+    );
+
+    expect(getStatus).toContain('E_WALLET_STORAGE_UNREADABLE');
+    expect(getStatus).toContain('without resetting or re-importing the wallet');
+    expect(restore).toContain('val savedWallet = walletStore.load()');
+    expect(restore).toContain('restoreAttempted = false');
+    expect(restore).toContain('throw error');
+    expect(restore).not.toContain('runCatching');
+  });
+
+  it('rejects unreadable saved Android profiles with one stable error contract', () => {
+    const getSavedConfiguration = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun getSavedConfiguration(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun configure('),
+    );
+
+    expect(getSavedConfiguration).toContain('migrateConfig(saved)');
+    expect(getSavedConfiguration).toContain('.commit()');
+    expect(getSavedConfiguration).toContain(
+      'MasqCoreLifecycle.executor.execute',
+    );
+    expect(getSavedConfiguration.match(/E_SAVED_CONFIG_INVALID/g)).toHaveLength(
+      2,
+    );
+    expect(moduleSource).toContain(
+      '"The saved MASQ network profile is invalid."',
+    );
   });
 
   it('refreshes and reachability-tests entry nodes before starting', () => {
@@ -449,10 +569,14 @@ describe('Android native MASQ core integration', () => {
       configureIndex,
     );
 
+    expect(moduleSource).toContain('private object MasqCoreLifecycle');
+    expect(moduleSource).toContain('val startGeneration = AtomicLong(0L)');
     expect(moduleSource).toContain(
-      'private val startGeneration = AtomicLong(0L)',
+      'val executor = Executors.newSingleThreadExecutor()',
     );
-    expect(start).toContain('startGeneration.incrementAndGet()');
+    expect(start).toContain(
+      'MasqCoreLifecycle.startGeneration.incrementAndGet()',
+    );
     expect(start).toContain('catch (_: StaleStartException)');
     expect(start).not.toContain(
       'promise.resolve(MasqCoreJni.nativeStart())',
@@ -473,7 +597,9 @@ describe('Android native MASQ core integration', () => {
       ),
     ).toBeLessThan(configuredStartIndex);
     expect(
-      resolution.indexOf('startGeneration.get() != generation'),
+      resolution.indexOf(
+        'MasqCoreLifecycle.startGeneration.get() != generation',
+      ),
     ).toBeLessThan(
       resolution.indexOf('preferences.edit()'),
     );
@@ -481,21 +607,244 @@ describe('Android native MASQ core integration', () => {
       start.indexOf('resolveStart(generation, promise, started, refreshedConfig)'),
     );
     expect(stop.indexOf('invalidatePendingStarts()')).toBeLessThan(
-      stop.indexOf('ioExecutor.execute'),
+      stop.indexOf('MasqCoreLifecycle.executor.execute'),
     );
-    expect(stop.indexOf('ioExecutor.execute')).toBeLessThan(
+    expect(stop.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
       stop.indexOf('MasqCoreJni.nativeStop()'),
     );
     expect(shutdown.indexOf('invalidatePendingStarts()')).toBeLessThan(
-      shutdown.indexOf('ioExecutor.execute'),
+      shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
     );
-    expect(shutdown.indexOf('ioExecutor.execute')).toBeLessThan(
+    expect(
+      shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
+    ).toBeLessThan(
       shutdown.indexOf('MasqCoreJni.nativeShutdown()'),
     );
     expect(rejection).toContain(
       'promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)',
     );
     expect(rejection).toContain('} else if (error == null) {');
+  });
+
+  it('serializes destructive Android actions behind one process-global start fence', () => {
+    const reset = moduleSource.slice(
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+    );
+    const networkReset = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+    );
+    const removeWallet = moduleSource.slice(
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+      moduleSource.indexOf('override fun preflightBrowserProxy('),
+    );
+
+    for (const operation of [reset, networkReset, removeWallet]) {
+      expect(operation.indexOf('invalidatePendingStarts()')).toBeLessThan(
+        operation.indexOf('MasqCoreLifecycle.executor.execute'),
+      );
+    }
+    expect(reset.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
+      reset.indexOf('MasqCoreJni.nativeReset()'),
+    );
+    expect(
+      networkReset.indexOf('MasqCoreLifecycle.executor.execute'),
+    ).toBeLessThan(
+      networkReset.indexOf('MasqCoreJni.nativeResetNetworkProfile()'),
+    );
+    expect(
+      removeWallet.indexOf('MasqCoreLifecycle.executor.execute'),
+    ).toBeLessThan(
+      removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()'),
+    );
+    expect(moduleSource).not.toContain('private val ioExecutor');
+  });
+
+  it('keeps slow entry-node discovery off the process-global lifecycle executor', () => {
+    const startSnapshot = moduleSource.slice(
+      moduleSource.indexOf('override fun start(promise: Promise)'),
+      moduleSource.indexOf('private fun completeStartAfterDiscovery('),
+    );
+    const discoveryCompletion = moduleSource.slice(
+      moduleSource.indexOf('private fun completeStartAfterDiscovery('),
+      moduleSource.indexOf('override fun stop(promise: Promise)'),
+    );
+
+    expect(moduleSource).toContain(
+      'private val discoveryExecutor = Executors.newSingleThreadExecutor()',
+    );
+    expect(startSnapshot).toContain('MasqCoreLifecycle.executor.execute');
+    expect(startSnapshot).toContain('discoveryExecutor.execute');
+    expect(startSnapshot).not.toContain('entryNodeDiscovery.discover(');
+    expect(discoveryCompletion.indexOf('entryNodeDiscovery.discover(')).toBeLessThan(
+      discoveryCompletion.indexOf('MasqCoreLifecycle.executor.execute'),
+    );
+    expect(
+      discoveryCompletion.indexOf('MasqCoreLifecycle.executor.execute'),
+    ).toBeLessThan(
+      discoveryCompletion.indexOf('MasqCoreJni.nativeConfigure('),
+    );
+    expect(discoveryCompletion).toContain(
+      'synchronized(MasqCoreLifecycle.lock)',
+    );
+    expect(moduleSource).toContain('discoveryExecutor.shutdownNow()');
+  });
+
+  it('serializes restore and direct core mutations across Android module instances', () => {
+    const getStatus = moduleSource.slice(
+      moduleSource.indexOf('override fun getStatus(promise: Promise)'),
+      moduleSource.indexOf('override fun getNetworkStatus(promise: Promise)'),
+    );
+    const configure = moduleSource.slice(
+      moduleSource.indexOf('override fun configure('),
+      moduleSource.indexOf('override fun importWallet('),
+    );
+    const importWallet = moduleSource.slice(
+      moduleSource.indexOf('override fun importWallet('),
+      moduleSource.indexOf('override fun updateMinHops('),
+    );
+    const updateMinHops = moduleSource.slice(
+      moduleSource.indexOf('override fun updateMinHops('),
+      moduleSource.indexOf('override fun start('),
+    );
+    const setSystemTunnel = moduleSource.slice(
+      moduleSource.indexOf('override fun setSystemTunnel('),
+      moduleSource.indexOf('private fun stopSystemTunnel('),
+    );
+
+    for (const operation of [
+      getStatus,
+      configure,
+      importWallet,
+      updateMinHops,
+      setSystemTunnel,
+    ]) {
+      expect(operation).toContain('MasqCoreLifecycle.executor.execute');
+    }
+    expect(getStatus).toContain('E_CORE_RESTORE');
+    expect(setSystemTunnel.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
+      setSystemTunnel.indexOf('restoreCoreIfNeeded()'),
+    );
+    expect(moduleSource).toContain('E_VPN_STALE_CORE');
+    for (const operation of [configure, importWallet, updateMinHops]) {
+      expect(operation.indexOf('invalidatePendingStarts()')).toBeLessThan(
+        operation.indexOf('MasqCoreLifecycle.executor.execute'),
+      );
+    }
+  });
+
+  it('validates destructive Android terminal state before deleting durable data', () => {
+    const reset = moduleSource.slice(
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+    );
+    const removeWallet = moduleSource.slice(
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+      moduleSource.indexOf('override fun preflightBrowserProxy('),
+    );
+    const networkReset = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+    );
+
+    expect(reset.indexOf('if (!MasqCoreJni.isAvailable)')).toBeLessThan(
+      reset.indexOf('clearRememberedBrowserStorage('),
+    );
+    expect(reset.indexOf('MasqCoreJni.nativeReset()')).toBeLessThan(
+      reset.indexOf('walletStore.delete()'),
+    );
+    expect(reset.indexOf('isExactFullResetStatus(')).toBeLessThan(
+      reset.indexOf('walletStore.delete()'),
+    );
+    expect(reset.lastIndexOf('MasqCoreJni.nativeGetStatus()')).toBeLessThan(
+      reset.indexOf('promise.resolve(finalStatusJson)'),
+    );
+    expect(reset.indexOf('MasqCoreJni.nativeReset()')).toBeLessThan(
+      reset.indexOf('clearRememberedBrowserStorage('),
+    );
+    expect(
+      networkReset.lastIndexOf('MasqCoreJni.nativeGetStatus()'),
+    ).toBeLessThan(
+      networkReset.indexOf('preferences.edit().remove(SAVED_CONFIG_KEY)'),
+    );
+    expect(removeWallet.indexOf('if (!MasqCoreJni.isAvailable)')).toBeLessThan(
+      removeWallet.indexOf('walletStore.delete()'),
+    );
+    expect(removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()')).toBeLessThan(
+      removeWallet.indexOf('walletStore.delete()'),
+    );
+    expect(removeWallet.indexOf('isExactWalletRemovalStatus(')).toBeLessThan(
+      removeWallet.indexOf('walletStore.delete()'),
+    );
+    expect(removeWallet.lastIndexOf('MasqCoreJni.nativeGetStatus()')).toBeLessThan(
+      removeWallet.indexOf('promise.resolve(finalStatusJson)'),
+    );
+  });
+
+  it('rejects missing or malformed Android core phases as unsuccessful', () => {
+    const statusSucceeded = moduleSource.slice(
+      moduleSource.indexOf('private fun statusSucceeded('),
+      moduleSource.indexOf('private fun nullableStatusString('),
+    );
+
+    expect(statusSucceeded).toContain('val phase = JSONObject(statusJson).opt("phase")');
+    expect(statusSucceeded).toContain('phase is String');
+    expect(statusSucceeded).toContain('phase in');
+    expect(statusSucceeded).not.toContain('optString("phase") != "error"');
+  });
+
+  it('fences stale Android browser proxy callbacks behind the core lifecycle', () => {
+    const browserRouting = moduleSource.slice(
+      moduleSource.indexOf('override fun setBrowserRoutingMode('),
+      moduleSource.indexOf('private fun validateBrowserSite('),
+    );
+    const masqConfirmation = moduleSource.slice(
+      moduleSource.indexOf('private fun confirmMasqBrowserRouting('),
+      moduleSource.indexOf('private fun applyDirectBrowserRouting('),
+    );
+    const directRouting = moduleSource.slice(
+      moduleSource.indexOf('private fun applyDirectBrowserRouting('),
+      moduleSource.indexOf('private fun failBrowserRoutingClosed('),
+    );
+    const companion = moduleSource.slice(
+      moduleSource.indexOf('companion object {'),
+      moduleSource.indexOf('private data class BrowserSite('),
+    );
+
+    expect(browserRouting).toContain(
+      'MasqCoreLifecycle.startGeneration.get()',
+    );
+    expect(browserRouting).toContain('requireCurrentBrowserCore(request)');
+    expect(moduleSource).toContain('E_BROWSER_STALE_CORE');
+    expect(browserRouting).toContain('MasqCoreLifecycle.executor.execute');
+    expect(
+      browserRouting.indexOf('requireCurrentBrowserCore(request)'),
+    ).toBeLessThan(
+      browserRouting.indexOf('MasqCoreJni.nativeSetProxyEnabled(true)'),
+    );
+    expect(masqConfirmation.match(/requireCurrentBrowserCore\(request\)/g))
+      .toHaveLength(3);
+    expect(directRouting.indexOf('requireCurrentBrowserCore(request)'))
+      .toBeLessThan(
+        directRouting.indexOf(
+          'ProxyController.getInstance().clearProxyOverride',
+        ),
+      );
+    expect(directRouting.match(/requireCurrentBrowserCore\(request\)/g)?.length)
+      .toBeGreaterThanOrEqual(4);
+    expect(companion).toContain(
+      'private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()',
+    );
+    expect(moduleSource).toContain('next?.owner?.applyBrowserRoutingMode(next)');
   });
 
   it('persists only strict Android browser protection preferences', () => {

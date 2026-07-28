@@ -35,6 +35,7 @@ const mockController = {
   busy: false,
   profileReady: true,
   initializationState: 'ready' as 'loading' | 'ready' | 'error',
+  profileRecoveryAvailable: false,
   connectionProgress: { step: 1, total: 5, label: 'Ready' },
   draft: DEFAULT_SETUP,
   entryNodeRefresh: null,
@@ -48,6 +49,7 @@ const mockController = {
   } as NetworkStatus,
   refresh: jest.fn().mockResolvedValue(EMPTY_STATUS),
   retryInitialization: jest.fn().mockResolvedValue(undefined),
+  recoverNetworkProfile: jest.fn().mockResolvedValue(undefined),
   refreshWalletBalance: jest.fn().mockResolvedValue(undefined),
   removeWallet: jest.fn().mockResolvedValue(undefined),
   reset: jest.fn().mockResolvedValue(undefined),
@@ -126,11 +128,13 @@ describe('App browser routing modes', () => {
     mockCloseBrowserSession.mockReset().mockResolvedValue('blocked');
     mockController.refresh.mockClear();
     mockController.retryInitialization.mockClear();
+    mockController.recoverNetworkProfile.mockClear();
     mockController.connect.mockClear();
     mockController.disconnect.mockClear();
     mockController.systemTunnel = UNSUPPORTED_SYSTEM_TUNNEL;
     mockController.profileReady = true;
     mockController.initializationState = 'ready';
+    mockController.profileRecoveryAvailable = false;
     mockController.busy = false;
     mockController.draft = DEFAULT_SETUP;
     mockController.status = { ...EMPTY_STATUS };
@@ -725,6 +729,39 @@ describe('App browser routing modes', () => {
     expect(
       findButton(renderer, 'Node & wallet settings').props.disabled,
     ).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('confirms wallet-preserving profile recovery while Direct Browse remains blocked', async () => {
+    mockController.profileReady = false;
+    mockController.initializationState = 'error';
+    mockController.profileRecoveryAvailable = true;
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(jest.fn());
+    const renderer = await renderApp();
+
+    expect(
+      findButton(renderer, 'Browse without MASQ').props.disabled,
+    ).toBe(true);
+    ReactTestRenderer.act(() =>
+      findButton(
+        renderer,
+        'Reset network profile · keep wallet',
+      ).props.onPress(),
+    );
+
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0][0]).toBe('Reset invalid network profile?');
+    expect(alert.mock.calls[0][1]).toContain(
+      'consumer wallet remains on this device',
+    );
+    const reset = alert.mock.calls[0][2]?.find(
+      action => action.text === 'Reset network profile',
+    );
+    await ReactTestRenderer.act(async () => {
+      reset?.onPress?.();
+      await Promise.resolve();
+    });
+    expect(mockController.recoverNetworkProfile).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });

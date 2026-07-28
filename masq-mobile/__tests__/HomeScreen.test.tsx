@@ -29,10 +29,12 @@ function homeScreen(
     busy?: boolean;
     profileReady?: boolean;
     initializationState?: 'loading' | 'ready' | 'error';
+    profileRecoveryAvailable?: boolean;
     network?: NetworkStatus;
     onOpenDirectBrowser?: () => void;
     onOpenSetup?: () => void;
     onRetryInitialization?: () => void;
+    onRecoverNetworkProfile?: () => void;
     onOpenTrafficRouting?: () => void;
     systemTunnel?: SystemTunnelStatus;
   } = {},
@@ -42,6 +44,7 @@ function homeScreen(
       busy={options.busy ?? true}
       profileReady={options.profileReady ?? true}
       initializationState={options.initializationState ?? 'ready'}
+      profileRecoveryAvailable={options.profileRecoveryAvailable ?? false}
       connectionProgress={{ step: 2, total: 5, label: 'Finding nodes' }}
       entryNodeRefresh={{ attempt: 1, maxAttempts: 3 }}
       issue={null}
@@ -50,6 +53,7 @@ function homeScreen(
       network={options.network ?? network}
       onConnect={jest.fn()}
       onRetryInitialization={options.onRetryInitialization ?? jest.fn()}
+      onRecoverNetworkProfile={options.onRecoverNetworkProfile ?? jest.fn()}
       onDisconnect={onDisconnect}
       onOpenBrowser={jest.fn()}
       onOpenDirectBrowser={options.onOpenDirectBrowser ?? jest.fn()}
@@ -262,6 +266,47 @@ describe('HomeScreen connection controls', () => {
     ReactTestRenderer.act(() => retry.props.onPress());
     expect(onRetryInitialization).toHaveBeenCalledTimes(1);
     expect(onOpenSetup).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('offers an explicit wallet-preserving recovery while all browsing stays blocked', () => {
+    const onRecoverNetworkProfile = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(jest.fn(), { phase: 'unconfigured' }, {
+          busy: false,
+          initializationState: 'error',
+          onRecoverNetworkProfile,
+          profileReady: false,
+          profileRecoveryAvailable: true,
+        }),
+      );
+    });
+
+    const recovery = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(
+            text =>
+              text.props.children === 'Reset network profile · keep wallet',
+          ),
+    );
+    const directBrowser = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Browse without MASQ'),
+    );
+    expect(directBrowser.props.disabled).toBe(true);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'consumer wallet stays on this device',
+    );
+    ReactTestRenderer.act(() => recovery.props.onPress());
+    expect(onRecoverNetworkProfile).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 

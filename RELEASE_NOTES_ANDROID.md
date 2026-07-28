@@ -41,6 +41,12 @@ not affected. Future releases must retain preview.2 certificate SHA-256
   instead of silently creating or overwriting a profile.
 - Retrying controller initialization preserves the existing profile and editable settings; only a
   genuinely unconfigured installation receives the deterministic default profile.
+- Saved RPC, entry-node and routing preferences are semantically validated and compared with every
+  native status field that represents the active profile before profile actions are unlocked.
+- If an invalid profile cannot be reloaded, an explicit confirmed recovery removes only network
+  settings, verifies that MASQ stopped, and preserves the consumer wallet.
+- Status and network polling remain paused until initialization has committed one current profile
+  snapshot, so an older startup result cannot overwrite fresher native state.
 
 ## Included
 

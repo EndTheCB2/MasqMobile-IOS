@@ -19,6 +19,7 @@ import {
   type MasqConfig,
   type NetworkStatus,
 } from './types';
+import { isValidSavedConfig } from './config';
 import {
   decodeRoutableApps,
   decodeSystemTunnelStatus,
@@ -28,6 +29,48 @@ import {
 } from './systemTunnel';
 
 export type BrowserRoutingMode = 'blocked' | 'masq' | 'direct';
+
+export const SAVED_PROFILE_ERROR_CODE = 'E_SAVED_CONFIG_INVALID';
+
+export class SavedProfileError extends Error {
+  readonly code = SAVED_PROFILE_ERROR_CODE;
+
+  constructor(message = 'The saved MASQ configuration is invalid.') {
+    super(message);
+    this.name = 'SavedProfileError';
+  }
+}
+
+export function isSavedProfileError(caught: unknown): boolean {
+  if (caught instanceof SavedProfileError) {
+    return true;
+  }
+  if (!caught || typeof caught !== 'object') {
+    return false;
+  }
+  const code = (caught as { code?: unknown }).code;
+  return code === 'E_SAVED_CONFIG' || code === SAVED_PROFILE_ERROR_CODE;
+}
+
+export function decodeSavedConfiguration(
+  serialized: string,
+): MasqConfig | null {
+  if (serialized === 'null') {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (!isSavedConfig(parsed)) {
+      throw new SavedProfileError();
+    }
+    return parsed;
+  } catch (caught) {
+    if (caught instanceof SavedProfileError) {
+      throw caught;
+    }
+    throw new SavedProfileError();
+  }
+}
 
 export interface MasqCore {
   getStatus(): Promise<CoreStatus>;
@@ -86,15 +129,16 @@ class NativeCore implements MasqCore {
   }
 
   async getSavedConfiguration(): Promise<MasqConfig | null> {
-    const serialized = await NativeMasqCore!.getSavedConfiguration();
-    if (serialized === 'null') {
-      return null;
+    let serialized: string;
+    try {
+      serialized = await NativeMasqCore!.getSavedConfiguration();
+    } catch (caught) {
+      if (isSavedProfileError(caught)) {
+        throw new SavedProfileError();
+      }
+      throw caught;
     }
-    const parsed: unknown = JSON.parse(serialized);
-    if (!isSavedConfig(parsed)) {
-      throw new Error('The saved MASQ configuration is invalid.');
-    }
-    return parsed;
+    return decodeSavedConfiguration(serialized);
   }
 
   async configure(config: MasqConfig): Promise<CoreStatus> {
@@ -467,7 +511,7 @@ function isSavedConfig(value: unknown): value is MasqConfig {
     return false;
   }
   const config = value as Partial<MasqConfig>;
-  return (
+  if (
     typeof config.configVersion === 'number' &&
     (config.chain === 'base-mainnet' || config.chain === 'base-sepolia') &&
     typeof config.rpcUrl === 'string' &&
@@ -476,7 +520,10 @@ function isSavedConfig(value: unknown): value is MasqConfig {
     typeof config.minHops === 'number' &&
     (typeof config.exitCountry === 'string' || config.exitCountry === null) &&
     typeof config.exitCountryFallback === 'boolean'
-  );
+  ) {
+    return isValidSavedConfig(config as MasqConfig);
+  }
+  return false;
 }
 
 function decodeNetworkStatus(serialized: string): NetworkStatus {

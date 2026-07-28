@@ -299,6 +299,25 @@ function AppContent() {
     );
   };
 
+  const confirmInitializationRecovery = () => {
+    Alert.alert(
+      'Reset invalid network profile?',
+      'Use this only if Retry keeps failing. MASQ stops active routing and removes the saved chain, RPC, entry nodes and route preferences. Your consumer wallet remains on this device. Browsing stays blocked until MASQ Mobile confirms the reset.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset network profile',
+          style: 'destructive',
+          onPress: () => {
+            setDirectBrowserError(null);
+            setRouteError(null);
+            controller.recoverNetworkProfile().catch(() => undefined);
+          },
+        },
+      ],
+    );
+  };
+
   const shareDiagnostics = async () => {
     const diagnostics = buildRedactedDiagnostics(
       controller.status,
@@ -405,6 +424,7 @@ function AppContent() {
           connectionProgress={controller.connectionProgress}
           profileReady={controller.profileReady}
           initializationState={controller.initializationState}
+          profileRecoveryAvailable={controller.profileRecoveryAvailable}
           network={controller.network}
           entryNodeRefresh={controller.entryNodeRefresh}
           issue={activeIssue}
@@ -416,6 +436,7 @@ function AppContent() {
             setRouteError(null);
             controller.retryInitialization().catch(() => undefined);
           }}
+          onRecoverNetworkProfile={confirmInitializationRecovery}
           onDisconnect={disconnect}
           onOpenBrowser={openMasqBrowser}
           onOpenDirectBrowser={confirmDirectBrowser}

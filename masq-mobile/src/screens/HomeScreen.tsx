@@ -22,6 +22,7 @@ interface Props {
   busy: boolean;
   profileReady: boolean;
   initializationState: 'loading' | 'ready' | 'error';
+  profileRecoveryAvailable: boolean;
   network: NetworkStatus;
   connectionProgress: { step: number; total: number; label: string };
   entryNodeRefresh: { attempt: number; maxAttempts: number } | null;
@@ -30,6 +31,7 @@ interface Props {
   systemTunnel: SystemTunnelStatus;
   onConnect: () => void;
   onRetryInitialization: () => void;
+  onRecoverNetworkProfile: () => void;
   onDisconnect: () => void;
   onReset: () => void;
   onResetNetwork: () => void;
@@ -51,6 +53,7 @@ export function HomeScreen({
   busy,
   profileReady,
   initializationState,
+  profileRecoveryAvailable,
   network,
   connectionProgress,
   entryNodeRefresh,
@@ -59,6 +62,7 @@ export function HomeScreen({
   systemTunnel,
   onConnect,
   onRetryInitialization,
+  onRecoverNetworkProfile,
   onDisconnect,
   onReset,
   onResetNetwork,
@@ -194,25 +198,43 @@ export function HomeScreen({
 
         <View style={styles.actions}>
           {!profileReady ? (
-            <Button
-              accessibilityLabel={
-                initializationState === 'loading'
-                  ? 'Loading saved Node and wallet profile'
-                  : 'Retry saved profile loading'
-              }
-              accessibilityState={{
-                busy: initializationState === 'loading',
-                disabled: initializationState === 'loading',
-              }}
-              label={
-                initializationState === 'loading'
-                  ? 'Loading saved profile…'
-                  : 'Retry profile loading'
-              }
-              onPress={onRetryInitialization}
-              busy={initializationState === 'loading'}
-              disabled={initializationState === 'loading'}
-            />
+            <>
+              <Button
+                accessibilityLabel={
+                  initializationState === 'loading'
+                    ? 'Loading saved Node and wallet profile'
+                    : 'Retry saved profile loading'
+                }
+                accessibilityState={{
+                  busy: initializationState === 'loading',
+                  disabled: initializationState === 'loading',
+                }}
+                label={
+                  initializationState === 'loading'
+                    ? 'Loading saved profile…'
+                    : 'Retry profile loading'
+                }
+                onPress={onRetryInitialization}
+                busy={initializationState === 'loading'}
+                disabled={initializationState === 'loading'}
+              />
+              {initializationState === 'error' &&
+              profileRecoveryAvailable ? (
+                <>
+                  <Button
+                    label="Reset network profile · keep wallet"
+                    onPress={onRecoverNetworkProfile}
+                    tone="danger"
+                  />
+                  <Text style={styles.profileRecoveryHelper}>
+                    Use this only if Retry keeps failing. MASQ and Direct
+                    browsing remain blocked while MASQ Mobile removes the
+                    chain, RPC and entry-node settings. The consumer wallet
+                    stays on this device.
+                  </Text>
+                </>
+              ) : null}
+            </>
           ) : connected ? (
             <>
               <Button
@@ -685,6 +707,12 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   profileActionDisabled: { opacity: 0.48 },
+  profileRecoveryHelper: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: 'center',
+  },
   errorActionText: { color: colors.white, fontSize: 12, fontWeight: '700' },
   actions: { gap: 11 },
   statsRow: { flexDirection: 'row', gap: 12, marginTop: 22 },

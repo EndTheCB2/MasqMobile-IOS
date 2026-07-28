@@ -1,14 +1,22 @@
 import { AppState } from 'react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { normalizeWalletSecret, toMasqConfig } from '../core/config';
+import {
+  isValidSavedConfig,
+  normalizeWalletSecret,
+  toMasqConfig,
+} from '../core/config';
 import {
   isAbortError,
   startWithEntryNodeRefresh,
 } from '../core/entryNodeRefresh';
 import { stopMasqSafely } from '../core/connectionLifecycle';
 import { startAndAwaitMasqConnection } from '../core/connectionReadiness';
-import { masqCore } from '../core/masqCore';
+import {
+  isSavedProfileError,
+  masqCore,
+  SavedProfileError,
+} from '../core/masqCore';
 import {
   classifyMasqIssue,
   reconcileMasqIssue,
@@ -31,6 +39,7 @@ import {
   DEFAULT_SETUP,
   EMPTY_STATUS,
   type CoreStatus,
+  type MasqConfig,
   type NetworkStatus,
   type SetupDraft,
 } from '../core/types';
@@ -47,6 +56,15 @@ export type ControllerInitializationState = 'loading' | 'ready' | 'error';
 
 export const PROFILE_NOT_READY_MESSAGE =
   'MASQ has not finished loading the saved Node and wallet profile. Wait for profile loading to complete and try again.';
+export const PROFILE_RECOVERY_NOT_AVAILABLE_MESSAGE =
+  'Network-profile recovery is available only after saved profile loading fails.';
+
+const SAVED_PROFILE_INVALID_MESSAGE =
+  'The saved MASQ configuration is invalid.';
+const SAVED_PROFILE_MISMATCH_MESSAGE =
+  'The saved MASQ configuration does not match the active native network profile.';
+const NETWORK_PROFILE_RESET_NOT_CONFIRMED_MESSAGE =
+  'MASQ could not confirm that the invalid network profile was removed while preserving the consumer wallet.';
 
 export function useMasqController() {
   const [status, setStatus] = useState<CoreStatus>(EMPTY_STATUS);
@@ -55,6 +73,8 @@ export function useMasqController() {
   const [busy, setBusy] = useState(true);
   const [initializationState, setInitializationState] =
     useState<ControllerInitializationState>('loading');
+  const [profileRecoveryAvailable, setProfileRecoveryAvailable] =
+    useState(false);
   const [issue, setIssue] = useState<MasqIssue | null>(null);
   const [entryNodeRefresh, setEntryNodeRefresh] = useState<{
     attempt: number;
@@ -73,6 +93,9 @@ export function useMasqController() {
   const connectFlight = useRef(new SingleFlight<CoreStatus>());
   const desiredConnected = useRef(false);
   const initializationEpoch = useRef(0);
+  const initializationStateRef =
+    useRef<ControllerInitializationState>('loading');
+  const profileRecoveryAvailableRef = useRef(false);
   const profileReadyRef = useRef(false);
   const statusRef = useRef(status);
   const networkRef = useRef(network);
@@ -116,27 +139,30 @@ export function useMasqController() {
 
   const initialize = useCallback(async () => {
     const initialization = ++initializationEpoch.current;
+    operationEpoch.current += 1;
     profileReadyRef.current = false;
+    initializationStateRef.current = 'loading';
+    profileRecoveryAvailableRef.current = false;
     setInitializationState('loading');
+    setProfileRecoveryAvailable(false);
     setBusy(true);
     setIssue(null);
     try {
-      const [initialStatus, initialNetwork, saved] = await Promise.all([
+      const saved = await masqCore.getSavedConfiguration();
+      if (initialization !== initializationEpoch.current) {
+        return;
+      }
+      if (saved && !isValidSavedConfig(saved)) {
+        throw new SavedProfileError(SAVED_PROFILE_INVALID_MESSAGE);
+      }
+      const [initialStatus, initialNetwork] = await Promise.all([
         masqCore.getStatus(),
         masqCore.getNetworkStatus().catch(() => UNKNOWN_NETWORK),
-        masqCore.getSavedConfiguration(),
       ]);
       if (initialization !== initializationEpoch.current) {
         return;
       }
-      if (
-        initialStatus.chain !== null &&
-        (!saved || saved.chain !== initialStatus.chain)
-      ) {
-        throw new Error(
-          'The saved MASQ configuration is missing or does not match the active native network profile.',
-        );
-      }
+      assertSavedProfileMatchesStatus(saved, initialStatus);
       const loadedDraft: SetupDraft = saved
         ? {
             ...DEFAULT_SETUP,
@@ -149,15 +175,29 @@ export function useMasqController() {
       setNetwork(initialNetwork);
       setDraft(loadedDraft);
       profileReadyRef.current = true;
+      initializationStateRef.current = 'ready';
       setInitializationState('ready');
     } catch (caught) {
       if (initialization !== initializationEpoch.current) {
         return;
       }
       profileReadyRef.current = false;
+      initializationStateRef.current = 'error';
+      const recoveryAvailable =
+        isSavedProfileError(caught);
+      const initializationError =
+        recoveryAvailable && !(caught instanceof SavedProfileError)
+          ? new SavedProfileError()
+          : caught;
+      profileRecoveryAvailableRef.current = recoveryAvailable;
       setInitializationState('error');
+      setProfileRecoveryAvailable(recoveryAvailable);
       setIssue(
-        classifyMasqIssue(caught, networkRef.current, statusRef.current),
+        classifyMasqIssue(
+          initializationError,
+          networkRef.current,
+          statusRef.current,
+        ),
       );
     } finally {
       if (initialization === initializationEpoch.current) {
@@ -409,11 +449,70 @@ export function useMasqController() {
     run,
   ]);
 
+  const recoverNetworkProfile = useCallback(async () => {
+    if (
+      initializationStateRef.current !== 'error' ||
+      !profileRecoveryAvailableRef.current
+    ) {
+      throw new Error(PROFILE_RECOVERY_NOT_AVAILABLE_MESSAGE);
+    }
+    const recovery = ++initializationEpoch.current;
+    desiredConnected.current = false;
+    cancelConnectionAttempt();
+    profileReadyRef.current = false;
+    initializationStateRef.current = 'loading';
+    profileRecoveryAvailableRef.current = false;
+    setInitializationState('loading');
+    setProfileRecoveryAvailable(false);
+    setBusy(true);
+    setIssue(null);
+    try {
+      const tunnel = await disableSystemTunnel();
+      if (tunnel.active || tunnel.phase !== 'off' || tunnel.mode !== 'off') {
+        throw new Error(
+          'MASQ could not confirm that system routing stopped before network-profile recovery.',
+        );
+      }
+      const next = await masqCore.resetNetworkProfile();
+      if (recovery !== initializationEpoch.current) {
+        return;
+      }
+      if (
+        next.phase !== 'unconfigured' ||
+        next.chain !== null ||
+        next.connectedNeighbors !== 0 ||
+        next.proxyEnabled ||
+        next.proxyPort !== null ||
+        next.lastError !== null
+      ) {
+        throw new Error(NETWORK_PROFILE_RESET_NOT_CONFIRMED_MESSAGE);
+      }
+      setStatus(next);
+      await initialize();
+    } catch (caught) {
+      if (recovery !== initializationEpoch.current) {
+        return;
+      }
+      profileReadyRef.current = false;
+      initializationStateRef.current = 'error';
+      profileRecoveryAvailableRef.current = true;
+      setInitializationState('error');
+      setProfileRecoveryAvailable(true);
+      setIssue(
+        classifyMasqIssue(caught, networkRef.current, statusRef.current),
+      );
+      setBusy(false);
+      throw caught;
+    }
+  }, [cancelConnectionAttempt, disableSystemTunnel, initialize]);
+
   useEffect(() => {
     initialize().catch(() => undefined);
     return () => {
       initializationEpoch.current += 1;
       profileReadyRef.current = false;
+      initializationStateRef.current = 'loading';
+      profileRecoveryAvailableRef.current = false;
     };
   }, [initialize]);
 
@@ -480,21 +579,36 @@ export function useMasqController() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
+      if (!profileReadyRef.current) {
+        if (!cancelled) timer = setTimeout(poll, 1000);
+        return;
+      }
       if (AppState.currentState !== 'active') {
         if (!cancelled) timer = setTimeout(poll, 5000);
         return;
       }
       const epoch = operationEpoch.current;
+      const initialization = initializationEpoch.current;
       try {
         const next = await masqCore.getStatus();
-        if (!cancelled && epoch === operationEpoch.current) {
+        if (
+          !cancelled &&
+          profileReadyRef.current &&
+          epoch === operationEpoch.current &&
+          initialization === initializationEpoch.current
+        ) {
           setStatus(next);
           setIssue(current =>
             reconcileMasqIssue(current, next, networkRef.current),
           );
         }
       } catch (caught) {
-        if (!cancelled && epoch === operationEpoch.current) {
+        if (
+          !cancelled &&
+          profileReadyRef.current &&
+          epoch === operationEpoch.current &&
+          initialization === initializationEpoch.current
+        ) {
           setIssue(
             classifyMasqIssue(caught, networkRef.current, statusRef.current),
           );
@@ -518,13 +632,26 @@ export function useMasqController() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let reconnecting = false;
     const pollNetwork = async () => {
+      if (!profileReadyRef.current) {
+        if (!cancelled) timer = setTimeout(pollNetwork, 2000);
+        return;
+      }
       if (AppState.currentState !== 'active') {
         if (!cancelled) timer = setTimeout(pollNetwork, 5000);
         return;
       }
+      const epoch = operationEpoch.current;
+      const initialization = initializationEpoch.current;
       try {
         const next = await masqCore.getNetworkStatus();
-        if (cancelled) return;
+        if (
+          cancelled ||
+          !profileReadyRef.current ||
+          epoch !== operationEpoch.current ||
+          initialization !== initializationEpoch.current
+        ) {
+          return;
+        }
         const previous = networkRef.current;
         setNetwork(next);
         setIssue(current =>
@@ -569,8 +696,20 @@ export function useMasqController() {
         masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
         return;
       }
+      if (!profileReadyRef.current) {
+        return;
+      }
+      const epoch = operationEpoch.current;
+      const initialization = initializationEpoch.current;
       Promise.all([masqCore.getStatus(), masqCore.getNetworkStatus()])
         .then(([nextStatus, nextNetwork]) => {
+          if (
+            !profileReadyRef.current ||
+            epoch !== operationEpoch.current ||
+            initialization !== initializationEpoch.current
+          ) {
+            return;
+          }
           setStatus(nextStatus);
           setNetwork(nextNetwork);
           if (
@@ -610,6 +749,7 @@ export function useMasqController() {
     busy,
     profileReady: initializationState === 'ready',
     initializationState,
+    profileRecoveryAvailable,
     issue,
     entryNodeRefresh,
     walletBalance,
@@ -617,6 +757,7 @@ export function useMasqController() {
     routableApps,
     systemTunnelBusy,
     retryInitialization: initialize,
+    recoverNetworkProfile,
     saveSetup,
     connect,
     disconnect,
@@ -628,6 +769,31 @@ export function useMasqController() {
     refreshWalletBalance,
     updateSystemTunnel,
   };
+}
+
+function assertSavedProfileMatchesStatus(
+  saved: MasqConfig | null,
+  status: CoreStatus,
+) {
+  const savedProfilePresent = saved !== null;
+  const nativeProfilePresent = status.chain !== null;
+  if (
+    savedProfilePresent !== nativeProfilePresent ||
+    status.phase === 'error'
+  ) {
+    throw new SavedProfileError(SAVED_PROFILE_MISMATCH_MESSAGE);
+  }
+  if (!saved || status.chain === null) {
+    return;
+  }
+  if (
+    saved.chain !== status.chain ||
+    saved.minHops !== status.minHops ||
+    saved.exitCountry !== status.exitCountry ||
+    saved.exitCountryFallback !== status.exitCountryFallback
+  ) {
+    throw new SavedProfileError(SAVED_PROFILE_MISMATCH_MESSAGE);
+  }
 }
 
 function describeConnectionProgress(

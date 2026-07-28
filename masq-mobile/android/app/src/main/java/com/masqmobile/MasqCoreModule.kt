@@ -33,9 +33,15 @@ import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONObject
 
+private object MasqCoreLifecycle {
+  val lock = Any()
+  val startGeneration = AtomicLong(0L)
+  val executor = Executors.newSingleThreadExecutor()
+}
+
 class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec(reactContext) {
   private val callbackExecutor = Executor { command -> reactContext.runOnUiQueueThread(command) }
-  private val ioExecutor = Executors.newSingleThreadExecutor()
+  private val discoveryExecutor = Executors.newSingleThreadExecutor()
   private val stopAcknowledgementExecutor = Executors.newSingleThreadScheduledExecutor()
   private val preferences =
       reactContext.getSharedPreferences("masq-mobile-consumer", Context.MODE_PRIVATE)
@@ -43,13 +49,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   private val entryNodeDiscovery = EntryNodeDiscovery(reactContext)
   private val restoreLock = Any()
   private val lifecycleLock = Any()
-  private val startGeneration = AtomicLong(0L)
-  private val browserRoutingLock = Any()
-  private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()
   private val pendingTunnelStops = mutableMapOf<Long, PendingTunnelStop>()
   @Volatile private var restoreAttempted = false
-  private var moduleInvalidated = false
-  private var browserRoutingInFlight = false
+  @Volatile private var moduleInvalidated = false
   private var pendingTunnelRequest: PendingTunnelRequest? = null
   private val tunnelActivityListener =
       object : BaseActivityEventListener() {
@@ -66,7 +68,19 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             request.promise.reject("E_VPN_PERMISSION", "Android VPN permission was not granted.")
             return
           }
-          startSystemTunnel(request.mode, request.apps, request.proxyPort, request.promise)
+          synchronized(MasqCoreLifecycle.lock) {
+            if (
+                request.coreGeneration !=
+                    MasqCoreLifecycle.startGeneration.get()
+            ) {
+              request.promise.reject(
+                  "E_VPN_STALE_CORE",
+                  "The MASQ core changed before VPN permission was granted.",
+              )
+              return
+            }
+            startSystemTunnel(request.mode, request.apps, request.proxyPort, request.promise)
+          }
         }
       }
 
@@ -75,8 +89,24 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun getStatus(promise: Promise) {
-    restoreCoreIfNeeded()
-    promise.resolve(statusJson())
+    MasqCoreLifecycle.executor.execute {
+      try {
+        restoreCoreIfNeeded()
+        promise.resolve(statusJson())
+      } catch (error: SecureWalletStore.UnreadableException) {
+        promise.reject(
+            "E_WALLET_STORAGE_UNREADABLE",
+            "The encrypted consumer wallet could not be read safely. Unlock the device and retry without resetting or re-importing the wallet.",
+            error,
+        )
+      } catch (error: Exception) {
+        promise.reject(
+            "E_CORE_RESTORE",
+            "The saved MASQ state could not be restored safely.",
+            error,
+        )
+      }
+    }
   }
 
   override fun getNetworkStatus(promise: Promise) {
@@ -322,58 +352,88 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun getSavedConfiguration(promise: Promise) {
-    val saved = preferences.getString(SAVED_CONFIG_KEY, null)
-    if (saved == null) {
-      promise.resolve("null")
-      return
-    }
-    val migrated = JSONObject(saved)
-        .put("configVersion", 2)
-        .apply {
-          if (!has("minHops")) put("minHops", 1)
-          if (!has("exitCountry")) put("exitCountry", JSONObject.NULL)
-          if (!has("exitCountryFallback")) put("exitCountryFallback", true)
+    MasqCoreLifecycle.executor.execute {
+      val saved =
+          try {
+            preferences.getString(SAVED_CONFIG_KEY, null)
+          } catch (error: Exception) {
+            promise.reject(
+                "E_SAVED_CONFIG_INVALID",
+                SAVED_CONFIG_INVALID_MESSAGE,
+                error,
+            )
+            return@execute
+          }
+      if (saved == null) {
+        promise.resolve("null")
+        return@execute
+      }
+      try {
+        val migrated = migrateConfig(saved)
+        val migrationCommitted =
+            preferences.edit().putString(SAVED_CONFIG_KEY, migrated).commit()
+        if (!migrationCommitted) {
+          throw IllegalStateException("The saved MASQ profile migration could not be committed.")
         }
-        .toString()
-    preferences.edit().putString(SAVED_CONFIG_KEY, migrated).apply()
-    promise.resolve(migrated)
+        promise.resolve(migrated)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_SAVED_CONFIG_INVALID",
+            SAVED_CONFIG_INVALID_MESSAGE,
+            error,
+        )
+      }
+    }
   }
 
   override fun configure(configJson: String, promise: Promise) {
-    restoreAttempted = true
-    ifCoreAvailable(promise) {
-      val result = MasqCoreJni.nativeConfigure(prepareNativeConfig(configJson))
-      if (statusSucceeded(result)) {
-        preferences.edit().putString(SAVED_CONFIG_KEY, migrateConfig(configJson)).apply()
+    invalidatePendingStarts()
+    MasqCoreLifecycle.executor.execute {
+      restoreAttempted = true
+      ifCoreAvailable(promise) {
+        val result = MasqCoreJni.nativeConfigure(prepareNativeConfig(configJson))
+        if (statusSucceeded(result)) {
+          val committed =
+              preferences
+                  .edit()
+                  .putString(SAVED_CONFIG_KEY, migrateConfig(configJson))
+                  .commit()
+          if (!committed) {
+            throw IllegalStateException("The saved MASQ profile could not be committed.")
+          }
+        }
+        result
       }
-      result
     }
   }
 
   override fun importWallet(privateKey: String, promise: Promise) {
-    if (!MasqCoreJni.isAvailable) {
-      promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
-      return
-    }
-    try {
-      val result = MasqCoreJni.nativeImportWallet(privateKey)
-      if (statusSucceeded(result)) {
-        try {
-          walletStore.save(privateKey)
-        } catch (error: Exception) {
-          runCatching { walletStore.delete() }
-          MasqCoreJni.nativeRemoveWallet()
-          promise.reject(
-              "E_KEYSTORE",
-              "The consumer wallet could not be saved in secure Android storage.",
-              error,
-          )
-          return
-        }
+    invalidatePendingStarts()
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
       }
-      promise.resolve(result)
-    } catch (error: RuntimeException) {
-      promise.reject("E_CORE_WALLET", "The MASQ core rejected the wallet.", error)
+      try {
+        val result = MasqCoreJni.nativeImportWallet(privateKey)
+        if (statusSucceeded(result)) {
+          try {
+            walletStore.save(privateKey)
+          } catch (error: Exception) {
+            runCatching { walletStore.delete() }
+            MasqCoreJni.nativeRemoveWallet()
+            promise.reject(
+                "E_KEYSTORE",
+                "The consumer wallet could not be saved in secure Android storage.",
+                error,
+            )
+            return@execute
+          }
+        }
+        promise.resolve(result)
+      } catch (error: RuntimeException) {
+        promise.reject("E_CORE_WALLET", "The MASQ core rejected the wallet.", error)
+      }
     }
   }
 
@@ -382,35 +442,53 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.reject("E_MIN_HOPS", "Choose between one and six MASQ hops.")
       return
     }
-    val saved = preferences.getString(SAVED_CONFIG_KEY, null)
-    if (saved == null) {
-      promise.reject("E_SAVED_CONFIG", "The saved MASQ network profile is invalid.")
-      return
-    }
-    restoreCoreIfNeeded()
-    ifCoreAvailable(promise) {
-      val hops = minHops.toInt()
-      val result = MasqCoreJni.nativeUpdateMinHops(hops)
-      if (statusSucceeded(result)) {
-        preferences
-            .edit()
-            .putString(SAVED_CONFIG_KEY, JSONObject(saved).put("minHops", hops).toString())
-            .apply()
+    invalidatePendingStarts()
+    MasqCoreLifecycle.executor.execute {
+      try {
+        val saved = preferences.getString(SAVED_CONFIG_KEY, null)
+        if (saved == null) {
+          promise.reject("E_SAVED_CONFIG", "The saved MASQ network profile is invalid.")
+          return@execute
+        }
+        restoreCoreIfNeeded()
+        ifCoreAvailable(promise) {
+          val hops = minHops.toInt()
+          val result = MasqCoreJni.nativeUpdateMinHops(hops)
+          if (statusSucceeded(result)) {
+            val committed =
+                preferences
+                    .edit()
+                    .putString(
+                        SAVED_CONFIG_KEY,
+                        JSONObject(saved).put("minHops", hops).toString(),
+                    )
+                    .commit()
+            if (!committed) {
+              throw IllegalStateException("The saved MASQ profile could not be committed.")
+            }
+          }
+          result
+        }
+      } catch (error: Exception) {
+        promise.reject(
+            "E_CORE_RESTORE",
+            "The saved MASQ state could not be restored safely.",
+            error,
+        )
       }
-      result
     }
   }
 
   override fun start(promise: Promise) {
     val generation =
-        synchronized(lifecycleLock) {
-          startGeneration.incrementAndGet()
+        synchronized(MasqCoreLifecycle.lock) {
+          MasqCoreLifecycle.startGeneration.incrementAndGet()
         }
     if (!MasqCoreJni.isAvailable) {
       promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
       return
     }
-    ioExecutor.execute {
+    MasqCoreLifecycle.executor.execute {
       try {
         requireCurrentStart(generation)
         restoreCoreIfNeeded()
@@ -418,10 +496,12 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         val currentStatus = JSONObject(MasqCoreJni.nativeGetStatus())
         requireCurrentStart(generation)
         if (currentStatus.optString("phase") != "ready") {
-          requireCurrentStart(generation)
-          val started = MasqCoreJni.nativeStart()
-          requireCurrentStart(generation)
-          resolveStart(generation, promise, started)
+          synchronized(MasqCoreLifecycle.lock) {
+            requireCurrentStart(generation)
+            val started = MasqCoreJni.nativeStart()
+            requireCurrentStart(generation)
+            resolveStart(generation, promise, started)
+          }
           return@execute
         }
 
@@ -439,21 +519,15 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               }
             } ?: emptyList()
         requireCurrentStart(generation)
-        val refreshedNodes = entryNodeDiscovery.discover(chain, preferredNodes)
-        requireCurrentStart(generation)
-        config.put("neighbors", JSONArray(refreshedNodes))
-        val refreshedConfig = migrateConfig(config.toString())
-        requireCurrentStart(generation)
-        val configureResult =
-            MasqCoreJni.nativeConfigure(prepareNativeConfig(refreshedConfig))
-        requireCurrentStart(generation)
-        if (!statusSucceeded(configureResult)) {
-          throw IllegalStateException("The MASQ core rejected the refreshed entry nodes.")
+        discoveryExecutor.execute {
+          completeStartAfterDiscovery(
+              generation,
+              config,
+              chain,
+              preferredNodes,
+              promise,
+          )
         }
-        requireCurrentStart(generation)
-        val started = MasqCoreJni.nativeStart()
-        requireCurrentStart(generation)
-        resolveStart(generation, promise, started, refreshedConfig)
       } catch (_: StaleStartException) {
         rejectStart(generation, promise, "E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
       } catch (error: EntryNodeDiscoveryException) {
@@ -476,13 +550,85 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
+  private fun completeStartAfterDiscovery(
+      generation: Long,
+      config: JSONObject,
+      chain: String,
+      preferredNodes: List<String>,
+      promise: Promise,
+  ) {
+    try {
+      val refreshedNodes = entryNodeDiscovery.discover(chain, preferredNodes)
+      requireCurrentStart(generation)
+      config.put("neighbors", JSONArray(refreshedNodes))
+      val refreshedConfig = migrateConfig(config.toString())
+      requireCurrentStart(generation)
+      MasqCoreLifecycle.executor.execute {
+        try {
+          synchronized(MasqCoreLifecycle.lock) {
+            requireCurrentStart(generation)
+            val configureResult =
+                MasqCoreJni.nativeConfigure(prepareNativeConfig(refreshedConfig))
+            requireCurrentStart(generation)
+            if (!statusSucceeded(configureResult)) {
+              throw IllegalStateException(
+                  "The MASQ core rejected the refreshed entry nodes.",
+              )
+            }
+            val started = MasqCoreJni.nativeStart()
+            requireCurrentStart(generation)
+            resolveStart(generation, promise, started, refreshedConfig)
+          }
+        } catch (_: StaleStartException) {
+          rejectStart(
+              generation,
+              promise,
+              "E_CORE_START_CANCELLED",
+              START_CANCELLED_MESSAGE,
+          )
+        } catch (error: Exception) {
+          rejectStart(
+              generation,
+              promise,
+              "E_CORE_START",
+              error.message ?: "The MASQ core could not start.",
+              error,
+          )
+        }
+      }
+    } catch (_: StaleStartException) {
+      rejectStart(
+          generation,
+          promise,
+          "E_CORE_START_CANCELLED",
+          START_CANCELLED_MESSAGE,
+      )
+    } catch (error: EntryNodeDiscoveryException) {
+      rejectStart(
+          generation,
+          promise,
+          "E_ENTRY_NODE_DISCOVERY",
+          error.message ?: "MASQ could not find reachable entry nodes.",
+          error,
+      )
+    } catch (error: Exception) {
+      rejectStart(
+          generation,
+          promise,
+          "E_CORE_START",
+          error.message ?: "The MASQ core could not start.",
+          error,
+      )
+    }
+  }
+
   override fun stop(promise: Promise) {
     invalidatePendingStarts()
     if (!MasqCoreJni.isAvailable) {
       promise.resolve(statusJson())
       return
     }
-    ioExecutor.execute {
+    MasqCoreLifecycle.executor.execute {
       try {
         promise.resolve(MasqCoreJni.nativeStop())
       } catch (error: RuntimeException) {
@@ -497,7 +643,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.resolve(statusJson())
       return
     }
-    ioExecutor.execute {
+    MasqCoreLifecycle.executor.execute {
       try {
         promise.resolve(MasqCoreJni.nativeShutdown())
       } catch (error: RuntimeException) {
@@ -511,13 +657,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   private fun invalidatePendingStarts() {
-    synchronized(lifecycleLock) {
-      startGeneration.incrementAndGet()
+    synchronized(MasqCoreLifecycle.lock) {
+      MasqCoreLifecycle.startGeneration.incrementAndGet()
     }
   }
 
   private fun requireCurrentStart(generation: Long) {
-    if (startGeneration.get() != generation) {
+    if (MasqCoreLifecycle.startGeneration.get() != generation) {
       throw StaleStartException()
     }
   }
@@ -528,12 +674,17 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       status: String,
       refreshedConfig: String? = null,
   ) {
-    synchronized(lifecycleLock) {
-      if (startGeneration.get() != generation) {
+    synchronized(MasqCoreLifecycle.lock) {
+      if (MasqCoreLifecycle.startGeneration.get() != generation) {
         promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
       } else {
         if (refreshedConfig != null) {
-          preferences.edit().putString(SAVED_CONFIG_KEY, refreshedConfig).apply()
+          val committed =
+              preferences.edit().putString(SAVED_CONFIG_KEY, refreshedConfig).commit()
+          if (!committed) {
+            runCatching { MasqCoreJni.nativeStop() }
+            throw IllegalStateException("The refreshed MASQ profile could not be committed.")
+          }
         }
         promise.resolve(status)
       }
@@ -547,8 +698,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       message: String,
       error: Throwable? = null,
   ) {
-    synchronized(lifecycleLock) {
-      if (startGeneration.get() != generation) {
+    synchronized(MasqCoreLifecycle.lock) {
+      if (MasqCoreLifecycle.startGeneration.get() != generation) {
         promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
       } else if (error == null) {
         promise.reject(code, message)
@@ -559,55 +710,266 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun reset(promise: Promise) {
-    callbackExecutor.execute {
+    if (!MasqCoreJni.isAvailable) {
+      promise.reject(
+          "E_CORE_UNAVAILABLE",
+          "The native MASQ core is missing from this build.",
+      )
+      return
+    }
+    invalidatePendingStarts()
+    MasqCoreLifecycle.executor.execute {
       try {
+        val resetStatusJson = MasqCoreJni.nativeReset()
+        if (!isExactFullResetStatus(JSONObject(resetStatusJson))) {
+          promise.reject(
+              "E_CORE_RESET",
+              "The MASQ core did not confirm a complete reset.",
+          )
+          return@execute
+        }
         walletStore.delete()
-        clearRememberedBrowserStorage(clearProtectionExceptions = true)
+        if (!preferences.edit().remove(SAVED_CONFIG_KEY).commit()) {
+          throw IllegalStateException("The saved MASQ profile could not be removed.")
+        }
+        restoreAttempted = true
+        val finalStatusJson = MasqCoreJni.nativeGetStatus()
+        if (!isExactFullResetStatus(JSONObject(finalStatusJson))) {
+          promise.reject(
+              "E_CORE_RESET",
+              "The MASQ core did not retain the complete reset state.",
+          )
+          return@execute
+        }
+        callbackExecutor.execute {
+          try {
+            clearRememberedBrowserStorage(clearProtectionExceptions = true)
+            promise.resolve(finalStatusJson)
+          } catch (error: Exception) {
+            promise.reject(
+                "E_BROWSER_SITE_DELETE",
+                "Remembered browser data could not be removed during the full reset.",
+                error,
+            )
+          }
+        }
       } catch (error: Exception) {
         promise.reject(
-            "E_KEYSTORE_DELETE",
-            "Saved wallet or remembered browser data could not be removed from secure Android storage.",
+            "E_CORE_RESET",
+            "The saved wallet, network profile, or MASQ core could not be reset.",
             error,
         )
-        return@execute
-      }
-      preferences.edit().remove(SAVED_CONFIG_KEY).commit()
-      restoreAttempted = true
-      if (!MasqCoreJni.isAvailable) {
-        promise.resolve(statusJson())
-        return@execute
-      }
-      try {
-        promise.resolve(MasqCoreJni.nativeReset())
-      } catch (error: RuntimeException) {
-        promise.reject("E_CORE_RESET", "The MASQ core could not be reset.", error)
       }
     }
   }
 
   override fun resetNetworkProfile(promise: Promise) {
-    preferences.edit().remove(SAVED_CONFIG_KEY).apply()
-    restoreAttempted = true
-    ifCoreAvailable(promise) { MasqCoreJni.nativeResetNetworkProfile() }
+    invalidatePendingStarts()
+    if (!MasqCoreJni.isAvailable) {
+      promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+      return
+    }
+    MasqCoreLifecycle.executor.execute {
+      val statusBeforeReset =
+          try {
+            JSONObject(MasqCoreJni.nativeGetStatus())
+          } catch (error: Exception) {
+            rejectNetworkProfileReset(promise, error)
+            return@execute
+          }
+      val walletAddressBeforeReset =
+          try {
+            nullableStatusString(statusBeforeReset, "walletAddress")
+          } catch (error: Exception) {
+            rejectNetworkProfileReset(promise, error)
+            return@execute
+          }
+      val walletReadBeforeReset =
+          try {
+            walletStore.readForPreservation()
+          } catch (error: Exception) {
+            rejectWalletPreservation(promise, error)
+            return@execute
+          }
+      val savedWalletBeforeReset =
+          when (walletReadBeforeReset) {
+            SecureWalletStore.PreservationRead.Absent -> null
+            is SecureWalletStore.PreservationRead.Readable ->
+                walletReadBeforeReset.secret
+            SecureWalletStore.PreservationRead.Unreadable -> {
+              rejectWalletPreservation(promise)
+              return@execute
+            }
+          }
+      if (walletAddressBeforeReset != null && savedWalletBeforeReset == null) {
+        rejectWalletPreservation(promise)
+        return@execute
+      }
+
+      restoreAttempted = true
+
+      val resetStatus =
+          try {
+            JSONObject(MasqCoreJni.nativeResetNetworkProfile())
+          } catch (error: Exception) {
+            rejectNetworkProfileReset(promise, error)
+            return@execute
+          }
+      if (!isExactNetworkProfileResetStatus(resetStatus)) {
+        rejectNetworkProfileReset(promise)
+        return@execute
+      }
+
+      val walletReadAfterReset =
+          try {
+            walletStore.readForPreservation()
+          } catch (error: Exception) {
+            rejectWalletPreservation(promise, error)
+            return@execute
+          }
+      val savedWalletAfterReset =
+          when (walletReadAfterReset) {
+            SecureWalletStore.PreservationRead.Absent -> null
+            is SecureWalletStore.PreservationRead.Readable ->
+                walletReadAfterReset.secret
+            SecureWalletStore.PreservationRead.Unreadable -> {
+              rejectWalletPreservation(promise)
+              return@execute
+            }
+          }
+      if (!walletSecretsMatch(savedWalletBeforeReset, savedWalletAfterReset)) {
+        rejectWalletPreservation(promise)
+        return@execute
+      }
+
+      var importedWalletAddress: String? = null
+      if (savedWalletAfterReset != null) {
+        val importStatus =
+            try {
+              JSONObject(MasqCoreJni.nativeImportWallet(savedWalletAfterReset))
+            } catch (error: Exception) {
+              rejectWalletPreservation(promise, error)
+              return@execute
+            }
+        if (!isExactNetworkProfileResetStatus(importStatus)) {
+          rejectWalletPreservation(promise)
+          return@execute
+        }
+        importedWalletAddress =
+            try {
+              nullableStatusString(importStatus, "walletAddress")
+            } catch (error: Exception) {
+              rejectWalletPreservation(promise, error)
+              return@execute
+            }
+        if (importedWalletAddress == null) {
+          rejectWalletPreservation(promise)
+          return@execute
+        }
+      }
+
+      val finalStatusJson: String
+      val finalStatus: JSONObject
+      try {
+        finalStatusJson = MasqCoreJni.nativeGetStatus()
+        finalStatus = JSONObject(finalStatusJson)
+      } catch (error: Exception) {
+        rejectNetworkProfileReset(promise, error)
+        return@execute
+      }
+      val finalWalletAddress =
+          try {
+            nullableStatusString(finalStatus, "walletAddress")
+          } catch (error: Exception) {
+            rejectWalletPreservation(promise, error)
+            return@execute
+          }
+      val walletPresenceMatches =
+          (savedWalletAfterReset == null && finalWalletAddress == null) ||
+              (savedWalletAfterReset != null && finalWalletAddress != null)
+      if (!walletPresenceMatches ||
+          (importedWalletAddress != null &&
+              finalWalletAddress != importedWalletAddress) ||
+          (walletAddressBeforeReset != null &&
+              finalWalletAddress != walletAddressBeforeReset)) {
+        rejectWalletPreservation(promise)
+        return@execute
+      }
+      if (!isExactNetworkProfileResetStatus(finalStatus)) {
+        rejectNetworkProfileReset(promise)
+        return@execute
+      }
+      val profileRemoved =
+          try {
+            preferences.edit().remove(SAVED_CONFIG_KEY).commit()
+          } catch (error: Exception) {
+            rejectNetworkProfileReset(promise, error)
+            return@execute
+          }
+      if (!profileRemoved) {
+        rejectNetworkProfileReset(promise)
+        return@execute
+      }
+      promise.resolve(finalStatusJson)
+    }
   }
 
   override fun removeWallet(promise: Promise) {
-    try {
-      walletStore.delete()
-    } catch (error: Exception) {
-      promise.reject(
-          "E_KEYSTORE_DELETE",
-          "The saved consumer wallet could not be removed from secure Android storage.",
-          error,
-      )
-      return
+    invalidatePendingStarts()
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject(
+            "E_CORE_UNAVAILABLE",
+            "The native MASQ core is missing from this build.",
+        )
+        return@execute
+      }
+      val removalStatusJson =
+          try {
+            MasqCoreJni.nativeRemoveWallet()
+          } catch (error: Exception) {
+            promise.reject(
+                "E_CORE_WALLET_REMOVE",
+                "The MASQ core could not remove the consumer wallet.",
+                error,
+            )
+            return@execute
+          }
+      if (
+          !isExactWalletRemovalStatus(JSONObject(removalStatusJson))
+      ) {
+        promise.reject(
+              "E_CORE_WALLET_REMOVE",
+              "The MASQ core did not confirm wallet removal.",
+        )
+        return@execute
+      }
+      try {
+        walletStore.delete()
+        restoreAttempted = true
+        val finalStatusJson = MasqCoreJni.nativeGetStatus()
+        if (!isExactWalletRemovalStatus(JSONObject(finalStatusJson))) {
+          promise.reject(
+              "E_CORE_WALLET_REMOVE",
+              "The MASQ core did not retain the wallet-removed state.",
+          )
+          return@execute
+        }
+        promise.resolve(finalStatusJson)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_KEYSTORE_DELETE",
+            "The saved consumer wallet could not be removed from secure Android storage.",
+            error,
+        )
+      }
     }
-    restoreAttempted = true
-    ifCoreAvailable(promise) { MasqCoreJni.nativeRemoveWallet() }
   }
 
   override fun preflightBrowserProxy(promise: Promise) {
-    ifCoreAvailable(promise) { MasqCoreJni.nativePreflightProxy() }
+    MasqCoreLifecycle.executor.execute {
+      ifCoreAvailable(promise) { MasqCoreJni.nativePreflightProxy() }
+    }
   }
 
   override fun getSystemTunnelStatus(promise: Promise) {
@@ -662,6 +1024,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.reject("E_VPN_UNAVAILABLE", "The native MASQ packet tunnel is missing from this build.")
       return
     }
+    if (!MasqCoreJni.isAvailable) {
+      promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+      return
+    }
     val status = JSONObject(MasqVpnService.statusJson())
     if (status.optString("phase") != "off") {
       promise.reject("E_VPN_ACTIVE", "Turn off the current system tunnel before changing its scope.")
@@ -683,34 +1049,86 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       return
     }
 
-    restoreCoreIfNeeded()
-    val coreStatus =
-        runCatching { JSONObject(MasqCoreJni.nativeGetStatus()) }.getOrElse {
-          promise.reject("E_CORE_STATUS", "The MASQ core status is unavailable.", it)
-          return
+    MasqCoreLifecycle.executor.execute {
+      try {
+        restoreCoreIfNeeded()
+        val coreStatus = JSONObject(MasqCoreJni.nativeGetStatus())
+        val proxyPort = coreStatus.optInt("proxyPort", 0)
+        if (
+            coreStatus.optString("phase") != "connected" ||
+                proxyPort !in 1..65535
+        ) {
+          promise.reject(
+              "E_NOT_CONNECTED",
+              "Connect a valid MASQ route before enabling system traffic.",
+          )
+          return@execute
         }
-    val proxyPort = coreStatus.optInt("proxyPort", 0)
-    if (coreStatus.optString("phase") != "connected" || proxyPort !in 1..65535) {
-      promise.reject("E_NOT_CONNECTED", "Connect a valid MASQ route before enabling system traffic.")
-      return
+        val coreGeneration = MasqCoreLifecycle.startGeneration.get()
+        callbackExecutor.execute {
+          requestSystemTunnelPermissionOrStart(
+              mode,
+              apps,
+              proxyPort,
+              coreGeneration,
+              promise,
+          )
+        }
+      } catch (error: SecureWalletStore.UnreadableException) {
+        promise.reject(
+            "E_WALLET_STORAGE_UNREADABLE",
+            "The encrypted consumer wallet could not be read safely. Unlock the device and retry.",
+            error,
+        )
+      } catch (error: Exception) {
+        promise.reject("E_CORE_STATUS", "The MASQ core status is unavailable.", error)
+      }
     }
+  }
 
-    val permissionIntent = VpnService.prepare(reactApplicationContext)
-    if (permissionIntent == null) {
-      startSystemTunnel(mode, apps, proxyPort, promise)
-      return
-    }
-    val activity = reactApplicationContext.getCurrentActivity()
-    if (activity == null || pendingTunnelRequest != null) {
-      promise.reject("E_VPN_ACTIVITY", "Open MASQ before approving Android VPN access.")
-      return
-    }
-    pendingTunnelRequest = PendingTunnelRequest(mode, apps, proxyPort, promise)
-    try {
-      activity.startActivityForResult(permissionIntent, VPN_PERMISSION_REQUEST)
-    } catch (error: Exception) {
-      pendingTunnelRequest = null
-      promise.reject("E_VPN_PERMISSION", "Android could not open the VPN permission dialog.", error)
+  private fun requestSystemTunnelPermissionOrStart(
+      mode: String,
+      apps: List<String>,
+      proxyPort: Int,
+      coreGeneration: Long,
+      promise: Promise,
+  ) {
+    synchronized(MasqCoreLifecycle.lock) {
+      if (coreGeneration != MasqCoreLifecycle.startGeneration.get()) {
+        promise.reject(
+            "E_VPN_STALE_CORE",
+            "The MASQ core changed before system routing could start.",
+        )
+        return
+      }
+      val permissionIntent = VpnService.prepare(reactApplicationContext)
+      if (permissionIntent == null) {
+        startSystemTunnel(mode, apps, proxyPort, promise)
+        return
+      }
+      val activity = reactApplicationContext.getCurrentActivity()
+      if (activity == null || pendingTunnelRequest != null) {
+        promise.reject("E_VPN_ACTIVITY", "Open MASQ before approving Android VPN access.")
+        return
+      }
+      pendingTunnelRequest =
+          PendingTunnelRequest(
+              mode,
+              apps,
+              proxyPort,
+              coreGeneration,
+              promise,
+          )
+      try {
+        activity.startActivityForResult(permissionIntent, VPN_PERMISSION_REQUEST)
+      } catch (error: Exception) {
+        pendingTunnelRequest = null
+        promise.reject(
+            "E_VPN_PERMISSION",
+            "Android could not open the VPN permission dialog.",
+            error,
+        )
+      }
     }
   }
 
@@ -834,9 +1252,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             pendingTunnelStops.clear()
           }
           pending
-        }
+    }
     stopAcknowledgementExecutor.shutdownNow()
-    ioExecutor.shutdownNow()
+    discoveryExecutor.shutdownNow()
     abandonedStops.forEach { operation ->
       runCatching {
         operation.promise.reject(
@@ -873,7 +1291,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       }
     }
 
-    val request = BrowserRoutingRequest(mode, promise)
+    val request =
+        BrowserRoutingRequest(
+            this,
+            mode,
+            MasqCoreLifecycle.startGeneration.get(),
+            promise,
+        )
     val next =
         synchronized(browserRoutingLock) {
           browserRoutingQueue.addLast(request)
@@ -884,10 +1308,18 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             browserRoutingQueue.removeFirst()
           }
         }
-    next?.let(::applyBrowserRoutingMode)
+    next?.owner?.applyBrowserRoutingMode(next)
   }
 
   private fun applyBrowserRoutingMode(request: BrowserRoutingRequest) {
+    if (moduleInvalidated) {
+      finishBrowserRoutingWithError(
+          request,
+          "E_MODULE_INVALIDATED",
+          "The MASQ native module is shutting down.",
+      )
+      return
+    }
     when (request.mode) {
       "blocked" -> applyBlockedBrowserRouting(request)
       "masq" -> applyMasqBrowserRouting(request)
@@ -958,36 +1390,91 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       return
     }
 
-    try {
-      val status = JSONObject(MasqCoreJni.nativeGetStatus())
-      if (status.optString("phase") != "connected") {
-        finishBrowserRoutingWithError(
-            request,
-            "E_NOT_CONNECTED",
-            "Build a MASQ route first.",
-        )
-        return
-      }
-      val proxyPort = status.optInt("proxyPort", 0)
-      if (proxyPort !in 1..65535) {
-        finishBrowserRoutingWithError(
-            request,
-            "E_PROXY_PORT",
-            "The MASQ core returned an invalid proxy port.",
-        )
-        return
-      }
+    MasqCoreLifecycle.executor.execute {
+      try {
+        requireCurrentBrowserCore(request)
+        val status = JSONObject(MasqCoreJni.nativeGetStatus())
+        requireCurrentBrowserCore(request)
+        if (status.optString("phase") != "connected") {
+          callbackExecutor.execute {
+            finishBrowserRoutingWithError(
+                request,
+                "E_NOT_CONNECTED",
+                "Build a MASQ route first.",
+            )
+          }
+          return@execute
+        }
+        val proxyPort = status.optInt("proxyPort", 0)
+        if (proxyPort !in 1..65535) {
+          callbackExecutor.execute {
+            finishBrowserRoutingWithError(
+                request,
+                "E_PROXY_PORT",
+                "The MASQ core returned an invalid proxy port.",
+            )
+          }
+          return@execute
+        }
 
-      val config =
-          ProxyConfig.Builder()
-              .addProxyRule("http://127.0.0.1:$proxyPort")
-              // Intentionally no addDirect(): failure must never bypass MASQ.
-              .build()
-      ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
-        try {
-          MasqCoreJni.nativeSetProxyEnabled(true)
-          finishBrowserRouting(request, "masq")
-        } catch (error: RuntimeException) {
+        callbackExecutor.execute {
+          try {
+            requireCurrentBrowserCore(request)
+            val config =
+                ProxyConfig.Builder()
+                    .addProxyRule("http://127.0.0.1:$proxyPort")
+                    // Intentionally no addDirect(): failure must never bypass MASQ.
+                    .build()
+            ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
+              confirmMasqBrowserRouting(request)
+            }
+          } catch (_: StaleBrowserCoreException) {
+            rejectStaleBrowserRouting(request)
+          } catch (error: RuntimeException) {
+            failBrowserRoutingClosed(
+                request,
+                "E_PROXY_APPLY",
+                "The local MASQ proxy could not be configured.",
+                error,
+            )
+          }
+        }
+      } catch (_: StaleBrowserCoreException) {
+        callbackExecutor.execute { rejectStaleBrowserRouting(request) }
+      } catch (error: RuntimeException) {
+        callbackExecutor.execute {
+          failBrowserRoutingClosed(
+              request,
+              "E_PROXY_APPLY",
+              "The local MASQ proxy could not be configured.",
+              error,
+          )
+        }
+      }
+    }
+  }
+
+  private fun confirmMasqBrowserRouting(request: BrowserRoutingRequest) {
+    MasqCoreLifecycle.executor.execute {
+      try {
+        requireCurrentBrowserCore(request)
+        val result = MasqCoreJni.nativeSetProxyEnabled(true)
+        requireCurrentBrowserCore(request)
+        if (!statusSucceeded(result)) {
+          throw IllegalStateException("The MASQ core did not confirm the browser proxy.")
+        }
+        callbackExecutor.execute {
+          try {
+            requireCurrentBrowserCore(request)
+            finishBrowserRouting(request, "masq")
+          } catch (_: StaleBrowserCoreException) {
+            rejectStaleBrowserRouting(request)
+          }
+        }
+      } catch (_: StaleBrowserCoreException) {
+        callbackExecutor.execute { rejectStaleBrowserRouting(request) }
+      } catch (error: RuntimeException) {
+        callbackExecutor.execute {
           failBrowserRoutingClosed(
               request,
               "E_PROXY_STATE",
@@ -996,17 +1483,16 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
           )
         }
       }
-    } catch (error: RuntimeException) {
-      finishBrowserRoutingWithError(
-          request,
-          "E_PROXY_APPLY",
-          "The local MASQ proxy could not be configured.",
-          error,
-      )
     }
   }
 
   private fun applyDirectBrowserRouting(request: BrowserRoutingRequest) {
+    try {
+      requireCurrentBrowserCore(request)
+    } catch (_: StaleBrowserCoreException) {
+      rejectStaleBrowserRouting(request)
+      return
+    }
     val tunnelStatus =
         runCatching { JSONObject(MasqVpnService.statusJson()) }.getOrElse {
           finishBrowserRoutingWithError(
@@ -1030,18 +1516,38 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
     try {
       ProxyController.getInstance().clearProxyOverride(callbackExecutor) {
-        try {
-          if (MasqCoreJni.isAvailable) {
-            MasqCoreJni.nativeSetProxyEnabled(false)
+        MasqCoreLifecycle.executor.execute {
+          try {
+            requireCurrentBrowserCore(request)
+            if (MasqCoreJni.isAvailable) {
+              val result = MasqCoreJni.nativeSetProxyEnabled(false)
+              if (!statusSucceeded(result)) {
+                throw IllegalStateException(
+                    "The MASQ core did not confirm direct browser routing.",
+                )
+              }
+            }
+            requireCurrentBrowserCore(request)
+            callbackExecutor.execute {
+              try {
+                requireCurrentBrowserCore(request)
+                finishBrowserRouting(request, "direct")
+              } catch (_: StaleBrowserCoreException) {
+                rejectStaleBrowserRouting(request)
+              }
+            }
+          } catch (_: StaleBrowserCoreException) {
+            callbackExecutor.execute { rejectStaleBrowserRouting(request) }
+          } catch (error: RuntimeException) {
+            callbackExecutor.execute {
+              failBrowserRoutingClosed(
+                  request,
+                  "E_PROXY_STATE",
+                  "The MASQ core could not confirm direct browser routing.",
+                  error,
+              )
+            }
           }
-          finishBrowserRouting(request, "direct")
-        } catch (error: RuntimeException) {
-          failBrowserRoutingClosed(
-              request,
-              "E_PROXY_STATE",
-              "The MASQ core could not confirm direct browser routing.",
-              error,
-          )
         }
       }
     } catch (error: RuntimeException) {
@@ -1243,11 +1749,28 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   private fun syncCoreBrowserProxy(enabled: Boolean) {
     if (!MasqCoreJni.isAvailable) return
-    try {
-      MasqCoreJni.nativeSetProxyEnabled(enabled)
-    } catch (_: RuntimeException) {
-      // WebView routing remains authoritative and blocked on cleanup paths.
+    MasqCoreLifecycle.executor.execute {
+      try {
+        MasqCoreJni.nativeSetProxyEnabled(enabled)
+      } catch (_: RuntimeException) {
+        // WebView routing remains authoritative and blocked on cleanup paths.
+      }
     }
+  }
+
+  private fun requireCurrentBrowserCore(request: BrowserRoutingRequest) {
+    if (request.coreGeneration != MasqCoreLifecycle.startGeneration.get()) {
+      throw StaleBrowserCoreException()
+    }
+  }
+
+  private fun rejectStaleBrowserRouting(request: BrowserRoutingRequest) {
+    failBrowserRoutingClosed(
+        request,
+        "E_BROWSER_STALE_CORE",
+        "The MASQ core changed before browser routing could be enabled.",
+        StaleBrowserCoreException(),
+    )
   }
 
   private fun finishBrowserRouting(request: BrowserRoutingRequest, mode: String) {
@@ -1279,11 +1802,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             browserRoutingQueue.removeFirst()
           }
         }
-    next?.let(::applyBrowserRoutingMode)
+    next?.owner?.applyBrowserRoutingMode(next)
   }
 
   private data class BrowserRoutingRequest(
+      val owner: MasqCoreModule,
       val mode: String,
+      val coreGeneration: Long,
       val promise: Promise,
   )
 
@@ -1325,18 +1850,24 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     if (restoreAttempted || !MasqCoreJni.isAvailable) return
     synchronized(restoreLock) {
       if (restoreAttempted) return
-      restoreAttempted = true
-      runCatching {
+      try {
         val current = JSONObject(MasqCoreJni.nativeGetStatus())
         val savedConfig = preferences.getString(SAVED_CONFIG_KEY, null)
         if (current.isNull("chain") && savedConfig != null) {
           val result = MasqCoreJni.nativeConfigure(prepareNativeConfig(savedConfig))
-          if (!statusSucceeded(result)) return@runCatching
+          if (!statusSucceeded(result)) {
+            restoreAttempted = true
+            return
+          }
         }
         val savedWallet = walletStore.load()
         if (current.isNull("walletAddress") && savedWallet != null) {
           MasqCoreJni.nativeImportWallet(savedWallet)
         }
+        restoreAttempted = true
+      } catch (error: Exception) {
+        restoreAttempted = false
+        throw error
       }
     }
   }
@@ -1364,8 +1895,99 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
           }
           .toString()
 
-  private fun statusSucceeded(statusJson: String): Boolean =
-      JSONObject(statusJson).optString("phase") != "error"
+  private fun statusSucceeded(statusJson: String): Boolean {
+    val phase = JSONObject(statusJson).opt("phase")
+    return phase is String &&
+        phase in
+            setOf(
+                "unconfigured",
+                "ready",
+                "connecting",
+                "connected",
+                "paused",
+                "stopping",
+                "blocked",
+            )
+  }
+
+  private fun nullableStatusString(status: JSONObject, field: String): String? {
+    if (!status.has(field)) {
+      throw IllegalArgumentException("The MASQ core status is missing $field.")
+    }
+    if (status.isNull(field)) return null
+    val value = status.opt(field)
+    if (value !is String || value.isBlank()) {
+      throw IllegalArgumentException("The MASQ core status contains an invalid $field.")
+    }
+    return value
+  }
+
+  private fun walletSecretsMatch(before: String?, after: String?): Boolean {
+    if (before == null || after == null) return before == after
+    return MessageDigest.isEqual(
+        before.toByteArray(StandardCharsets.UTF_8),
+        after.toByteArray(StandardCharsets.UTF_8),
+    )
+  }
+
+  private fun isExactNetworkProfileResetStatus(status: JSONObject): Boolean {
+    val minHops = status.opt("minHops")
+    return isExactStoppedRouteStatus(status) &&
+        status.has("chain") &&
+        status.isNull("chain") &&
+        minHops is Number &&
+        minHops.toDouble() == 1.0 &&
+        status.has("exitCountry") &&
+        status.isNull("exitCountry") &&
+        status.opt("exitCountryFallback") == true
+  }
+
+  private fun isExactFullResetStatus(status: JSONObject): Boolean =
+      isExactNetworkProfileResetStatus(status) &&
+          status.has("walletAddress") &&
+          status.isNull("walletAddress")
+
+  private fun isExactWalletRemovalStatus(status: JSONObject): Boolean =
+      isExactStoppedRouteStatus(status) &&
+          status.has("walletAddress") &&
+          status.isNull("walletAddress")
+
+  private fun isExactStoppedRouteStatus(status: JSONObject): Boolean {
+    val connectedNeighbors = status.opt("connectedNeighbors")
+    val routeStage = status.opt("routeStage")
+    val routeHops = status.opt("routeHops")
+    val availableExitCountries = status.opt("availableExitCountries")
+    return status.opt("phase") == "unconfigured" &&
+        connectedNeighbors is Number &&
+        connectedNeighbors.toDouble() == 0.0 &&
+        routeStage is Number &&
+        routeStage.toDouble() == 0.0 &&
+        routeHops is Number &&
+        routeHops.toDouble() == 0.0 &&
+        availableExitCountries is JSONArray &&
+        availableExitCountries.length() == 0 &&
+        status.opt("proxyEnabled") == false &&
+        status.has("proxyPort") &&
+        status.isNull("proxyPort") &&
+        status.has("lastError") &&
+        status.isNull("lastError")
+  }
+
+  private fun rejectNetworkProfileReset(promise: Promise, error: Throwable? = null) {
+    if (error == null) {
+      promise.reject("E_NETWORK_PROFILE_RESET", NETWORK_PROFILE_RESET_MESSAGE)
+    } else {
+      promise.reject("E_NETWORK_PROFILE_RESET", NETWORK_PROFILE_RESET_MESSAGE, error)
+    }
+  }
+
+  private fun rejectWalletPreservation(promise: Promise, error: Throwable? = null) {
+    if (error == null) {
+      promise.reject("E_WALLET_PRESERVATION", WALLET_PRESERVATION_MESSAGE)
+    } else {
+      promise.reject("E_WALLET_PRESERVATION", WALLET_PRESERVATION_MESSAGE, error)
+    }
+  }
 
   private fun browserProtectionJson(
       blockAdsAndTrackers: Boolean,
@@ -1438,8 +2060,17 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     private const val BLOCKED_BROWSER_PROXY = "http://127.0.0.1:1"
     private const val START_CANCELLED_MESSAGE =
         "The MASQ connection attempt was cancelled."
+    private const val SAVED_CONFIG_INVALID_MESSAGE =
+        "The saved MASQ network profile is invalid."
+    private const val NETWORK_PROFILE_RESET_MESSAGE =
+        "The MASQ network profile could not be reset safely."
+    private const val WALLET_PRESERVATION_MESSAGE =
+        "The saved consumer wallet could not be preserved during network-profile recovery."
     private const val STOP_TUNNEL_TIMEOUT_MS = 10_000L
     private val STOP_REQUEST_COUNTER = AtomicLong(1L)
+    private val browserRoutingLock = Any()
+    private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()
+    private var browserRoutingInFlight = false
     private val BROWSER_PROTECTION_FIELDS =
         setOf(
             "blockAdsAndTrackers",
@@ -1462,6 +2093,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       val mode: String,
       val apps: List<String>,
       val proxyPort: Int,
+      val coreGeneration: Long,
       val promise: Promise,
   )
 
@@ -1473,4 +2105,5 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   )
 
   private class StaleStartException : IllegalStateException()
+  private class StaleBrowserCoreException : IllegalStateException()
 }

@@ -9,6 +9,10 @@ describe('iOS native MASQ core linkage', () => {
     path.resolve(__dirname, '../ios/MasqMobile/RCTMasqCore.mm'),
     'utf8',
   );
+  const bridgeHeaderSource = readFileSync(
+    path.resolve(__dirname, '../ios/MasqMobile/RCTMasqCore.h'),
+    'utf8',
+  );
   const nativeSpecSource = readFileSync(
     path.resolve(__dirname, '../specs/NativeMasqCore.ts'),
     'utf8',
@@ -84,6 +88,317 @@ describe('iOS native MASQ core linkage', () => {
     expect(bridgeSource).toContain('&masq_mobile_start');
     expect(bridgeSource).toContain('&masq_mobile_shutdown');
     expect(bridgeSource).toContain('&masq_mobile_string_free');
+  });
+
+  it('proves iOS wallet preservation before completing a network-profile-only reset', () => {
+    const resetBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)resetNetworkProfile:'),
+      bridgeSource.indexOf('- (void)removeWallet:'),
+    );
+    const terminalStatusBody = bridgeSource.slice(
+      bridgeSource.indexOf('BOOL isResetNetworkProfileTerminalStatus('),
+      bridgeSource.indexOf('NSString *_Nullable nativeConfig('),
+    );
+    const profileRemoval = resetBody.indexOf(
+      '[defaults removeObjectForKey:MasqConfigDefaultsKey]',
+    );
+    const nativeReset = resetBody.indexOf(
+      'symbol<NoArgumentFunction>("masq_mobile_reset_network_profile")',
+    );
+    const walletRestore = resetBody.indexOf(
+      'symbol<StringArgumentFunction>("masq_mobile_import_wallet")',
+    );
+
+    expect(resetBody).toContain('if (!coreAvailable())');
+    expect(resetBody).toContain(
+      'loadWalletSecretForPreservation(&savedWalletBefore)',
+    );
+    expect(resetBody).toContain('beforeWalletAddress && !savedWalletBefore');
+    expect(resetBody).toContain(
+      'loadWalletSecretForPreservation(&savedWalletAfter)',
+    );
+    expect(resetBody).toContain(
+      '[savedWalletBefore isEqualToString:savedWalletAfter]',
+    );
+    expect(resetBody).toContain(
+      '[beforeWalletAddress isEqualToString:finalWalletAddress]',
+    );
+    expect(resetBody).toContain(
+      '[importedWalletAddress isEqualToString:finalWalletAddress]',
+    );
+    expect(resetBody).toContain(
+      'isResetNetworkProfileTerminalStatus(walletStatus)',
+    );
+    expect(resetBody).toContain('E_NETWORK_PROFILE_RESET');
+    expect(resetBody).toContain('E_WALLET_PRESERVATION');
+    expect(resetBody).not.toContain('deleteWalletSecret');
+    expect(resetBody).not.toContain('resetBrowserProtectionPreferences');
+
+    expect(profileRemoval).toBeGreaterThan(
+      resetBody.indexOf('loadWalletSecretForPreservation(&savedWalletBefore)'),
+    );
+    expect(nativeReset).toBeGreaterThan(
+      resetBody.indexOf('loadWalletSecretForPreservation(&savedWalletBefore)'),
+    );
+    expect(walletRestore).toBeGreaterThan(nativeReset);
+    expect(resetBody.lastIndexOf('"masq_mobile_get_status"')).toBeGreaterThan(
+      walletRestore,
+    );
+    expect(profileRemoval).toBeGreaterThan(
+      resetBody.lastIndexOf('"masq_mobile_get_status"'),
+    );
+
+    expect(terminalStatusBody).toContain(
+      '[status[@"phase"] isEqualToString:@"unconfigured"]',
+    );
+    expect(terminalStatusBody).toContain('status[@"chain"] == [NSNull null]');
+    expect(terminalStatusBody).toContain(
+      '[status[@"connectedNeighbors"] isEqual:@0]',
+    );
+    expect(terminalStatusBody).toContain(
+      '[status[@"routeStage"] isEqual:@0]',
+    );
+    expect(terminalStatusBody).toContain(
+      '[status[@"routeHops"] isEqual:@0]',
+    );
+    expect(terminalStatusBody).toContain('[status[@"minHops"] isEqual:@1]');
+    expect(terminalStatusBody).toContain(
+      'status[@"exitCountry"] == [NSNull null]',
+    );
+    expect(terminalStatusBody).toContain(
+      '[status[@"exitCountryFallback"] isEqual:@YES]',
+    );
+    expect(terminalStatusBody).toContain(
+      '[(NSArray *)status[@"availableExitCountries"] count] == 0',
+    );
+    expect(terminalStatusBody).toContain(
+      '[status[@"proxyEnabled"] isEqual:@NO]',
+    );
+    expect(terminalStatusBody).toContain(
+      'status[@"proxyPort"] == [NSNull null]',
+    );
+    expect(terminalStatusBody).toContain(
+      'status[@"lastError"] == [NSNull null]',
+    );
+  });
+
+  it('uses a stable code for unreadable saved iOS profiles', () => {
+    const getSavedConfigurationBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)getSavedConfiguration:'),
+      bridgeSource.indexOf('- (void)configure:'),
+    );
+
+    expect(getSavedConfigurationBody).toContain('E_SAVED_CONFIG_INVALID');
+  });
+
+  it('uses a process-global fence so an old iOS module cannot undo a reset', () => {
+    const startBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)start:'),
+      bridgeSource.indexOf('- (void)reset:'),
+    );
+    const resetBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)resetNetworkProfile:'),
+      bridgeSource.indexOf('- (void)removeWallet:'),
+    );
+    const staleGuard = startBody.indexOf(
+      'generation != gCoreStartGeneration',
+    );
+    const nativeConfigure = startBody.indexOf(
+      'symbol<StringArgumentFunction>("masq_mobile_configure")',
+    );
+    const profileWrite = startBody.indexOf(
+      'setObject:refreshedConfig',
+    );
+    const nativeStart = startBody.indexOf(
+      'symbol<NoArgumentFunction>("masq_mobile_start")',
+    );
+
+    expect(bridgeSource).toContain(
+      'static NSUInteger gCoreStartGeneration = 0;',
+    );
+    expect(bridgeSource).toContain('NSObject *coreLifecycleLock()');
+    expect(startBody).toContain('generation = gCoreStartGeneration');
+    expect(startBody).toContain('@synchronized(coreLifecycleLock())');
+    expect(startBody).toContain('E_CORE_START_CANCELLED');
+    expect(staleGuard).toBeGreaterThan(-1);
+    expect(nativeConfigure).toBeGreaterThan(staleGuard);
+    expect(nativeStart).toBeGreaterThan(nativeConfigure);
+    expect(profileWrite).toBeGreaterThan(nativeStart);
+    expect(resetBody.indexOf('gCoreStartGeneration += 1')).toBeLessThan(
+      resetBody.indexOf(
+        '[defaults removeObjectForKey:MasqConfigDefaultsKey]',
+      ),
+    );
+  });
+
+  it('serializes iOS profile mutations and validates destructive terminal states before deletion', () => {
+    const getSavedConfigurationBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)getSavedConfiguration:'),
+      bridgeSource.indexOf('- (void)configure:'),
+    );
+    const configureBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)configure:'),
+      bridgeSource.indexOf('- (void)importWallet:'),
+    );
+    const importWalletBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)importWallet:'),
+      bridgeSource.indexOf('- (void)updateMinHops:'),
+    );
+    const updateMinHopsBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)updateMinHops:'),
+      bridgeSource.indexOf('- (void)start:'),
+    );
+    const fullResetBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)reset:'),
+      bridgeSource.indexOf('- (void)resetNetworkProfile:'),
+    );
+    const removeWalletBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)removeWallet:'),
+      bridgeSource.indexOf('- (void)preflightBrowserProxy:'),
+    );
+
+    expect(getSavedConfigurationBody).toContain(
+      '@synchronized(coreLifecycleLock())',
+    );
+    for (const mutation of [
+      configureBody,
+      importWalletBody,
+      updateMinHopsBody,
+    ]) {
+      expect(mutation).toContain('@synchronized(coreLifecycleLock())');
+      expect(mutation).toContain('gCoreStartGeneration += 1');
+    }
+    expect(fullResetBody.indexOf('if (!coreAvailable())')).toBeLessThan(
+      fullResetBody.indexOf('deleteWalletSecret()'),
+    );
+    expect(fullResetBody.indexOf('"masq_mobile_reset"')).toBeLessThan(
+      fullResetBody.indexOf('deleteWalletSecret()'),
+    );
+    expect(
+      fullResetBody.indexOf('isFullResetTerminalStatus(resetStatus)'),
+    ).toBeLessThan(fullResetBody.indexOf('deleteWalletSecret()'));
+    expect(fullResetBody.lastIndexOf('"masq_mobile_get_status"')).toBeLessThan(
+      fullResetBody.indexOf('resolve(finalResult)'),
+    );
+    expect(removeWalletBody.indexOf('if (!coreAvailable())')).toBeLessThan(
+      removeWalletBody.indexOf('deleteWalletSecret()'),
+    );
+    expect(removeWalletBody.indexOf('"masq_mobile_remove_wallet"')).toBeLessThan(
+      removeWalletBody.indexOf('deleteWalletSecret()'),
+    );
+    expect(
+      removeWalletBody.indexOf(
+        'isWalletRemovalTerminalStatus(removalStatus)',
+      ),
+    ).toBeLessThan(removeWalletBody.indexOf('deleteWalletSecret()'));
+    expect(
+      removeWalletBody.lastIndexOf('"masq_mobile_get_status"'),
+    ).toBeLessThan(removeWalletBody.indexOf('resolve(finalResult)'));
+  });
+
+  it('fences stale iOS browser proxy callbacks behind the core lifecycle', () => {
+    const browserRoutingBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)setBrowserRoutingMode:'),
+      bridgeSource.indexOf(
+        '- (std::shared_ptr<facebook::react::TurboModule>)',
+      ),
+    );
+
+    expect(browserRoutingBody).toContain(
+      'coreGeneration = gCoreStartGeneration',
+    );
+    expect(browserRoutingBody).toContain(
+      'coreGeneration != gCoreStartGeneration',
+    );
+    expect(browserRoutingBody).toContain(
+      '[mode isEqualToString:@"direct"]',
+    );
+    expect(browserRoutingBody).toContain(
+      'self.invalidated ||\n            coreGeneration != gCoreStartGeneration',
+    );
+    expect(browserRoutingBody).toContain('E_BROWSER_STALE_CORE');
+    expect(browserRoutingBody).toContain(
+      '@synchronized(coreLifecycleLock())',
+    );
+  });
+
+  it('restores iOS saved network configuration and wallet independently', () => {
+    const restoreBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (BOOL)restoreCoreIfNeeded'),
+      bridgeSource.indexOf('- (void)stop:'),
+    );
+
+    expect(restoreBody).toContain('if (savedConfig) {');
+    expect(restoreBody).toContain('if (savedWallet) {');
+    expect(restoreBody).toContain('"masq_mobile_configure"');
+    expect(restoreBody).toContain('"masq_mobile_import_wallet"');
+    expect(restoreBody).not.toContain(
+      'if (!savedConfig || !savedWallet)',
+    );
+  });
+
+  it('invalidates every queued iOS core mutation when its bridge is torn down', () => {
+    const invalidationBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)invalidate {'),
+      bridgeSource.indexOf('- (void)getStatus:'),
+    );
+    const startBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)start:'),
+      bridgeSource.indexOf('- (void)reset:'),
+    );
+    const preflightBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)preflightBrowserProxy:'),
+      bridgeSource.indexOf('- (void)getSystemTunnelStatus:'),
+    );
+    const stopBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)stop:'),
+      bridgeSource.indexOf('- (void)shutdown:'),
+    );
+    const shutdownBody = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)shutdown:'),
+      bridgeSource.indexOf('- (void)setBrowserRoutingMode:'),
+    );
+
+    expect(bridgeHeaderSource).toContain('#import <React/RCTInvalidating.h>');
+    expect(bridgeHeaderSource).toContain(
+      '<NativeMasqCoreSpec, RCTInvalidating>',
+    );
+    expect(invalidationBody).toContain('self.invalidated = YES');
+    expect(invalidationBody).toContain('gCoreStartGeneration += 1');
+    expect(invalidationBody).toContain('gBrowserProtectionGeneration += 1');
+    expect(startBody).toContain(
+      'self.invalidated || generation != gCoreStartGeneration',
+    );
+    for (const operation of [preflightBody, stopBody, shutdownBody]) {
+      expect(operation).toContain('generation = gCoreStartGeneration');
+      expect(operation).toContain(
+        'self.invalidated || generation != gCoreStartGeneration',
+      );
+      expect(operation.indexOf('generation = gCoreStartGeneration'))
+        .toBeLessThan(operation.indexOf('dispatch_async('));
+    }
+    expect(preflightBody.indexOf('generation != gCoreStartGeneration'))
+      .toBeLessThan(preflightBody.indexOf('"masq_mobile_preflight_proxy"'));
+  });
+
+  it('rejects malformed iOS core operation status instead of treating it as success', () => {
+    const statusSucceededBody = bridgeSource.slice(
+      bridgeSource.indexOf('BOOL statusSucceeded('),
+      bridgeSource.indexOf('NSDictionary *_Nullable decodedStatus('),
+    );
+
+    expect(statusSucceededBody).toContain(
+      '[decoded isKindOfClass:[NSDictionary class]]',
+    );
+    expect(statusSucceededBody).toContain(
+      '[phase isKindOfClass:[NSString class]]',
+    );
+    expect(statusSucceededBody).toContain(
+      '[successfulPhases containsObject:(NSString *)phase]',
+    );
+    expect(statusSucceededBody).not.toContain(
+      '![(NSString *)phase isEqualToString:@"error"]',
+    );
   });
 
   it('rejects unsafe node-finder URL components before archiving', () => {
@@ -179,7 +494,7 @@ describe('iOS native MASQ core linkage', () => {
     );
     expect(blockedBody).toContain('MasqBlockedBrowserProxyPort');
     expect(blockedBody).toContain(
-      'symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled")',
+      '"masq_mobile_set_proxy_enabled"',
     );
     expect(blockedBody).toContain('false');
     expect(blockedBody).toContain('resolve(@"blocked")');
@@ -194,7 +509,7 @@ describe('iOS native MASQ core linkage', () => {
       '[masqBrowserDataStore() setProxyConfigurations:@[]]',
     );
     expect(directBody).toContain(
-      'symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled")',
+      '"masq_mobile_set_proxy_enabled"',
     );
     expect(directBody).toContain('false');
     expect(directBody).toContain('resolve(@"direct")');
@@ -209,8 +524,9 @@ describe('iOS native MASQ core linkage', () => {
     expect(masqBody).toContain('![status isKindOfClass:[NSDictionary class]]');
     expect(masqBody).toContain('port.integerValue < 1');
     expect(masqBody).toContain('port.integerValue > 65535');
-    expect(masqBody).toContain(
-      'symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled"), true',
+    expect(masqBody).toContain('"masq_mobile_set_proxy_enabled"');
+    expect(masqBody).toMatch(
+      /"masq_mobile_set_proxy_enabled"\),\s+true\)/,
     );
     expect(masqBody).toContain('resolve(@"masq")');
 
