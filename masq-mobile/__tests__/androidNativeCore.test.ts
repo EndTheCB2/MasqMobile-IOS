@@ -405,6 +405,82 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain('E_ENTRY_NODE_DISCOVERY');
   });
 
+  it('serializes start cancellation and final native stop state', () => {
+    const start = moduleSource.slice(
+      moduleSource.indexOf('override fun start(promise: Promise)'),
+      moduleSource.indexOf('override fun stop(promise: Promise)'),
+    );
+    const stop = moduleSource.slice(
+      moduleSource.indexOf('override fun stop(promise: Promise)'),
+      moduleSource.indexOf('override fun shutdown(promise: Promise)'),
+    );
+    const shutdown = moduleSource.slice(
+      moduleSource.indexOf('override fun shutdown(promise: Promise)'),
+      moduleSource.indexOf('private fun invalidatePendingStarts()'),
+    );
+    const resolution = moduleSource.slice(
+      moduleSource.indexOf('private fun resolveStart('),
+      moduleSource.indexOf('private fun rejectStart('),
+    );
+    const rejection = moduleSource.slice(
+      moduleSource.indexOf('private fun rejectStart('),
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+    );
+    const configureIndex = start.indexOf('MasqCoreJni.nativeConfigure');
+    const configuredStartIndex = start.indexOf(
+      'MasqCoreJni.nativeStart()',
+      configureIndex,
+    );
+
+    expect(moduleSource).toContain(
+      'private val startGeneration = AtomicLong(0L)',
+    );
+    expect(start).toContain('startGeneration.incrementAndGet()');
+    expect(start).toContain('catch (_: StaleStartException)');
+    expect(start).not.toContain(
+      'promise.resolve(MasqCoreJni.nativeStart())',
+    );
+    expect(start.indexOf('requireCurrentStart(generation)')).toBeLessThan(
+      start.indexOf('entryNodeDiscovery.discover'),
+    );
+    expect(
+      start.indexOf(
+        'requireCurrentStart(generation)',
+        start.indexOf('entryNodeDiscovery.discover'),
+      ),
+    ).toBeLessThan(start.indexOf('MasqCoreJni.nativeConfigure'));
+    expect(
+      start.indexOf(
+        'requireCurrentStart(generation)',
+        configureIndex,
+      ),
+    ).toBeLessThan(configuredStartIndex);
+    expect(
+      resolution.indexOf('startGeneration.get() != generation'),
+    ).toBeLessThan(
+      resolution.indexOf('preferences.edit()'),
+    );
+    expect(configuredStartIndex).toBeLessThan(
+      start.indexOf('resolveStart(generation, promise, started, refreshedConfig)'),
+    );
+    expect(stop.indexOf('invalidatePendingStarts()')).toBeLessThan(
+      stop.indexOf('ioExecutor.execute'),
+    );
+    expect(stop.indexOf('ioExecutor.execute')).toBeLessThan(
+      stop.indexOf('MasqCoreJni.nativeStop()'),
+    );
+    expect(shutdown.indexOf('invalidatePendingStarts()')).toBeLessThan(
+      shutdown.indexOf('ioExecutor.execute'),
+    );
+    expect(shutdown.indexOf('ioExecutor.execute')).toBeLessThan(
+      shutdown.indexOf('MasqCoreJni.nativeShutdown()'),
+    );
+    expect(rejection).toContain(
+      'promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)',
+    );
+    expect(rejection).toContain('} else if (error == null) {');
+  });
+
   it('persists only strict Android browser protection preferences', () => {
     expect(moduleSource).toContain(
       'override fun prepareBrowserProtection(promise: Promise)',

@@ -43,6 +43,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   private val entryNodeDiscovery = EntryNodeDiscovery(reactContext)
   private val restoreLock = Any()
   private val lifecycleLock = Any()
+  private val startGeneration = AtomicLong(0L)
   private val browserRoutingLock = Any()
   private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()
   private val pendingTunnelStops = mutableMapOf<Long, PendingTunnelStop>()
@@ -401,16 +402,26 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun start(promise: Promise) {
-    restoreCoreIfNeeded()
+    val generation =
+        synchronized(lifecycleLock) {
+          startGeneration.incrementAndGet()
+        }
     if (!MasqCoreJni.isAvailable) {
       promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
       return
     }
     ioExecutor.execute {
       try {
+        requireCurrentStart(generation)
+        restoreCoreIfNeeded()
+        requireCurrentStart(generation)
         val currentStatus = JSONObject(MasqCoreJni.nativeGetStatus())
+        requireCurrentStart(generation)
         if (currentStatus.optString("phase") != "ready") {
-          promise.resolve(MasqCoreJni.nativeStart())
+          requireCurrentStart(generation)
+          val started = MasqCoreJni.nativeStart()
+          requireCurrentStart(generation)
+          resolveStart(generation, promise, started)
           return@execute
         }
 
@@ -427,37 +438,61 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                 nodes.optString(index).takeIf(String::isNotBlank)
               }
             } ?: emptyList()
+        requireCurrentStart(generation)
         val refreshedNodes = entryNodeDiscovery.discover(chain, preferredNodes)
+        requireCurrentStart(generation)
         config.put("neighbors", JSONArray(refreshedNodes))
         val refreshedConfig = migrateConfig(config.toString())
+        requireCurrentStart(generation)
         val configureResult =
             MasqCoreJni.nativeConfigure(prepareNativeConfig(refreshedConfig))
+        requireCurrentStart(generation)
         if (!statusSucceeded(configureResult)) {
           throw IllegalStateException("The MASQ core rejected the refreshed entry nodes.")
         }
-        preferences.edit().putString(SAVED_CONFIG_KEY, refreshedConfig).apply()
-        promise.resolve(MasqCoreJni.nativeStart())
+        requireCurrentStart(generation)
+        val started = MasqCoreJni.nativeStart()
+        requireCurrentStart(generation)
+        resolveStart(generation, promise, started, refreshedConfig)
+      } catch (_: StaleStartException) {
+        rejectStart(generation, promise, "E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
       } catch (error: EntryNodeDiscoveryException) {
-        promise.reject("E_ENTRY_NODE_DISCOVERY", error.message, error)
+        rejectStart(
+            generation,
+            promise,
+            "E_ENTRY_NODE_DISCOVERY",
+            error.message ?: "MASQ could not find reachable entry nodes.",
+            error,
+        )
       } catch (error: Exception) {
-        promise.reject("E_CORE_START", error.message ?: "The MASQ core could not start.", error)
+        rejectStart(
+            generation,
+            promise,
+            "E_CORE_START",
+            error.message ?: "The MASQ core could not start.",
+            error,
+        )
       }
     }
   }
 
   override fun stop(promise: Promise) {
+    invalidatePendingStarts()
     if (!MasqCoreJni.isAvailable) {
       promise.resolve(statusJson())
       return
     }
-    try {
-      promise.resolve(MasqCoreJni.nativeStop())
-    } catch (error: RuntimeException) {
-      promise.reject("E_CORE_STOP", "The MASQ core could not be stopped.", error)
+    ioExecutor.execute {
+      try {
+        promise.resolve(MasqCoreJni.nativeStop())
+      } catch (error: RuntimeException) {
+        promise.reject("E_CORE_STOP", "The MASQ core could not be stopped.", error)
+      }
     }
   }
 
   override fun shutdown(promise: Promise) {
+    invalidatePendingStarts()
     if (!MasqCoreJni.isAvailable) {
       promise.resolve(statusJson())
       return
@@ -471,6 +506,54 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             "The MASQ peer connection could not be shut down.",
             error,
         )
+      }
+    }
+  }
+
+  private fun invalidatePendingStarts() {
+    synchronized(lifecycleLock) {
+      startGeneration.incrementAndGet()
+    }
+  }
+
+  private fun requireCurrentStart(generation: Long) {
+    if (startGeneration.get() != generation) {
+      throw StaleStartException()
+    }
+  }
+
+  private fun resolveStart(
+      generation: Long,
+      promise: Promise,
+      status: String,
+      refreshedConfig: String? = null,
+  ) {
+    synchronized(lifecycleLock) {
+      if (startGeneration.get() != generation) {
+        promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
+      } else {
+        if (refreshedConfig != null) {
+          preferences.edit().putString(SAVED_CONFIG_KEY, refreshedConfig).apply()
+        }
+        promise.resolve(status)
+      }
+    }
+  }
+
+  private fun rejectStart(
+      generation: Long,
+      promise: Promise,
+      code: String,
+      message: String,
+      error: Throwable? = null,
+  ) {
+    synchronized(lifecycleLock) {
+      if (startGeneration.get() != generation) {
+        promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
+      } else if (error == null) {
+        promise.reject(code, message)
+      } else {
+        promise.reject(code, message, error)
       }
     }
   }
@@ -735,6 +818,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       }
 
   override fun invalidate() {
+    invalidatePendingStarts()
     val abandonedStops =
         synchronized(lifecycleLock) {
           val pending = mutableListOf<PendingTunnelStop>()
@@ -1352,6 +1436,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     private const val BROWSER_PROFILE_PREFIX = "masq_"
     private const val BROWSER_SITE_PREFERENCE_PREFIX = "browser-site."
     private const val BLOCKED_BROWSER_PROXY = "http://127.0.0.1:1"
+    private const val START_CANCELLED_MESSAGE =
+        "The MASQ connection attempt was cancelled."
     private const val STOP_TUNNEL_TIMEOUT_MS = 10_000L
     private val STOP_REQUEST_COUNTER = AtomicLong(1L)
     private val BROWSER_PROTECTION_FIELDS =
@@ -1385,4 +1471,6 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       val completed: AtomicBoolean = AtomicBoolean(false),
       val timeoutFuture: AtomicReference<ScheduledFuture<*>?> = AtomicReference(),
   )
+
+  private class StaleStartException : IllegalStateException()
 }

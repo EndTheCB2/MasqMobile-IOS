@@ -253,10 +253,15 @@ export function useMasqController() {
   const disconnect = useCallback(async () => {
     desiredConnected.current = false;
     cancelConnectionAttempt();
+    const connectIdle = connectFlight.current.whenIdle();
     return run(async () => {
-      setStatus(current => ({ ...current, phase: 'stopping' }));
-      await disableSystemTunnel();
-      return stopMasqSafely(masqCore);
+      try {
+        setStatus(current => ({ ...current, phase: 'stopping' }));
+        await disableSystemTunnel();
+        return await stopMasqSafely(masqCore);
+      } finally {
+        await connectIdle;
+      }
     });
   }, [cancelConnectionAttempt, disableSystemTunnel, run]);
 

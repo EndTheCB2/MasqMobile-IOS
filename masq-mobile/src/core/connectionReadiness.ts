@@ -19,6 +19,7 @@ export async function startAndAwaitMasqConnection(
   const startedAt = Date.now();
 
   let status = await start();
+  throwIfAborted(options.signal);
   options.onStatus?.(status);
 
   while (status.phase !== 'connected') {
@@ -36,6 +37,7 @@ export async function startAndAwaitMasqConnection(
     await sleep(pollIntervalMs);
     throwIfAborted(options.signal);
     status = await getStatus();
+    throwIfAborted(options.signal);
     options.onStatus?.(status);
   }
 
