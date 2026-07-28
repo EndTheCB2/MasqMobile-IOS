@@ -14,7 +14,7 @@ Download the signed APK, checksum, and signing-certificate fingerprint only from
 distributed outside Google Play, does not update automatically, and has not completed an
 independent mobile security audit.
 
-Preview.2 started the permanent Android signing lineage retained by preview.3 and later. Preview.1
+Preview.2 started the permanent Android signing lineage retained by preview.4 and later. Preview.1
 users must first back up their 12-word recovery phrase, uninstall preview.1, and then install the
 current preview. Preview.2 users can update in place. See the installation guide for the
 certificate fingerprint and migration warning.
@@ -43,13 +43,17 @@ workspace through `../masq-node-mobile/node`.
   address remains visible.
 - Temporary browser sessions by default, with exact-host remembered sign-in profiles only on
   Android WebView runtimes that report multi-profile isolation support.
-- Android whole-device and selected-app routing through a fail-closed `VpnService` packet tunnel.
+- Android `VpnService` and packet-translator foundations for future whole-device and selected-app
+  routing. The public preview keeps this UI disabled until process-death, network-handover and
+  leak tests prove the complete lifecycle is fail-closed.
 - Automatic RPC validation and entry-node discovery/retry.
 - Wallet import, live balance warnings, configurable hop count, and live exit-country inventory.
 
 iOS system routing remains unavailable: it requires an Apple Network Extension entitlement and a
 separately signed Packet Tunnel extension. The iOS UI reports that boundary and never claims that
 other apps are protected. Per-app iOS routing additionally requires managed devices through MDM.
+Android Always-on VPN support is also disabled while the system-tunnel lifecycle remains under
+validation. Installing this preview stops any system tunnel left by an earlier experimental build.
 
 The browser-protection rules are a small, MASQ Mobile-authored set bundled with the app. Rule
 matching happens locally: the feature downloads no external filter list and sends no browsing

@@ -25,6 +25,9 @@ describe('Android native MASQ core integration', () => {
     '../masq-node-mobile/node/src/daemon/launch_verifier.rs',
   );
   const manifest = read('android/app/src/main/AndroidManifest.xml');
+  const mainActivity = read(
+    'android/app/src/main/java/com/masqmobile/MainActivity.kt',
+  );
   const vpnService = read(
     'android/app/src/main/java/com/masqmobile/MasqVpnService.kt',
   );
@@ -100,9 +103,11 @@ describe('Android native MASQ core integration', () => {
       'MASQ_ANDROID_KEY_ALIAS="${MASQ_ANDROID_KEY_ALIAS:-masq-mobile-preview2}"',
     );
     expect(releaseBuilder).toContain('SIGNED_TEMP_APK');
+    expect(releaseBuilder).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(releaseBuilder).toContain('--v4-signing-enabled false');
     expect(releaseBuilder).toContain('ci\\.invalid\\.example');
     expect(apkVerifier).toContain('com.endthecb2.masqmobile');
+    expect(apkVerifier).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(apkVerifier).toContain('CN=Android Debug');
     expect(apkVerifier).toContain('--verbose --print-certs --Werr');
     expect(apkVerifier).toContain('/Users/[A-Za-z0-9._-]+');
@@ -113,6 +118,11 @@ describe('Android native MASQ core integration', () => {
       'Verify Android native linkage in the assembled APK',
     );
     expect(mobileCi).toContain('npm run verify:android:native:apk');
+  });
+
+  it('protects wallet entry and app previews from Android screen capture', () => {
+    expect(mainActivity).toContain('WindowManager.LayoutParams.FLAG_SECURE');
+    expect(mainActivity).toContain('window.addFlags');
   });
 
   it('supports explicit blocked, MASQ, and direct WebView routing modes', () => {
@@ -259,11 +269,25 @@ describe('Android native MASQ core integration', () => {
     expect(coreFacade).toContain('persistentSessionsSupported: false');
   });
 
-  it('packages a fail-closed Android system packet tunnel', () => {
+  it('packages the Android system packet tunnel behind a public safety gate', () => {
     const buildScript = read('scripts/build-rust-android.sh');
+    const systemTunnel = read('src/core/systemTunnel.ts');
 
     expect(manifest).toContain('android.permission.BIND_VPN_SERVICE');
     expect(manifest).toContain('android.net.VpnService');
+    expect(manifest).toContain('android.net.VpnService.SUPPORTS_ALWAYS_ON');
+    expect(manifest).toContain('android:value="false"');
+    expect(gradle).toContain(
+      'buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"',
+    );
+    expect(systemTunnel).toContain(
+      'export const SYSTEM_TUNNEL_PUBLICLY_ENABLED = false',
+    );
+    expect(vpnService).toContain('BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED &&');
+    expect(moduleSource).toContain('"E_VPN_PREVIEW_DISABLED"');
+    expect(moduleSource).toContain(
+      'if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED)',
+    );
     expect(vpnService).toContain('.addRoute("0.0.0.0", 0)');
     expect(vpnService).toContain('.addRoute("::", 0)');
     expect(vpnService).toContain(

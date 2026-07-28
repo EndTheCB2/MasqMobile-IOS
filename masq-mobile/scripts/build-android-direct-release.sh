@@ -56,8 +56,12 @@ VERSION_NAME="$(
   sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*/\1/p' "$APP_GRADLE" |
     head -1
 )"
-if [ -z "$VERSION_NAME" ]; then
-  echo "error: could not read Android versionName from $APP_GRADLE" >&2
+VERSION_CODE="$(
+  sed -nE 's/^[[:space:]]*versionCode[[:space:]]+([0-9]+).*/\1/p' "$APP_GRADLE" |
+    head -1
+)"
+if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+  echo "error: could not read Android versionName/versionCode from $APP_GRADLE" >&2
   exit 1
 fi
 
@@ -130,6 +134,7 @@ fi
 
 ANDROID_HOME="$SDK_ROOT" \
   MASQ_ANDROID_EXPECTED_VERSION_NAME="$VERSION_NAME" \
+  MASQ_ANDROID_EXPECTED_VERSION_CODE="$VERSION_CODE" \
   "$ROOT_DIR/scripts/verify-android-apk-privacy.sh" "$SIGNED_TEMP_APK"
 mv -f "$SIGNED_TEMP_APK" "$SIGNED_APK"
 

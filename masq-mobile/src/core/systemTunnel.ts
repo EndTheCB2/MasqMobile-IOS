@@ -6,6 +6,10 @@ export type SystemTunnelPhase =
   | 'stopping'
   | 'blocked';
 
+// Keep system-wide routing unreachable in public previews until Android
+// process-death, handover, and leak tests prove the tunnel is fail-closed.
+export const SYSTEM_TUNNEL_PUBLICLY_ENABLED = false;
+
 export interface SystemTunnelStatus {
   active: boolean;
   lastError: string | null;

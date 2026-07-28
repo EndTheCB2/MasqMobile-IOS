@@ -7,7 +7,8 @@ areas:
 - embedded, consume-only runtime lifecycle for iOS and Android;
 - mobile-safe network discovery, route selection, proxying, and status reporting;
 - configurable hop count and exit-location preferences;
-- wallet import and mobile persistence bridges;
+- wallet import and mobile persistence bridges, with masked recovery-word entry, autofill opt-out
+  and Android screen-capture protection;
 - settlement, receipt-session, and database migration support required by the embedded runtime;
 - React Native user interface and native WebView integration with explicit `blocked`, `masq` and
   `direct` routing states, structurally separate non-persistent iOS data stores and no automatic
@@ -18,7 +19,9 @@ areas:
 - explicit ENS `.eth` translation to eth.limo HTTPS transport with no search or Direct fallback;
 - opt-in exact-host remembered WebView profiles, separated by MASQ/Direct mode and enabled only
   after AndroidX WebKit confirms multi-profile support, with cross-site transitions re-profiled
-  and Android top-frame non-GET requests blocked fail-closed; and
+  and Android top-frame non-GET requests blocked fail-closed;
+- experimental Android `VpnService` and Rust packet-translator foundations kept behind a public
+  safety gate, with Always-on VPN disabled until lifecycle and leak testing is complete; and
 - iOS/Android build scripts, tests, diagnostics, and fail-closed security controls, including
   Android NDK-only native archiving and final-APK ELF linkage verification.
 

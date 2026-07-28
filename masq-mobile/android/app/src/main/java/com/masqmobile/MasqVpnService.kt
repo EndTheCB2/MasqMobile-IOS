@@ -35,6 +35,11 @@ class MasqVpnService : VpnService() {
       stopTunnel(requestId.takeIf { it != NO_STOP_REQUEST })
       return START_NOT_STICKY
     }
+    if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED) {
+      markOff()
+      stopTunnel()
+      return START_NOT_STICKY
+    }
     if (intent?.action != ACTION_START) {
       updateStatus(
           "blocked",
@@ -271,7 +276,11 @@ class MasqVpnService : VpnService() {
     fun statusJson(): String =
         synchronized(statusLock) {
           JSONObject()
-              .put("supported", MasqPacketTunnelJni.isAvailable)
+              .put(
+                  "supported",
+                  BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED &&
+                      MasqPacketTunnelJni.isAvailable,
+              )
               .put("active", currentActive)
               .put("mode", currentMode)
               .put("phase", currentPhase)

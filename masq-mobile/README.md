@@ -53,9 +53,10 @@ exit services to other nodes.
   sending credentials to the RPC.
 - Android WebView routing through AndroidX `ProxyController`, with exact `blocked`, `masq` and
   `direct` states and no automatic direct fallback.
-- Android whole-device and selected-app routing through `VpnService` plus an isolated Rust TUN
-  translator. Captured traffic remains blocked if translation fails; non-DNS UDP is deliberately
-  blocked until MASQ supports a reviewed UDP transport.
+- Android `VpnService` and an isolated Rust TUN translator are present as experimental
+  foundations. Public preview UI cannot start whole-device or selected-app routing until
+  process-death, network-handover and leak tests pass; Android Always-on VPN support is disabled
+  in the meantime.
 - iOS 17+ WebKit routing through `WKWebsiteDataStore.proxyConfigurations`, without proxy failover.
   The MASQ WebView is bound to a dedicated non-persistent data store that is never configured for
   direct networking. A second non-persistent store can use the device connection only in the
@@ -72,8 +73,9 @@ exit services to other nodes.
 
 The iOS build intentionally remains browser-only. Whole-device routing needs a separately signed
 Network Extension target and Apple entitlement; per-app routing additionally requires managed apps
-and MDM. Android system routing is implemented, but the MASQ app's own management UID is excluded
-to avoid a VPN loop. Its embedded browser still uses the explicit MASQ WebView proxy.
+and MDM. Android system-routing foundations remain behind a public safety gate until the complete
+tunnel lifecycle is proven fail-closed. The embedded browser continues to use the explicit MASQ
+WebView proxy.
 
 ## Structure
 
@@ -286,9 +288,10 @@ self-contained unsigned Android release APK with commit-pinned actions.
 - After import, the wallet secret is removed from React state and temporary Rust copies are
   zeroized. iOS persists it with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; Android uses
   AES-GCM with a non-exportable key held by Android Keystore.
-- The Android `VpnService` is fail-closed after establishment: if its translator stops, the TUN
-  descriptor stays open and captured traffic remains blocked. The user can additionally enable
-  Android's Always-on VPN and “Block connections without VPN” controls.
+- The Android `VpnService` keeps an established TUN descriptor open when its translator stops, but
+  whole-device and selected-app routing remain disabled in public previews until process-death,
+  service restart, network handover and leak testing also pass. Android Always-on VPN support is
+  disabled while that validation is incomplete.
 - iOS system routing returns an explicit unsupported result until a correctly provisioned Packet
   Tunnel extension exists.
 - MASQ Node remains beta software. Before store publication, conduct a mobile security review,

@@ -60,6 +60,7 @@ export function SetupScreen({
   const [submitted, setSubmitted] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showCountryPicker, setShowCountryPicker] = useState(false);
+  const [recoveryPhraseVisible, setRecoveryPhraseVisible] = useState(false);
   const [discoveryRequest, setDiscoveryRequest] = useState(0);
   const [discoveryState, setDiscoveryState] = useState<
     'loading' | 'ready' | 'error'
@@ -143,6 +144,7 @@ export function SetupScreen({
 
   const chooseWalletMode = (walletImportMode: WalletImportMode) => {
     setSubmitted(false);
+    setRecoveryPhraseVisible(false);
     setDraft(current => ({ ...current, walletImportMode, walletSecret: '' }));
   };
 
@@ -421,6 +423,7 @@ export function SetupScreen({
 
         {draft.walletImportMode === 'seedPhrase' ? (
           <Field
+            accessibilityLabel="Recovery phrase input"
             label={hasWallet ? 'Recovery phrase (optional)' : 'Recovery phrase'}
             value={draft.walletSecret}
             placeholder={
@@ -429,8 +432,12 @@ export function SetupScreen({
                 : 'word 1  word 2  word 3…'
             }
             autoCapitalize="none"
+            autoComplete="off"
             autoCorrect={false}
+            importantForAutofill="noExcludeDescendants"
+            secureTextEntry={!recoveryPhraseVisible}
             spellCheck={false}
+            textContentType="none"
             multiline
             numberOfLines={4}
             error={errors.walletSecret}
@@ -444,6 +451,13 @@ export function SetupScreen({
                 ? 'Saved securely on this device'
                 : `${wordCount}/12 words`
             }
+            actionLabel={recoveryPhraseVisible ? 'Hide' : 'Show'}
+            actionAccessibilityLabel={
+              recoveryPhraseVisible
+                ? 'Hide recovery phrase'
+                : 'Show recovery phrase'
+            }
+            onAction={() => setRecoveryPhraseVisible(current => !current)}
             onChangeText={walletSecret =>
               setDraft(current => ({ ...current, walletSecret }))
             }
@@ -629,14 +643,38 @@ interface FieldProps extends TextInputProps {
   error?: string;
   helper?: string;
   meta?: string;
+  actionLabel?: string;
+  actionAccessibilityLabel?: string;
+  onAction?: () => void;
 }
 
-function Field({ label, error, helper, meta, ...inputProps }: FieldProps) {
+function Field({
+  label,
+  error,
+  helper,
+  meta,
+  actionLabel,
+  actionAccessibilityLabel,
+  onAction,
+  ...inputProps
+}: FieldProps) {
   return (
     <View style={styles.field}>
       <View style={styles.labelRow}>
         <Label text={label} />
-        {meta ? <Text style={styles.meta}>{meta}</Text> : null}
+        <View style={styles.fieldMetaActions}>
+          {meta ? <Text style={styles.meta}>{meta}</Text> : null}
+          {actionLabel && onAction ? (
+            <Pressable
+              accessibilityLabel={actionAccessibilityLabel || actionLabel}
+              accessibilityRole="button"
+              hitSlop={8}
+              onPress={onAction}
+            >
+              <Text style={styles.fieldAction}>{actionLabel}</Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
       <TextInput
         placeholderTextColor="#587086"
@@ -873,6 +911,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
+  },
+  fieldMetaActions: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+  },
+  fieldAction: {
+    color: colors.violet,
+    fontSize: 12,
+    fontWeight: '800',
+    marginBottom: 9,
   },
   label: {
     color: colors.white,

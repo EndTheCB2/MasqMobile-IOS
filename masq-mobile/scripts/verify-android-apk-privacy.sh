@@ -103,6 +103,11 @@ if [ -n "${MASQ_ANDROID_EXPECTED_VERSION_NAME:-}" ] &&
   echo "error: unexpected Android version name." >&2
   exit 1
 fi
+if [ -n "${MASQ_ANDROID_EXPECTED_VERSION_CODE:-}" ] &&
+    [ "$ACTUAL_VERSION_CODE" != "$MASQ_ANDROID_EXPECTED_VERSION_CODE" ]; then
+  echo "error: unexpected Android version code." >&2
+  exit 1
+fi
 [ "$ACTUAL_MIN_SDK" = "24" ] && [ "$ACTUAL_TARGET_SDK" = "36" ] || {
   echo "error: unexpected Android SDK compatibility range." >&2
   exit 1

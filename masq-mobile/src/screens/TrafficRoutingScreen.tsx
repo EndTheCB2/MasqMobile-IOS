@@ -8,10 +8,11 @@ import {
   View,
 } from 'react-native';
 
-import type {
-  RoutableApp,
-  SystemTunnelMode,
-  SystemTunnelStatus,
+import {
+  SYSTEM_TUNNEL_PUBLICLY_ENABLED,
+  type RoutableApp,
+  type SystemTunnelMode,
+  type SystemTunnelStatus,
 } from '../core/systemTunnel';
 import { Button, ErrorBanner, ScreenHeader } from '../ui/components';
 import { colors, radii } from '../ui/theme';
@@ -78,9 +79,9 @@ export function TrafficRoutingScreen({
         <Text style={styles.eyebrow}>PROTECTION SCOPE</Text>
         <Text style={styles.title}>Choose what uses MASQ</Text>
         <Text style={styles.intro}>
-          System routing is fail-closed: if the MASQ route or packet translator
-          stops, captured apps stay blocked instead of falling back to your
-          direct connection.
+          {SYSTEM_TUNNEL_PUBLICLY_ENABLED
+            ? 'Choose which Android traffic is captured by the MASQ system tunnel.'
+            : 'Whole-device and selected-app routing are disabled in this preview while Android lifecycle and network-leak testing is completed.'}
         </Text>
         <ErrorBanner message={error || status.lastError} />
 
@@ -88,6 +89,19 @@ export function TrafficRoutingScreen({
           <View style={styles.warning}>
             <Text style={styles.warningTitle}>System tunnel unavailable</Text>
             <Text style={styles.warningText}>{unavailableReason}</Text>
+          </View>
+        ) : null}
+
+        {!SYSTEM_TUNNEL_PUBLICLY_ENABLED && status.supported ? (
+          <View style={styles.warning}>
+            <Text style={styles.warningTitle}>
+              Experimental system routing paused
+            </Text>
+            <Text style={styles.warningText}>
+              {status.phase === 'off'
+                ? 'Use the isolated MASQ Private browser for now. A later preview will enable system routing only after process-death, network-handover and leak tests pass.'
+                : 'A system tunnel from an earlier preview is still present. Turn it off below; this build cannot start a new system tunnel.'}
+            </Text>
           </View>
         ) : null}
 
@@ -100,22 +114,27 @@ export function TrafficRoutingScreen({
             if (status.phase !== 'off') apply('off', []).catch(() => undefined);
           }}
         />
-        <ScopeCard
-          active={choice === 'wholeDevice'}
-          detail="Android captures every other app. MASQ Mobile's own management traffic is excluded to prevent a VPN loop."
-          disabled={!status.supported || status.phase !== 'off'}
-          label="Whole device"
-          onPress={() => setChoice('wholeDevice')}
-        />
-        <ScopeCard
-          active={choice === 'selectedApps'}
-          detail="Capture only the Android apps you select below. App identities remain on this device."
-          disabled={!status.supported || status.phase !== 'off'}
-          label="Selected apps"
-          onPress={() => setChoice('selectedApps')}
-        />
+        {SYSTEM_TUNNEL_PUBLICLY_ENABLED ? (
+          <>
+            <ScopeCard
+              active={choice === 'wholeDevice'}
+              detail="Android captures every other app. MASQ Mobile's own management traffic is excluded to prevent a VPN loop."
+              disabled={!status.supported || status.phase !== 'off'}
+              label="Whole device"
+              onPress={() => setChoice('wholeDevice')}
+            />
+            <ScopeCard
+              active={choice === 'selectedApps'}
+              detail="Capture only the Android apps you select below. App identities remain on this device."
+              disabled={!status.supported || status.phase !== 'off'}
+              label="Selected apps"
+              onPress={() => setChoice('selectedApps')}
+            />
+          </>
+        ) : null}
 
-        {choice === 'selectedApps' &&
+        {SYSTEM_TUNNEL_PUBLICLY_ENABLED &&
+        choice === 'selectedApps' &&
         status.phase === 'off' &&
         status.supported ? (
           <View style={styles.appsCard}>
@@ -150,7 +169,9 @@ export function TrafficRoutingScreen({
           </View>
         ) : null}
 
-        {status.phase === 'off' && choice !== 'off' ? (
+        {SYSTEM_TUNNEL_PUBLICLY_ENABLED &&
+        status.phase === 'off' &&
+        choice !== 'off' ? (
           <Button
             busy={busy}
             disabled={
@@ -183,12 +204,12 @@ export function TrafficRoutingScreen({
           />
         ) : null}
 
-        <Text style={styles.footnote}>
-          For the strongest Android kill switch, enable “Always-on VPN” and
-          “Block connections without VPN” for MASQ in system VPN settings. UDP
-          other than DNS is intentionally blocked because the current MASQ
-          consumer proxy carries TCP/HTTP CONNECT traffic.
-        </Text>
+        {SYSTEM_TUNNEL_PUBLICLY_ENABLED ? (
+          <Text style={styles.footnote}>
+            UDP other than DNS is intentionally blocked because the current MASQ
+            consumer proxy carries TCP/HTTP CONNECT traffic.
+          </Text>
+        ) : null}
       </ScrollView>
     </View>
   );

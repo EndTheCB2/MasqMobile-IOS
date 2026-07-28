@@ -533,6 +533,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   @Suppress("DEPRECATION")
   override fun getRoutableApps(promise: Promise) {
+    if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED) {
+      promise.resolve("[]")
+      return
+    }
     try {
       val launcherIntent =
           Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_LAUNCHER) }
@@ -558,6 +562,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   override fun setSystemTunnel(mode: String, appIdsJson: String, promise: Promise) {
     if (mode == "off") {
       stopSystemTunnel(promise)
+      return
+    }
+    if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED) {
+      promise.reject(
+          "E_VPN_PREVIEW_DISABLED",
+          "System routing is not available in this preview.",
+      )
       return
     }
     if (mode != "wholeDevice" && mode != "selectedApps") {

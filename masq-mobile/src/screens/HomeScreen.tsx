@@ -3,7 +3,10 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import type { CoreStatus, NetworkStatus } from '../core/types';
 import type { MasqIssue } from '../core/issues';
 import type { WalletBalanceState } from '../core/walletBalance';
-import type { SystemTunnelStatus } from '../core/systemTunnel';
+import {
+  SYSTEM_TUNNEL_PUBLICLY_ENABLED,
+  type SystemTunnelStatus,
+} from '../core/systemTunnel';
 import { HOP_OPTIONS, exitCountryName } from '../core/routingPreferences';
 import {
   BrandMark,
@@ -213,8 +216,7 @@ export function HomeScreen({
             onPress={onOpenDirectBrowser}
             tone="secondary"
             disabled={
-              busy ||
-              (!network.available && network.interface !== 'unknown')
+              busy || (!network.available && network.interface !== 'unknown')
             }
           />
         </View>
@@ -341,7 +343,9 @@ export function HomeScreen({
           </View>
         ) : null}
 
-        {configured && systemTunnel.supported ? (
+        {configured &&
+        systemTunnel.supported &&
+        (SYSTEM_TUNNEL_PUBLICLY_ENABLED || systemTunnel.phase !== 'off') ? (
           <Pressable
             accessibilityRole="button"
             onPress={onOpenTrafficRouting}
@@ -355,10 +359,14 @@ export function HomeScreen({
                 <View style={styles.settingsBody}>
                   <Text style={styles.settingsEyebrow}>TRAFFIC SCOPE</Text>
                   <Text style={styles.settingsTitle}>
-                    {systemTunnelTitle(systemTunnel)}
+                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
+                      ? systemTunnelTitle(systemTunnel)
+                      : 'Turn off experimental system routing'}
                   </Text>
                   <Text style={styles.settingsMeta}>
-                    Configure whole-device or per-app routing
+                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
+                      ? 'Configure whole-device or per-app routing'
+                      : 'New system tunnels are disabled in this preview'}
                   </Text>
                 </View>
                 <Text style={styles.chevron}>›</Text>
@@ -504,7 +512,9 @@ function shortAddress(address: string): string {
 
 function systemTunnelTitle(status: SystemTunnelStatus): string {
   if (status.phase === 'blocked') {
-    return 'System traffic blocked';
+    return status.active
+      ? 'System traffic blocked'
+      : 'System routing unavailable';
   }
   if (status.mode === 'wholeDevice' && status.active) {
     return 'Whole device protected';
