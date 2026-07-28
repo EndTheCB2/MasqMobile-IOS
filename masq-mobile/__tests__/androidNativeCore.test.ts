@@ -269,11 +269,25 @@ describe('Android native MASQ core integration', () => {
     expect(coreFacade).toContain('persistentSessionsSupported: false');
   });
 
-  it('packages a fail-closed Android system packet tunnel', () => {
+  it('packages the Android system packet tunnel behind a public safety gate', () => {
     const buildScript = read('scripts/build-rust-android.sh');
+    const systemTunnel = read('src/core/systemTunnel.ts');
 
     expect(manifest).toContain('android.permission.BIND_VPN_SERVICE');
     expect(manifest).toContain('android.net.VpnService');
+    expect(manifest).toContain('android.net.VpnService.SUPPORTS_ALWAYS_ON');
+    expect(manifest).toContain('android:value="false"');
+    expect(gradle).toContain(
+      'buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"',
+    );
+    expect(systemTunnel).toContain(
+      'export const SYSTEM_TUNNEL_PUBLICLY_ENABLED = false',
+    );
+    expect(vpnService).toContain('BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED &&');
+    expect(moduleSource).toContain('"E_VPN_PREVIEW_DISABLED"');
+    expect(moduleSource).toContain(
+      'if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED)',
+    );
     expect(vpnService).toContain('.addRoute("0.0.0.0", 0)');
     expect(vpnService).toContain('.addRoute("::", 0)');
     expect(vpnService).toContain(

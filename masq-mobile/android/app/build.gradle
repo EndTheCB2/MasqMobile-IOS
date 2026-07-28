@@ -108,6 +108,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 4
         versionName "1.0.0-preview.4"
+        buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"
         ndk {
             // The embedded MASQ core is built for modern 64-bit devices and emulators.
             abiFilters "arm64-v8a", "x86_64"

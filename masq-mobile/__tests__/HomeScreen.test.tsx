@@ -9,7 +9,10 @@ import {
   type NetworkStatus,
 } from '../src/core/types';
 import { EMPTY_WALLET_BALANCE } from '../src/core/walletBalance';
-import { UNSUPPORTED_SYSTEM_TUNNEL } from '../src/core/systemTunnel';
+import {
+  UNSUPPORTED_SYSTEM_TUNNEL,
+  type SystemTunnelStatus,
+} from '../src/core/systemTunnel';
 
 const network: NetworkStatus = {
   available: true,
@@ -26,6 +29,8 @@ function homeScreen(
     busy?: boolean;
     network?: NetworkStatus;
     onOpenDirectBrowser?: () => void;
+    onOpenTrafficRouting?: () => void;
+    systemTunnel?: SystemTunnelStatus;
   } = {},
 ) {
   return (
@@ -35,14 +40,14 @@ function homeScreen(
       entryNodeRefresh={{ attempt: 1, maxAttempts: 3 }}
       issue={null}
       walletBalance={EMPTY_WALLET_BALANCE}
-      systemTunnel={UNSUPPORTED_SYSTEM_TUNNEL}
+      systemTunnel={options.systemTunnel ?? UNSUPPORTED_SYSTEM_TUNNEL}
       network={options.network ?? network}
       onConnect={jest.fn()}
       onDisconnect={onDisconnect}
       onOpenBrowser={jest.fn()}
       onOpenDirectBrowser={options.onOpenDirectBrowser ?? jest.fn()}
       onOpenSetup={jest.fn()}
-      onOpenTrafficRouting={jest.fn()}
+      onOpenTrafficRouting={options.onOpenTrafficRouting ?? jest.fn()}
       onOpenPrivacy={jest.fn()}
       onOpenSystemSettings={jest.fn()}
       onRemoveWallet={jest.fn()}
@@ -124,6 +129,65 @@ describe('HomeScreen connection controls', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('hides unvalidated Android system-routing controls while the tunnel is off', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          { phase: 'ready' },
+          {
+            systemTunnel: {
+              ...UNSUPPORTED_SYSTEM_TUNNEL,
+              supported: true,
+            },
+          },
+        ),
+      );
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('TRAFFIC SCOPE');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('keeps a shutdown path visible for a tunnel left by an earlier preview', () => {
+    const onOpenTrafficRouting = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          { phase: 'connected' },
+          {
+            onOpenTrafficRouting,
+            systemTunnel: {
+              active: true,
+              lastError: null,
+              mode: 'wholeDevice',
+              phase: 'active',
+              selectedApps: [],
+              supported: true,
+            },
+          },
+        ),
+      );
+    });
+
+    const control = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(
+            text =>
+              text.props.children === 'Turn off experimental system routing',
+          ),
+    );
+    ReactTestRenderer.act(() => control.props.onPress());
+    expect(onOpenTrafficRouting).toHaveBeenCalledTimes(1);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it.each([
     [
       'configured and connected',
@@ -175,10 +239,14 @@ describe('HomeScreen connection controls', () => {
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
       renderer = ReactTestRenderer.create(
-        homeScreen(jest.fn(), { phase: 'ready' }, {
-          busy: false,
-          network: { ...network, available: false },
-        }),
+        homeScreen(
+          jest.fn(),
+          { phase: 'ready' },
+          {
+            busy: false,
+            network: { ...network, available: false },
+          },
+        ),
       );
     });
 

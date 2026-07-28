@@ -42,6 +42,9 @@ not affected. Future releases must retain preview.2 certificate SHA-256
   wallet or browser content from being captured accidentally.
 - Direct-distribution verification now requires the exact Android version code in addition to the
   version name, package ID, signer, native libraries and alignment.
+- Unvalidated Android whole-device/per-app controls and Always-on VPN support are withheld until
+  process-death, network-handover and leak tests pass. Installing preview.4 stops any system
+  tunnel left by an earlier experimental build.
 
 ## Included
 
@@ -50,7 +53,8 @@ not affected. Future releases must retain preview.2 certificate SHA-256
 - Automatic entry-node discovery and refresh.
 - Wallet import from 12 recovery words or a private key, stored in operating-system secure storage.
 - Configurable hop count and preferred exit country.
-- Android whole-device or selected-app routing through `VpnService`.
+- Experimental Android `VpnService` and packet-translator foundations, kept behind a public safety
+  gate pending complete lifecycle and leak testing.
 - Balanced/Strict browser protection with exact-host exceptions and Reject-only handling for
   supported consent managers.
 - ENS `.eth` websites through the eth.limo HTTPS gateway without search or Direct fallback.
@@ -73,6 +77,7 @@ not a Google Play production release.
 - MASQ Private blocks the page if the route fails; it does not silently fall back to the direct
   device connection.
 - Direct browsing exposes the public IP of the current connection or VPN.
+- Whole-device and selected-app routing cannot be started in this preview.
 - Browser protection is best effort and does not claim YouTube ad blocking.
 - GitHub-installed builds do not update automatically.
 - Back up the wallet recovery phrase before uninstalling. Never post it in a GitHub issue.

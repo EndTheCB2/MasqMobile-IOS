@@ -47,8 +47,9 @@ installations are not affected. Releases after preview.2 must keep the preview.2
    APK as harmful, stop and report the exact warning on this repository instead of bypassing it.
 6. After installation, turn **Allow from this source** off again for the browser or Files app.
 
-Android asks for VPN permission only if whole-device or selected-app routing is enabled. That
-system dialog is expected; MASQ Mobile cannot grant the permission itself.
+Preview.4 does not offer whole-device or selected-app routing. Android Always-on VPN support is
+disabled until process-death, network-handover and leak tests pass. If an earlier experimental
+preview left a system tunnel active, installing preview.4 stops it.
 
 ## Check the download
 
@@ -75,8 +76,8 @@ or from GitHub.
 - The app consumes MASQ routes; it does not serve traffic for other peers.
 - **MASQ Private** fails closed. It does not silently fall back to the device connection.
 - **Browse without MASQ** is an explicit direct mode and exposes the connection's normal public IP.
-- Android system routing supports whole-device or selected-app scope. The MASQ management process
-  itself is excluded to avoid a VPN loop.
+- Android whole-device and selected-app routing is withheld from this public preview until the
+  complete `VpnService` lifecycle passes fail-closed leak testing.
 - Browser protection is best effort. This public build does not claim YouTube ad blocking.
 - This preview uses the development node-finder endpoint recorded above and in its Release notes.
   It is not a Google Play production release.
