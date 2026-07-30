@@ -1,19 +1,25 @@
-import type {CoreStatus} from './types';
+import type { CoreStatus } from './types';
+import {
+  extractMasqErrorCode,
+  extractMasqErrorMessage,
+  isEntryNodeRetryCode,
+} from './errorCodes';
 
 export const ENTRY_NODE_REFRESH_ATTEMPTS = 6;
 const ENTRY_NODE_REFRESH_BASE_DELAY_MS = 1500;
 const ENTRY_NODE_REFRESH_MAX_DELAY_MS = 6000;
 
-interface RefreshProgress {
+export interface EntryNodeRefreshProgress {
   attempt: number;
   maxAttempts: number;
+  stage: 'discovery' | 'handshake';
 }
 
 interface RefreshOptions {
   baseDelayMs?: number;
   maxAttempts?: number;
   maxDelayMs?: number;
-  onAttempt?: (progress: RefreshProgress) => void;
+  onAttempt?: (progress: EntryNodeRefreshProgress) => void;
   signal?: AbortSignal;
   sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -34,11 +40,13 @@ export async function startWithEntryNodeRefresh(
     baseDelayMs,
     options.maxDelayMs ?? ENTRY_NODE_REFRESH_MAX_DELAY_MS,
   );
-  const sleep = options.sleep ?? (milliseconds => wait(milliseconds, options.signal));
+  const sleep =
+    options.sleep ?? (milliseconds => wait(milliseconds, options.signal));
+  let lastSafeHandshakeError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     throwIfAborted(options.signal);
-    options.onAttempt?.({attempt, maxAttempts});
+    options.onAttempt?.({ attempt, maxAttempts, stage: 'discovery' });
     try {
       const status = await start();
       throwIfAborted(options.signal);
@@ -47,13 +55,24 @@ export async function startWithEntryNodeRefresh(
       if (options.signal?.aborted) {
         throw abortError();
       }
-      if (!isEntryNodeDiscoveryError(caught) || attempt === maxAttempts) {
+      const retryCode = extractMasqErrorCode(caught);
+      const retryable = isEntryNodeRefreshError(caught);
+      if (
+        retryCode &&
+        retryCode !== 'E_ENTRY_NODE_DISCOVERY' &&
+        isEntryNodeRetryCode(retryCode)
+      ) {
+        lastSafeHandshakeError = caught;
+      }
+      if (!retryable) {
         throw caught;
       }
-      const delayMs = Math.min(
-        baseDelayMs * 2 ** (attempt - 1),
-        maxDelayMs,
-      );
+      if (attempt === maxAttempts) {
+        throw shouldPreserveHandshakeError(caught)
+          ? lastSafeHandshakeError ?? caught
+          : caught;
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
       await sleep(delayMs);
       throwIfAborted(options.signal);
     }
@@ -62,21 +81,19 @@ export async function startWithEntryNodeRefresh(
   throw new Error('MASQ entry-node refresh stopped unexpectedly.');
 }
 
-function isEntryNodeDiscoveryError(caught: unknown): boolean {
-  if (!caught || typeof caught !== 'object') {
-    return false;
+export function isEntryNodeRefreshError(caught: unknown): boolean {
+  const code = extractMasqErrorCode(caught);
+  if (code !== null) {
+    return isEntryNodeRetryCode(code);
   }
-  const candidate = caught as {code?: unknown; message?: unknown};
-  if (candidate.code === 'E_ENTRY_NODE_DISCOVERY') {
-    return true;
-  }
-  if (typeof candidate.message !== 'string') {
-    return false;
-  }
-  return /entry nodes?|node-finder/i.test(candidate.message) &&
-    /reachable|refresh|discover|find|handshake|connect|tim(?:e|ed)/i.test(
-      candidate.message,
-    );
+
+  const message = extractMasqErrorMessage(caught);
+  return (
+    /entry nodes?|entry peer|node-finder/i.test(message) &&
+    /reachable|refresh|discover|find|handshake|connect|gossip|tim(?:e|ed)/i.test(
+      message,
+    )
+  );
 }
 
 export function isAbortError(caught: unknown): boolean {
@@ -95,6 +112,11 @@ function abortError() {
   return error;
 }
 
+function shouldPreserveHandshakeError(caught: unknown): boolean {
+  const code = extractMasqErrorCode(caught);
+  return code === 'E_ENTRY_NODE_DISCOVERY' || code === null;
+}
+
 function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -106,6 +128,6 @@ function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
       signal?.removeEventListener('abort', cancel);
       reject(abortError());
     };
-    signal?.addEventListener('abort', cancel, {once: true});
+    signal?.addEventListener('abort', cancel, { once: true });
   });
 }

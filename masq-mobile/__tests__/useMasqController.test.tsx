@@ -81,9 +81,7 @@ describe('useMasqController profile readiness', () => {
   let current!: ReturnType<typeof useMasqController>;
 
   beforeEach(() => {
-    jest
-      .spyOn(masqCore, 'getNetworkStatus')
-      .mockResolvedValue({ ...NETWORK });
+    jest.spyOn(masqCore, 'getNetworkStatus').mockResolvedValue({ ...NETWORK });
     jest
       .spyOn(masqCore, 'getSystemTunnelStatus')
       .mockResolvedValue({ ...UNSUPPORTED_SYSTEM_TUNNEL });
@@ -109,10 +107,7 @@ describe('useMasqController profile readiness', () => {
       .spyOn(masqCore, 'updateMinHops')
       .mockResolvedValue({ ...EMPTY_STATUS, minHops: 4 });
     const reset = jest.spyOn(masqCore, 'reset');
-    const resetNetworkProfile = jest.spyOn(
-      masqCore,
-      'resetNetworkProfile',
-    );
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const removeWallet = jest.spyOn(masqCore, 'removeWallet');
     const start = jest.spyOn(masqCore, 'start');
     const setSystemTunnel = jest.spyOn(masqCore, 'setSystemTunnel');
@@ -126,24 +121,20 @@ describe('useMasqController profile readiness', () => {
     await expect(
       current.saveSetup({ ...DEFAULT_SETUP, neighbors: [] }),
     ).rejects.toThrow(PROFILE_NOT_READY_MESSAGE);
-    await expect(current.connect()).rejects.toThrow(
-      PROFILE_NOT_READY_MESSAGE,
-    );
+    await expect(current.connect()).rejects.toThrow(PROFILE_NOT_READY_MESSAGE);
     await expect(current.updateMinHops(4)).rejects.toThrow(
       PROFILE_NOT_READY_MESSAGE,
     );
-    await expect(current.reset()).rejects.toThrow(
-      PROFILE_NOT_READY_MESSAGE,
-    );
+    await expect(current.reset()).rejects.toThrow(PROFILE_NOT_READY_MESSAGE);
     await expect(current.resetNetworkProfile()).rejects.toThrow(
       PROFILE_NOT_READY_MESSAGE,
     );
     await expect(current.removeWallet()).rejects.toThrow(
       PROFILE_NOT_READY_MESSAGE,
     );
-    await expect(
-      current.updateSystemTunnel('wholeDevice', []),
-    ).rejects.toThrow(PROFILE_NOT_READY_MESSAGE);
+    await expect(current.updateSystemTunnel('wholeDevice', [])).rejects.toThrow(
+      PROFILE_NOT_READY_MESSAGE,
+    );
     await expect(current.refreshWalletBalance()).rejects.toThrow(
       PROFILE_NOT_READY_MESSAGE,
     );
@@ -183,9 +174,7 @@ describe('useMasqController profile readiness', () => {
     jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
     jest
       .spyOn(masqCore, 'getSavedConfiguration')
-      .mockRejectedValueOnce(
-        new SavedProfileError(),
-      )
+      .mockRejectedValueOnce(new SavedProfileError())
       .mockResolvedValueOnce(SAVED_PROFILE);
     const renderer = await renderController(value => {
       current = value;
@@ -215,9 +204,7 @@ describe('useMasqController profile readiness', () => {
 
   it('fails closed when native status is configured without a matching saved profile', async () => {
     jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
-    jest
-      .spyOn(masqCore, 'getSavedConfiguration')
-      .mockResolvedValue(null);
+    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(null);
     const configure = jest.spyOn(masqCore, 'configure');
     const renderer = await renderController(value => {
       current = value;
@@ -272,9 +259,7 @@ describe('useMasqController profile readiness', () => {
       engineAvailable: true,
       walletAddress: CONFIGURED_STATUS.walletAddress,
     };
-    jest
-      .spyOn(masqCore, 'getSavedConfiguration')
-      .mockResolvedValue(null);
+    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(null);
     jest
       .spyOn(masqCore, 'getStatus')
       .mockResolvedValueOnce(CONFIGURED_STATUS)
@@ -368,10 +353,7 @@ describe('useMasqController profile readiness', () => {
       selectedApps: [],
       supported: false,
     });
-    const resetNetworkProfile = jest.spyOn(
-      masqCore,
-      'resetNetworkProfile',
-    );
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const renderer = await renderController(value => {
       current = value;
     });
@@ -393,10 +375,7 @@ describe('useMasqController profile readiness', () => {
     jest
       .spyOn(masqCore, 'getSavedConfiguration')
       .mockRejectedValue(new Error('Temporary native bridge timeout.'));
-    const resetNetworkProfile = jest.spyOn(
-      masqCore,
-      'resetNetworkProfile',
-    );
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const renderer = await renderController(value => {
       current = value;
     });
@@ -419,10 +398,7 @@ describe('useMasqController profile readiness', () => {
       message:
         'The encrypted consumer wallet could not be read safely. Unlock the device and retry without resetting or re-importing the wallet.',
     });
-    const resetNetworkProfile = jest.spyOn(
-      masqCore,
-      'resetNetworkProfile',
-    );
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const renderer = await renderController(value => {
       current = value;
     });
@@ -504,25 +480,28 @@ describe('useMasqController profile readiness', () => {
     ['minimum hops', { minHops: 4 }],
     ['exit country', { exitCountry: 'NL' }],
     ['exit fallback', { exitCountryFallback: true }],
-  ])('fails closed when saved and native %s differ', async (_label, override) => {
-    jest
-      .spyOn(masqCore, 'getSavedConfiguration')
-      .mockResolvedValue(SAVED_PROFILE);
-    jest
-      .spyOn(masqCore, 'getStatus')
-      .mockResolvedValue({ ...CONFIGURED_STATUS, ...override });
-    const renderer = await renderController(value => {
-      current = value;
-    });
+  ])(
+    'fails closed when saved and native %s differ',
+    async (_label, override) => {
+      jest
+        .spyOn(masqCore, 'getSavedConfiguration')
+        .mockResolvedValue(SAVED_PROFILE);
+      jest
+        .spyOn(masqCore, 'getStatus')
+        .mockResolvedValue({ ...CONFIGURED_STATUS, ...override });
+      const renderer = await renderController(value => {
+        current = value;
+      });
 
-    expect(current.profileReady).toBe(false);
-    expect(current.initializationState).toBe('error');
-    expect(current.profileRecoveryAvailable).toBe(true);
-    expect(current.issue?.message).toContain(
-      'network profile could not be validated',
-    );
-    ReactTestRenderer.act(() => renderer.unmount());
-  });
+      expect(current.profileReady).toBe(false);
+      expect(current.initializationState).toBe('error');
+      expect(current.profileRecoveryAvailable).toBe(true);
+      expect(current.issue?.message).toContain(
+        'network profile could not be validated',
+      );
+      ReactTestRenderer.act(() => renderer.unmount());
+    },
+  );
 
   it.each([
     ['unconfigured', { ...EMPTY_STATUS }],
@@ -595,9 +574,7 @@ describe('useMasqController profile readiness', () => {
       .mockResolvedValueOnce({ ...CONFIGURED_STATUS, bytesUp: 10 })
       .mockReturnValueOnce(staleStatus.promise)
       .mockResolvedValueOnce(freshStatus);
-    jest
-      .spyOn(masqCore, 'getNetworkStatus')
-      .mockResolvedValue({ ...NETWORK });
+    jest.spyOn(masqCore, 'getNetworkStatus').mockResolvedValue({ ...NETWORK });
     const renderer = await renderController(value => {
       current = value;
     });
@@ -666,9 +643,9 @@ describe('useMasqController profile readiness', () => {
 
   it('ignores a deferred tunnel poll after a newer OFF operation commits', async () => {
     jest.useFakeTimers();
-    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(
-      SAVED_PROFILE,
-    );
+    jest
+      .spyOn(masqCore, 'getSavedConfiguration')
+      .mockResolvedValue(SAVED_PROFILE);
     jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
     const staleTunnelPoll = deferred<SystemTunnelStatus>();
     const getSystemTunnelStatus = jest
@@ -706,9 +683,9 @@ describe('useMasqController profile readiness', () => {
   });
 
   it('ignores a deferred initial tunnel snapshot after a newer operation commits', async () => {
-    jest.spyOn(masqCore, 'getSavedConfiguration').mockResolvedValue(
-      SAVED_PROFILE,
-    );
+    jest
+      .spyOn(masqCore, 'getSavedConfiguration')
+      .mockResolvedValue(SAVED_PROFILE);
     jest.spyOn(masqCore, 'getStatus').mockResolvedValue(CONFIGURED_STATUS);
     const staleInitialTunnel = deferred<SystemTunnelStatus>();
     jest
@@ -776,6 +753,12 @@ describe('useMasqController profile readiness', () => {
 
     ReactTestRenderer.act(() => appStateListener('active'));
     await ReactTestRenderer.act(async () => {
+      // Let the resume path pass its idle barrier and begin the stale reads
+      // before a newer initialization invalidates them.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await ReactTestRenderer.act(async () => {
       await current.retryInitialization();
     });
     expect(current.status).toEqual(freshStatus);
@@ -825,6 +808,255 @@ describe('useMasqController profile readiness', () => {
     expect(reset).toHaveBeenCalledTimes(1);
     expect(setSystemTunnel).not.toHaveBeenCalled();
     expect(current.draft).toEqual(DEFAULT_SETUP);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+});
+
+describe('useMasqController entry-node connection lifecycle', () => {
+  let current!: ReturnType<typeof useMasqController>;
+
+  beforeEach(() => {
+    jest
+      .spyOn(masqCore, 'getSavedConfiguration')
+      .mockResolvedValue(SAVED_PROFILE);
+    jest
+      .spyOn(masqCore, 'getStatus')
+      .mockResolvedValue({ ...CONFIGURED_STATUS });
+    jest.spyOn(masqCore, 'getNetworkStatus').mockResolvedValue({ ...NETWORK });
+    jest
+      .spyOn(masqCore, 'getSystemTunnelStatus')
+      .mockResolvedValue({ ...UNSUPPORTED_SYSTEM_TUNNEL });
+    jest.spyOn(masqCore, 'getRoutableApps').mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+    Object.assign(AppState, { currentState: INITIAL_APP_STATE });
+  });
+
+  it('publishes attempt 1 before waiting for a long native start', async () => {
+    const pendingStart = deferred<CoreStatus>();
+    jest.spyOn(masqCore, 'start').mockReturnValue(pendingStart.promise);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let connection!: Promise<CoreStatus>;
+
+    await ReactTestRenderer.act(async () => {
+      connection = current.connect();
+      await Promise.resolve();
+    });
+
+    expect(current.status.phase).toBe('connecting');
+    expect(current.entryNodeRefresh).toEqual({
+      attempt: 1,
+      maxAttempts: 6,
+      stage: 'discovery',
+    });
+    expect(current.connectionProgress).toEqual({
+      step: 2,
+      total: 5,
+      label: 'Finding reachable entry nodes (1/6)',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      pendingStart.resolve({
+        ...CONFIGURED_STATUS,
+        connectedNeighbors: 1,
+        phase: 'connected',
+      });
+      await connection;
+    });
+
+    expect(current.entryNodeRefresh).toBeNull();
+    expect(current.status.phase).toBe('connected');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('restores the connecting phase when automatic refresh starts another attempt', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'background' });
+    const pendingSecondStart = deferred<CoreStatus>();
+    jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Safe TCP diagnostic.'), {
+          code: 'E_ENTRY_TCP_FAILED',
+        }),
+      )
+      .mockReturnValueOnce(pendingSecondStart.promise);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let connection!: Promise<CoreStatus>;
+
+    await ReactTestRenderer.act(async () => {
+      connection = current.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(1_500);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(current.status.phase).toBe('connecting');
+    expect(current.entryNodeRefresh).toEqual({
+      attempt: 2,
+      maxAttempts: 6,
+      stage: 'discovery',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      pendingSecondStart.resolve({
+        ...CONFIGURED_STATUS,
+        connectedNeighbors: 1,
+        phase: 'connected',
+      });
+      await connection;
+    });
+    expect(current.entryNodeRefresh).toBeNull();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('waits for an abandoned background start before resuming a stale connecting engine', async () => {
+    let appStateListener!: (state: AppStateStatus) => void;
+    jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_type, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      });
+    const firstNativeStart = deferred<CoreStatus>();
+    let firstNativeStartSettled = false;
+    const connectedStatus: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      phase: 'connected',
+    };
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockImplementationOnce(() =>
+        firstNativeStart.promise.finally(() => {
+          firstNativeStartSettled = true;
+        }),
+      )
+      .mockImplementationOnce(async () => {
+        expect(firstNativeStartSettled).toBe(true);
+        return connectedStatus;
+      });
+    jest
+      .mocked(masqCore.getStatus)
+      .mockResolvedValueOnce({ ...CONFIGURED_STATUS })
+      .mockResolvedValueOnce({
+        ...CONFIGURED_STATUS,
+        phase: 'connecting',
+      });
+    const shutdown = jest.spyOn(masqCore, 'shutdown');
+    const reset = jest.spyOn(masqCore, 'reset');
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
+    const removeWallet = jest.spyOn(masqCore, 'removeWallet');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let abandonedConnection!: Promise<unknown>;
+
+    await ReactTestRenderer.act(async () => {
+      abandonedConnection = current.connect().catch(error => error);
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    ReactTestRenderer.act(() => appStateListener('background'));
+    ReactTestRenderer.act(() => appStateListener('active'));
+    await ReactTestRenderer.act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    // A second background event invalidates the pending resume. It must not
+    // restart MASQ after the old native call eventually settles.
+    ReactTestRenderer.act(() => appStateListener('background'));
+    await ReactTestRenderer.act(async () => {
+      firstNativeStart.resolve({
+        ...CONFIGURED_STATUS,
+        phase: 'connecting',
+      });
+      await abandonedConnection;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
+
+    await ReactTestRenderer.act(async () => {
+      appStateListener('active');
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(current.status).toEqual(connectedStatus);
+    expect(current.entryNodeRefresh).toBeNull();
+    expect(current.busy).toBe(false);
+    expect(current.status.walletAddress).toBe(CONFIGURED_STATUS.walletAddress);
+    expect(current.draft).toMatchObject({
+      ...SAVED_PROFILE,
+      walletSecret: '',
+    });
+    expect(reset).not.toHaveBeenCalled();
+    expect(resetNetworkProfile).not.toHaveBeenCalled();
+    expect(removeWallet).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('shuts down a failed start without resetting the wallet or profile', async () => {
+    const startupError = Object.assign(
+      new Error('The embedded MASQ core could not start.'),
+      { code: 'E_CORE_STARTUP_FAILED' },
+    );
+    jest.spyOn(masqCore, 'start').mockRejectedValue(startupError);
+    const shutdown = jest
+      .spyOn(masqCore, 'shutdown')
+      .mockResolvedValue({ ...CONFIGURED_STATUS });
+    const reset = jest.spyOn(masqCore, 'reset');
+    const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
+    const removeWallet = jest.spyOn(masqCore, 'removeWallet');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let caught: unknown;
+
+    await ReactTestRenderer.act(async () => {
+      try {
+        await current.connect();
+      } catch (error) {
+        caught = error;
+      }
+    });
+
+    expect(caught).toBe(startupError);
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(reset).not.toHaveBeenCalled();
+    expect(resetNetworkProfile).not.toHaveBeenCalled();
+    expect(removeWallet).not.toHaveBeenCalled();
+    expect(current.entryNodeRefresh).toBeNull();
+    expect(current.status.walletAddress).toBe(CONFIGURED_STATUS.walletAddress);
+    expect(current.draft).toMatchObject({
+      ...SAVED_PROFILE,
+      walletSecret: '',
+    });
+    expect(current.issue).toMatchObject({
+      action: 'retry',
+      category: 'native-core',
+      code: 'E_CORE_STARTUP_FAILED',
+    });
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });

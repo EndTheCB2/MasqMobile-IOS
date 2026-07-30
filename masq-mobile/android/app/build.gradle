@@ -194,6 +194,8 @@ tasks.matching { it.name == "preBuild" }.configureEach {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+    // Keep node discovery on the same pinned OkHttp line as this React Native version.
+    implementation("com.squareup.okhttp3:okhttp:4.9.2")
     implementation("androidx.webkit:webkit:1.16.0")
     implementation("androidx.core:core-ktx:1.17.0")
     testImplementation("junit:junit:4.13.2")

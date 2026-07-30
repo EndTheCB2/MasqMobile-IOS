@@ -68,6 +68,57 @@ describe('source privacy verification', () => {
       rmSync(fixture.root, { force: true, recursive: true });
     }
   });
+
+  it('ignores a relative dependency symlink in an excluded node_modules directory', () => {
+    const fixture = privacyFixture();
+    try {
+      mkdirSync(path.join(fixture.root, 'shared-dependencies'), {
+        recursive: true,
+      });
+      symlinkSync(
+        '../../shared-dependencies',
+        path.join(fixture.root, 'masq-mobile', 'node_modules'),
+      );
+
+      const result = runPrivacyCheck(fixture.script);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Source privacy check passed.');
+    } finally {
+      rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
+
+  it('still rejects an absolute node_modules symlink target', () => {
+    const fixture = privacyFixture();
+    const privateTarget = localUserPath();
+    try {
+      symlinkSync(
+        privateTarget,
+        path.join(fixture.root, 'masq-mobile', 'node_modules'),
+      );
+
+      const result = runPrivacyCheck(fixture.script);
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('an absolute symbolic-link target');
+      expect(result.stderr).not.toContain(privateTarget);
+    } finally {
+      rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
+
+  it('fails closed when ripgrep is unavailable and disables user config', () => {
+    const fixture = privacyFixture();
+    try {
+      const source = require('fs').readFileSync(fixture.script, 'utf8');
+
+      expect(source).toContain('if ! command -v rg');
+      expect(source).toContain('rg --no-config');
+    } finally {
+      rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
 });
 
 function privacyFixture() {

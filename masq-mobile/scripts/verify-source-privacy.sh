@@ -4,11 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: source privacy check requires ripgrep (rg)" >&2
+  exit 1
+fi
+
 scan() {
   local expression="$1"
   local description="$2"
   # Ordinary checkouts use a .git directory; linked worktrees use a .git pointer file.
-  if rg -n --hidden \
+  if rg --no-config -n --hidden \
       --glob '!.git' \
       --glob '!.git/**' \
       --glob '!**/build/**' \

@@ -12,10 +12,8 @@ use masq_lib::messages::{CountryGroups, ToMessageBody, UiSetExitLocationRequest}
 use masq_lib::ui_gateway::{MessageBody, NodeFromUiMessage};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
-use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicUsize, Ordering,
-};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +25,7 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
 static ROUTE_STAGE: AtomicU8 = AtomicU8::new(0);
 static ROUTE_HOPS: AtomicU8 = AtomicU8::new(0);
+static ENTRY_HANDSHAKE_MILESTONE: AtomicU8 = AtomicU8::new(EntryHandshakeMilestone::None as u8);
 static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(NO_EXIT_CODE);
 static SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 static ACTOR_ARBITERS: Mutex<Vec<Addr<Arbiter>>> = Mutex::new(Vec::new());
@@ -42,10 +41,13 @@ static MIN_HOPS_PREFERENCE: AtomicU8 = AtomicU8::new(0);
 static NEIGHBORHOOD_CONFIG: Mutex<Option<Recipient<ConfigChangeMsg>>> = Mutex::new(None);
 static NEIGHBORHOOD_RETRY: Mutex<Option<Recipient<StartMessage>>> = Mutex::new(None);
 static PENDING_ENTRY_NODES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static STREAM_CONNECT_JOBS: Mutex<usize> = Mutex::new(0);
+static STREAM_CONNECT_JOBS_FINISHED: Condvar = Condvar::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MobileConnectionError {
     StreamConnectionFailed,
+    PassLoopFound,
     RouteLengthPreferenceFailed,
     ExitCountryPreferenceFailed,
 }
@@ -54,8 +56,68 @@ impl MobileConnectionError {
     fn message(self) -> &'static str {
         match self {
             Self::StreamConnectionFailed => "Stream connection failed",
+            Self::PassLoopFound => {
+                "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop"
+            }
             Self::RouteLengthPreferenceFailed => "Route length could not be applied",
             Self::ExitCountryPreferenceFailed => "Exit-country preference could not be applied",
+        }
+    }
+
+    fn takes_priority_over(self, current: Option<&str>) -> bool {
+        self == Self::PassLoopFound
+            || !current
+                .map(|message| message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
+                .unwrap_or(false)
+    }
+}
+
+/// Privacy-safe, process-local progress through the current entry-node handshake.
+///
+/// The value is deliberately absent from `MobileRuntimeSnapshot` and therefore
+/// from the app's public status model. It records only a monotone transport
+/// phase: never an address, identity, descriptor, payload, or byte count.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum EntryHandshakeMilestone {
+    None = 0,
+    TcpConnected = 1,
+    DebutBytesWritten = 2,
+    InboundBytesReceived = 3,
+    GossipAccepted = 4,
+}
+
+impl EntryHandshakeMilestone {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::TcpConnected,
+            2 => Self::DebutBytesWritten,
+            3 => Self::InboundBytesReceived,
+            4 => Self::GossipAccepted,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Keeps an embedded connector job visible until its blocking socket attempt
+/// has actually returned, even if the future waiting for it is dropped.
+pub struct StreamConnectJobGuard {
+    tracked: bool,
+}
+
+impl Drop for StreamConnectJobGuard {
+    fn drop(&mut self) {
+        if !self.tracked {
+            return;
+        }
+        let mut jobs = STREAM_CONNECT_JOBS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *jobs = jobs
+            .checked_sub(1)
+            .expect("stream-connect job tracking underflow");
+        if *jobs == 0 {
+            STREAM_CONNECT_JOBS_FINISHED.notify_all();
         }
     }
 }
@@ -102,6 +164,7 @@ pub fn prepare(proxy_port: u16) {
     PROXY_PORT.store(proxy_port, Ordering::SeqCst);
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    reset_entry_handshake_milestone();
     LAST_EXIT_CODE.store(NO_EXIT_CODE, Ordering::SeqCst);
     *LAST_CONNECTION_ERROR
         .lock()
@@ -201,9 +264,9 @@ pub fn wait_for_actor_arbiters(timeout: Duration) -> bool {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             arbiters.retain(Addr::connected);
-            let every_expected_arbiter_registered =
-                REGISTERED_ACTOR_ARBITERS.load(Ordering::SeqCst)
-                    >= EXPECTED_ACTOR_ARBITERS.load(Ordering::SeqCst);
+            let every_expected_arbiter_registered = REGISTERED_ACTOR_ARBITERS
+                .load(Ordering::SeqCst)
+                >= EXPECTED_ACTOR_ARBITERS.load(Ordering::SeqCst);
             if every_expected_arbiter_registered && arbiters.is_empty() {
                 ACTOR_ARBITER_TRACKING_ACTIVE.store(false, Ordering::SeqCst);
                 ACTOR_ARBITER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
@@ -230,14 +293,32 @@ pub fn mark_started() {
 
 pub fn report_route_stage(stage: u8) {
     if is_embedded() {
-        ROUTE_STAGE.store(stage.min(2), Ordering::SeqCst);
+        let stage = stage.min(2);
+        let previous_stage = ROUTE_STAGE.swap(stage, Ordering::SeqCst);
         if stage == 0 {
             ROUTE_HOPS.store(0, Ordering::SeqCst);
+            if previous_stage >= 1 {
+                reset_entry_handshake_milestone();
+            }
         }
         if stage >= 1 {
             apply_exit_preference();
         }
     }
+}
+
+pub fn report_entry_handshake_milestone(milestone: EntryHandshakeMilestone) {
+    if is_embedded() {
+        ENTRY_HANDSHAKE_MILESTONE.fetch_max(milestone as u8, Ordering::SeqCst);
+    }
+}
+
+pub fn entry_handshake_milestone() -> EntryHandshakeMilestone {
+    EntryHandshakeMilestone::from_u8(ENTRY_HANDSHAKE_MILESTONE.load(Ordering::SeqCst))
+}
+
+fn reset_entry_handshake_milestone() {
+    ENTRY_HANDSHAKE_MILESTONE.store(EntryHandshakeMilestone::None as u8, Ordering::SeqCst);
 }
 
 pub fn report_route_hops(hops: usize) {
@@ -299,6 +380,7 @@ pub fn retry_connection(entry_nodes: &[String]) -> Result<(), String> {
         (!entry_nodes.is_empty()).then(|| entry_nodes.to_vec());
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    reset_entry_handshake_milestone();
     *LAST_CONNECTION_ERROR
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -397,10 +479,47 @@ fn apply_exit_preference() {
 
 pub fn report_connection_error(error: MobileConnectionError) {
     if is_embedded() {
-        *LAST_CONNECTION_ERROR
+        let mut last_error = LAST_CONNECTION_ERROR
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.message().to_string());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if error.takes_priority_over(last_error.as_deref()) {
+            *last_error = Some(error.message().to_string());
+        }
     }
+}
+
+pub fn track_stream_connect_job() -> StreamConnectJobGuard {
+    let tracked = is_embedded();
+    if tracked {
+        let mut jobs = STREAM_CONNECT_JOBS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *jobs = jobs
+            .checked_add(1)
+            .expect("stream-connect job tracking overflow");
+    }
+    StreamConnectJobGuard { tracked }
+}
+
+pub fn wait_for_stream_connect_jobs(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut jobs = STREAM_CONNECT_JOBS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *jobs > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (next_jobs, wait_result) = STREAM_CONNECT_JOBS_FINISHED
+            .wait_timeout(jobs, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        jobs = next_jobs;
+        if wait_result.timed_out() && *jobs > 0 {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn report_available_exit_countries(mut countries: Vec<String>) {
@@ -475,13 +594,14 @@ pub fn snapshot() -> MobileRuntimeSnapshot {
     }
 }
 
-fn finish(exit_code: i32) {
+pub(crate) fn finish(exit_code: i32) {
     masq_lib::logger::clear_log_recipient();
     STARTED.store(false, Ordering::SeqCst);
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     PROXY_PORT.store(0, Ordering::SeqCst);
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    reset_entry_handshake_milestone();
     LAST_EXIT_CODE.store(exit_code, Ordering::SeqCst);
     *SYSTEM
         .lock()
@@ -620,6 +740,67 @@ mod tests {
         ]);
 
         assert_eq!(snapshot().available_exit_countries, vec!["BE", "US"]);
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn entry_handshake_milestones_are_monotone_and_reset_for_real_retries() {
+        prepare(44_443);
+        mark_started();
+
+        report_entry_handshake_milestone(EntryHandshakeMilestone::DebutBytesWritten);
+        report_entry_handshake_milestone(EntryHandshakeMilestone::TcpConnected);
+        assert_eq!(
+            entry_handshake_milestone(),
+            EntryHandshakeMilestone::DebutBytesWritten
+        );
+
+        retry_connection(&[]).expect_err("retry recipient is intentionally absent");
+        assert_eq!(entry_handshake_milestone(), EntryHandshakeMilestone::None);
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stage_one_to_zero_resets_the_entry_handshake_milestone() {
+        prepare(44_443);
+        report_entry_handshake_milestone(EntryHandshakeMilestone::GossipAccepted);
+
+        report_route_stage(0);
+        assert_eq!(
+            entry_handshake_milestone(),
+            EntryHandshakeMilestone::GossipAccepted
+        );
+        report_route_stage(1);
+        report_route_stage(0);
+        assert_eq!(entry_handshake_milestone(), EntryHandshakeMilestone::None);
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stream_connect_jobs_are_bounded_by_an_acknowledged_wait() {
+        prepare(44_443);
+        let job = track_stream_connect_job();
+
+        assert!(!wait_for_stream_connect_jobs(Duration::from_millis(1)));
+        drop(job);
+        assert!(wait_for_stream_connect_jobs(Duration::from_millis(1)));
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_pass_loop_error_is_not_overwritten_by_a_later_transport_failure() {
+        prepare(44_443);
+        report_connection_error(MobileConnectionError::PassLoopFound);
+        report_connection_error(MobileConnectionError::StreamConnectionFailed);
+
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop")
+        );
         finish(0);
     }
 }

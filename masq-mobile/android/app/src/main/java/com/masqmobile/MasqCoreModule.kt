@@ -33,6 +33,9 @@ import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONObject
 
+internal fun shouldDiscoverEntryNodesBeforeStart(phase: String): Boolean =
+    phase != "connected"
+
 internal object MasqCoreLifecycle {
   val lock = Any()
   val startGeneration = AtomicLong(0L)
@@ -498,7 +501,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         requireCurrentStart(generation)
         val currentStatus = JSONObject(MasqCoreJni.nativeGetStatus())
         requireCurrentStart(generation)
-        if (currentStatus.optString("phase") != "ready") {
+        if (!shouldDiscoverEntryNodesBeforeStart(currentStatus.optString("phase"))) {
           synchronized(MasqCoreLifecycle.lock) {
             requireCurrentStart(generation)
             val started = MasqCoreJni.nativeStart()
@@ -561,17 +564,25 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise: Promise,
   ) {
     try {
-      val refreshedNodes = entryNodeDiscovery.discover(chain, preferredNodes)
+      val discoveryResult = entryNodeDiscovery.discover(chain, preferredNodes)
       requireCurrentStart(generation)
-      config.put("neighbors", JSONArray(refreshedNodes))
-      val refreshedConfig = migrateConfig(config.toString())
+      val runtimeConfig =
+          migrateConfig(
+              JSONObject(config.toString())
+                  .put("neighbors", JSONArray(discoveryResult.runtimeDescriptors))
+                  .toString())
+      val refreshedConfig =
+          migrateConfig(
+              JSONObject(config.toString())
+                  .put("neighbors", JSONArray(discoveryResult.persistentDescriptors))
+                  .toString())
       requireCurrentStart(generation)
       MasqCoreLifecycle.executor.execute {
         try {
           synchronized(MasqCoreLifecycle.lock) {
             requireCurrentStart(generation)
             val configureResult =
-                MasqCoreJni.nativeConfigure(prepareNativeConfig(refreshedConfig))
+                MasqCoreJni.nativeConfigure(prepareNativeConfig(runtimeConfig))
             requireCurrentStart(generation)
             if (!statusSucceeded(configureResult)) {
               throw IllegalStateException(

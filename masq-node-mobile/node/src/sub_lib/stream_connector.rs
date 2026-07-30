@@ -5,6 +5,8 @@ use crate::sub_lib::tokio_wrappers::WriteHalfWrapper;
 use crate::sub_lib::tokio_wrappers::WriteHalfWrapperReal;
 #[cfg(target_os = "ios")]
 use futures::future;
+#[cfg(not(target_os = "ios"))]
+use futures_cpupool::CpuPool;
 use masq_lib::logger::Logger;
 #[cfg(target_os = "ios")]
 use std::ffi::CString;
@@ -20,10 +22,17 @@ use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
 use tokio::prelude::Future;
 use tokio::reactor::Handle;
-use tokio::timer::Timeout;
 
 pub const CONNECT_TIMEOUT_MS: u64 = 5000;
 pub type ConnectionInfoFuture = Box<dyn Future<Item = ConnectionInfo, Error = io::Error> + Send>;
+
+#[cfg(not(target_os = "ios"))]
+lazy_static::lazy_static! {
+    // Blocking connect_timeout calls cannot stall an Actix/Tokio reactor. Two
+    // workers are sufficient for the two entry nodes used by mobile consume
+    // mode and bound the amount of native work queued by repeated retries.
+    static ref TCP_CONNECT_POOL: CpuPool = CpuPool::new(2);
+}
 
 pub struct ConnectionInfo {
     pub reader: Box<dyn ReadHalfWrapper>,
@@ -70,47 +79,17 @@ impl StreamConnector for StreamConnectorReal {
         #[cfg(not(target_os = "ios"))]
         {
             let future_logger = logger.clone();
-            Box::new(
-                Timeout::new(
-                    TcpStream::connect(&socket_addr).then(move |result| match result {
-                        Ok(stream) => {
-                            let local_addr = stream.local_addr().unwrap_or_else(|_| {
-                                panic!("Newly-connected stream has no local_addr; remote redacted")
-                            });
-                            let peer_addr = match stream.peer_addr() {
-                                Ok(addr) => addr,
-                                // Untested code below: we couldn't figure out how to make this happen in captivity
-                                Err(e) => {
-                                    error!(
-                                        future_logger,
-                                        "Newly-connected stream has no peer_addr; remote redacted"
-                                    );
-                                    return Err(e);
-                                }
-                            };
-                            let (read_half, write_half) = stream.split();
-                            Ok(ConnectionInfo {
-                                reader: Box::new(ReadHalfWrapperReal::new(read_half)),
-                                writer: Box::new(WriteHalfWrapperReal::new(write_half)),
-                                local_addr,
-                                peer_addr,
-                            })
-                        }
-                        Err(e) => {
-                            error!(
-                                future_logger,
-                                "Could not connect TCP stream; remote redacted"
-                            );
-                            Err(e)
-                        }
-                    }),
-                    Duration::from_millis(CONNECT_TIMEOUT_MS),
-                )
-                .map_err(|wrapped_error| match wrapped_error.into_inner() {
-                    Some(error) => error,
-                    None => io::Error::from(ErrorKind::TimedOut),
-                }),
-            )
+            let connect_job = crate::mobile_runtime::track_stream_connect_job();
+            Box::new(TCP_CONNECT_POOL.spawn_fn(move || {
+                let _connect_job = connect_job;
+                connect_one_socket(socket_addr, &future_logger).map_err(|error| {
+                    error!(
+                        future_logger,
+                        "Could not connect TCP stream; remote redacted"
+                    );
+                    error
+                })
+            }))
         }
     }
 
@@ -186,7 +165,9 @@ fn connect_one_socket(
     socket_addr: SocketAddr,
     logger: &Logger,
 ) -> Result<ConnectionInfo, io::Error> {
-    let stream = StdTcpStream::connect(&socket_addr)?;
+    let stream =
+        StdTcpStream::connect_timeout(&socket_addr, Duration::from_millis(CONNECT_TIMEOUT_MS))?;
+    stream.set_nonblocking(true)?;
     let tokio_stream = TcpStream::from_std(stream, &Handle::default())?;
     StreamConnectorReal {}
         .split_stream(tokio_stream, logger)

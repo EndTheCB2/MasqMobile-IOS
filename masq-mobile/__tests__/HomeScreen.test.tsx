@@ -13,6 +13,7 @@ import {
   UNSUPPORTED_SYSTEM_TUNNEL,
   type SystemTunnelStatus,
 } from '../src/core/systemTunnel';
+import type { EntryNodeRefreshProgress } from '../src/core/entryNodeRefresh';
 
 const network: NetworkStatus = {
   available: true,
@@ -37,6 +38,8 @@ function homeScreen(
     onRecoverNetworkProfile?: () => void;
     onOpenTrafficRouting?: () => void;
     systemTunnel?: SystemTunnelStatus;
+    entryNodeRefresh?: EntryNodeRefreshProgress | null;
+    connectionProgress?: { step: number; total: number; label: string };
   } = {},
 ) {
   return (
@@ -45,8 +48,22 @@ function homeScreen(
       profileReady={options.profileReady ?? true}
       initializationState={options.initializationState ?? 'ready'}
       profileRecoveryAvailable={options.profileRecoveryAvailable ?? false}
-      connectionProgress={{ step: 2, total: 5, label: 'Finding nodes' }}
-      entryNodeRefresh={{ attempt: 1, maxAttempts: 3 }}
+      connectionProgress={
+        options.connectionProgress ?? {
+          step: 2,
+          total: 5,
+          label: 'Finding nodes',
+        }
+      }
+      entryNodeRefresh={
+        options.entryNodeRefresh === undefined
+          ? {
+              attempt: 1,
+              maxAttempts: 3,
+              stage: 'discovery',
+            }
+          : options.entryNodeRefresh
+      }
       issue={null}
       walletBalance={EMPTY_WALLET_BALANCE}
       systemTunnel={options.systemTunnel ?? UNSUPPORTED_SYSTEM_TUNNEL}
@@ -81,6 +98,45 @@ function homeScreen(
 }
 
 describe('HomeScreen connection controls', () => {
+  it.each([
+    [
+      'discovery' as const,
+      'Finding entry nodes · 2/6',
+      'Finding reachable entry nodes (2/6)',
+    ],
+    [
+      'handshake' as const,
+      'Connecting to entry peer · 2/6',
+      'Connecting to an entry peer (attempt 2/6)',
+    ],
+  ])(
+    'shows the active %s attempt before connection completes',
+    (stage, buttonLabel, progressLabel) => {
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      ReactTestRenderer.act(() => {
+        renderer = ReactTestRenderer.create(
+          homeScreen(
+            jest.fn(),
+            {},
+            {
+              connectionProgress: {
+                step: stage === 'discovery' ? 2 : 3,
+                total: 5,
+                label: progressLabel,
+              },
+              entryNodeRefresh: { attempt: 2, maxAttempts: 6, stage },
+            },
+          ),
+        );
+      });
+
+      const screen = JSON.stringify(renderer.toJSON());
+      expect(screen).toContain(buttonLabel);
+      expect(screen).toContain(progressLabel);
+      ReactTestRenderer.act(() => renderer.unmount());
+    },
+  );
+
   it('keeps an explicit cancel action available while connecting', () => {
     const onDisconnect = jest.fn();
     let renderer!: ReactTestRenderer.ReactTestRenderer;
@@ -240,8 +296,7 @@ describe('HomeScreen connection controls', () => {
         node
           .findAllByType(Text)
           .some(
-            text =>
-              text.props.children === 'Whole-device dogfood route active',
+            text => text.props.children === 'Whole-device dogfood route active',
           ),
     );
     ReactTestRenderer.act(() => control.props.onPress());
@@ -347,9 +402,7 @@ describe('HomeScreen connection controls', () => {
     expect(JSON.stringify(renderer.toJSON())).toContain(
       'Loading the complete saved profile',
     );
-    expect(JSON.stringify(renderer.toJSON())).not.toContain(
-      'CONSUMER FUNDS',
-    );
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('CONSUMER FUNDS');
     expect(onOpenSetup).not.toHaveBeenCalled();
     ReactTestRenderer.act(() => renderer.unmount());
   });
@@ -360,13 +413,17 @@ describe('HomeScreen connection controls', () => {
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
       renderer = ReactTestRenderer.create(
-        homeScreen(jest.fn(), { phase: 'unconfigured' }, {
-          busy: false,
-          initializationState: 'error',
-          onOpenSetup,
-          onRetryInitialization,
-          profileReady: false,
-        }),
+        homeScreen(
+          jest.fn(),
+          { phase: 'unconfigured' },
+          {
+            busy: false,
+            initializationState: 'error',
+            onOpenSetup,
+            onRetryInitialization,
+            profileReady: false,
+          },
+        ),
       );
     });
 
@@ -388,13 +445,17 @@ describe('HomeScreen connection controls', () => {
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
       renderer = ReactTestRenderer.create(
-        homeScreen(jest.fn(), { phase: 'unconfigured' }, {
-          busy: false,
-          initializationState: 'error',
-          onRecoverNetworkProfile,
-          profileReady: false,
-          profileRecoveryAvailable: true,
-        }),
+        homeScreen(
+          jest.fn(),
+          { phase: 'unconfigured' },
+          {
+            busy: false,
+            initializationState: 'error',
+            onRecoverNetworkProfile,
+            profileReady: false,
+            profileRecoveryAvailable: true,
+          },
+        ),
       );
     });
 

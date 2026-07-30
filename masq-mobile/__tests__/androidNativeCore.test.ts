@@ -77,6 +77,12 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).not.toContain('signingConfig signingConfigs.debug');
     expect(buildScript).toContain('--features node-engine');
     expect(buildScript).toContain('--remap-path-prefix=$HOME=/build/source');
+    expect(buildScript).toContain(
+      'MASQ_ANDROID_CARGO_TARGET_DIR must use a privacy-neutral temporary path',
+    );
+    expect(buildScript).toContain(
+      '"$HOME/"* | "$ROOT_DIR/"* | /Users/* | /home/*',
+    );
     expect(buildScript).toContain('llvm-ar');
     expect(buildScript).toContain('llvm-ranlib');
     expect(buildScript).toContain('-Clink-arg=-Wl,-z,defs');
@@ -148,6 +154,8 @@ describe('Android native MASQ core integration', () => {
     expect(apkVerifier).toContain('MASQ_ANDROID_EXPECTED_VERSION_CODE');
     expect(apkVerifier).toContain('CN=Android Debug');
     expect(apkVerifier).toContain('--verbose --print-certs --Werr');
+    expect(apkVerifier).toContain('if ! command -v rg');
+    expect(apkVerifier).toContain('rg --no-config');
     expect(apkVerifier).toContain('/Users/[A-Za-z0-9._-]+');
     expect(apkVerifier).toContain(
       'verify-android-native-elf.js" --apk "$APK_PATH"',
@@ -1135,12 +1143,46 @@ describe('Android native MASQ core integration', () => {
     );
   });
 
-  it('refreshes and reachability-tests entry nodes before starting', () => {
+  it('refreshes and validates entry nodes before starting without an active TCP preflight', () => {
+    expect(gradle).toContain(
+      'implementation("com.squareup.okhttp3:okhttp:4.9.2")',
+    );
     expect(discovery).toContain('NODE_FINDER_ATTEMPTS = 6');
-    expect(discovery).toContain('Socket().use');
-    expect(discovery).toContain('saveCached(chain, reachable)');
+    expect(discovery).toContain('CacheControl.FORCE_NETWORK');
+    expect(discovery).toContain('MAX_RESPONSE_BYTES = 1024');
+    expect(discovery).toContain('ConnectionSpec.MODERN_TLS');
+    expect(discovery).toContain('followRedirects(false)');
+    expect(discovery).toContain('freshDescriptors = freshDescriptors');
+    expect(discovery).toContain('preferredDescriptors = preferredNodes');
+    expect(discovery).toContain('candidate.publicKey in selectedKeys');
+    expect(discovery).toContain('candidate.host in selectedHosts');
+    expect(discovery).toContain('saveCached(chain, result.persistentDescriptors)');
+    expect(discovery).toContain('candidate.singlePortDescriptor(generation)');
+    expect(discovery).toContain('mergePortVariants(');
+    expect(discovery).toContain('"NF_SELECTION_OK"');
+    expect(discovery).toContain(
+      'safeDiagnostic(code: String, vararg metrics: Pair<String, Int>)',
+    );
+    expect(discovery).toContain('NF_CODE_PATTERN = Regex("NF_[A-Z_]+")');
+    expect(discovery).not.toContain('Log.i(LOG_TAG, descriptor');
+    expect(discovery).not.toContain('Log.i(LOG_TAG, publicKey');
+    expect(discovery).not.toContain('Log.i(LOG_TAG, host');
+    expect(discovery).not.toContain('Socket()');
+    expect(discovery).not.toContain('InetSocketAddress');
     expect(moduleSource).toContain(
       'entryNodeDiscovery.discover(chain, preferredNodes)',
+    );
+    expect(moduleSource).toContain(
+      'JSONArray(discoveryResult.runtimeDescriptors)',
+    );
+    expect(moduleSource).toContain(
+      'JSONArray(discoveryResult.persistentDescriptors)',
+    );
+    expect(moduleSource).toContain(
+      'MasqCoreJni.nativeConfigure(prepareNativeConfig(runtimeConfig))',
+    );
+    expect(moduleSource).toContain(
+      'if (!shouldDiscoverEntryNodesBeforeStart(currentStatus.optString("phase")))',
     );
     expect(moduleSource).toContain('E_ENTRY_NODE_DISCOVERY');
   });

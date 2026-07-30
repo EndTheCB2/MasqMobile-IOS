@@ -355,6 +355,9 @@ impl Handler<ConnectionProgressMessage> for Neighborhood {
                     }
                     ConnectionProgressEvent::IntroductionGossipReceived(_)
                     | ConnectionProgressEvent::StandardGossipReceived => {
+                        crate::mobile_runtime::report_entry_handshake_milestone(
+                            crate::mobile_runtime::EntryHandshakeMilestone::GossipAccepted,
+                        );
                         if self.overall_connection_status.stage()
                             == OverallConnectionStage::NotConnected
                         {
@@ -368,8 +371,17 @@ impl Handler<ConnectionProgressMessage> for Neighborhood {
                                 );
                         }
                     }
+                    ConnectionProgressEvent::PassLoopFound => {
+                        crate::mobile_runtime::report_connection_error(
+                            crate::mobile_runtime::MobileConnectionError::PassLoopFound,
+                        );
+                        if self.overall_connection_status.stage()
+                            == OverallConnectionStage::NotConnected
+                        {
+                            self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
+                        }
+                    }
                     ConnectionProgressEvent::TcpConnectionFailed
-                    | ConnectionProgressEvent::PassLoopFound
                     | ConnectionProgressEvent::NoGossipResponseReceived => {
                         if self.overall_connection_status.stage()
                             == OverallConnectionStage::NotConnected

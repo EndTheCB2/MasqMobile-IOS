@@ -2,6 +2,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import type { CoreStatus, NetworkStatus } from '../core/types';
 import type { MasqIssue } from '../core/issues';
+import type { EntryNodeRefreshProgress } from '../core/entryNodeRefresh';
 import type { WalletBalanceState } from '../core/walletBalance';
 import {
   systemTunnelTrafficDisposition,
@@ -25,7 +26,7 @@ interface Props {
   profileRecoveryAvailable: boolean;
   network: NetworkStatus;
   connectionProgress: { step: number; total: number; label: string };
-  entryNodeRefresh: { attempt: number; maxAttempts: number } | null;
+  entryNodeRefresh: EntryNodeRefreshProgress | null;
   issue: MasqIssue | null;
   walletBalance: WalletBalanceState;
   systemTunnel: SystemTunnelStatus;
@@ -218,8 +219,7 @@ export function HomeScreen({
                 busy={initializationState === 'loading'}
                 disabled={initializationState === 'loading'}
               />
-              {initializationState === 'error' &&
-              profileRecoveryAvailable ? (
+              {initializationState === 'error' && profileRecoveryAvailable ? (
                 <>
                   <Button
                     label="Reset network profile · keep wallet"
@@ -228,9 +228,9 @@ export function HomeScreen({
                   />
                   <Text style={styles.profileRecoveryHelper}>
                     Use this only if Retry keeps failing. MASQ and Direct
-                    browsing remain blocked while MASQ Mobile removes the
-                    chain, RPC and entry-node settings. The consumer wallet
-                    stays on this device.
+                    browsing remain blocked while MASQ Mobile removes the chain,
+                    RPC and entry-node settings. The consumer wallet stays on
+                    this device.
                   </Text>
                 </>
               ) : null}
@@ -259,14 +259,16 @@ export function HomeScreen({
                 label={
                   status.phase === 'connecting'
                     ? entryNodeRefresh
-                      ? `Refreshing entry nodes · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
+                      ? entryNodeRefresh.stage === 'discovery'
+                        ? `Finding entry nodes · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
+                        : `Connecting to entry peer · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
                       : 'Contacting entry nodes…'
                     : configured
                     ? 'Connect to MASQ'
                     : 'Set up consumer wallet'
                 }
                 onPress={configured ? onConnect : onOpenSetup}
-                busy={busy}
+                busy={busy && status.phase !== 'connecting'}
                 disabled={
                   status.phase === 'connecting' ||
                   (status.phase === 'blocked' && configured)

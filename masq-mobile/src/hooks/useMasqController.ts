@@ -7,6 +7,7 @@ import {
   toMasqConfig,
 } from '../core/config';
 import {
+  type EntryNodeRefreshProgress,
   isAbortError,
   startWithEntryNodeRefresh,
 } from '../core/entryNodeRefresh';
@@ -76,10 +77,8 @@ export function useMasqController() {
   const [profileRecoveryAvailable, setProfileRecoveryAvailable] =
     useState(false);
   const [issue, setIssue] = useState<MasqIssue | null>(null);
-  const [entryNodeRefresh, setEntryNodeRefresh] = useState<{
-    attempt: number;
-    maxAttempts: number;
-  } | null>(null);
+  const [entryNodeRefresh, setEntryNodeRefresh] =
+    useState<EntryNodeRefreshProgress | null>(null);
   const [walletBalance, setWalletBalance] =
     useState<WalletBalanceState>(EMPTY_WALLET_BALANCE);
   const [systemTunnel, setSystemTunnel] = useState<SystemTunnelStatus>(
@@ -94,6 +93,7 @@ export function useMasqController() {
   const balanceAbort = useRef<AbortController | null>(null);
   const connectFlight = useRef(new SingleFlight<CoreStatus>());
   const desiredConnected = useRef(false);
+  const appStateResumeEpoch = useRef(0);
   const initializationEpoch = useRef(0);
   const initializationStateRef =
     useRef<ControllerInitializationState>('loading');
@@ -185,8 +185,7 @@ export function useMasqController() {
       }
       profileReadyRef.current = false;
       initializationStateRef.current = 'error';
-      const recoveryAvailable =
-        isSavedProfileError(caught);
+      const recoveryAvailable = isSavedProfileError(caught);
       const initializationError =
         recoveryAvailable && !(caught instanceof SavedProfileError)
           ? new SavedProfileError()
@@ -263,12 +262,7 @@ export function useMasqController() {
         balanceAbort.current = null;
       }
     }
-  }, [
-    draft.rpcUrl,
-    requireProfileReady,
-    status.chain,
-    status.walletAddress,
-  ]);
+  }, [draft.rpcUrl, requireProfileReady, status.chain, status.walletAddress]);
 
   const updateSystemTunnel = useCallback(
     async (mode: SystemTunnelMode, selectedApps: string[]) => {
@@ -312,9 +306,7 @@ export function useMasqController() {
         setSystemTunnel(next);
       }
       if (next.active || next.phase !== 'off' || next.mode !== 'off') {
-        throw new Error(
-          'MASQ could not confirm that system routing stopped.',
-        );
+        throw new Error('MASQ could not confirm that system routing stopped.');
       }
       return next;
     } finally {
@@ -370,21 +362,53 @@ export function useMasqController() {
           lastError: null,
         }));
         try {
-          return await startWithEntryNodeRefresh(
-            () =>
-              startAndAwaitMasqConnection(
-                () => masqCore.start(),
-                () => masqCore.getStatus(),
-                {
-                  onStatus: setStatus,
-                  signal: controller.signal,
+          try {
+            return await startWithEntryNodeRefresh(
+              () =>
+                startAndAwaitMasqConnection(
+                  () => masqCore.start(),
+                  () => masqCore.getStatus(),
+                  {
+                    onStatus: next => {
+                      setStatus(next);
+                      setEntryNodeRefresh(current => {
+                        if (next.phase === 'connected') {
+                          return null;
+                        }
+                        return current
+                          ? { ...current, stage: 'handshake' }
+                          : current;
+                      });
+                    },
+                    signal: controller.signal,
+                  },
+                ),
+              {
+                onAttempt: progress => {
+                  setStatus(current => ({
+                    ...current,
+                    phase: 'connecting',
+                    lastError: null,
+                  }));
+                  setEntryNodeRefresh(progress);
                 },
-              ),
-            {
-              onAttempt: setEntryNodeRefresh,
-              signal: controller.signal,
-            },
-          );
+                signal: controller.signal,
+              },
+            );
+          } catch (caught) {
+            if (!isAbortError(caught) && connectAbort.current === controller) {
+              desiredConnected.current = false;
+              try {
+                const stopped = await masqCore.shutdown();
+                if (connectAbort.current === controller) {
+                  setStatus(stopped);
+                }
+              } catch {
+                // The original connection diagnostic remains authoritative.
+              }
+            }
+            throw caught;
+          }
         } finally {
           if (connectAbort.current === controller) {
             connectAbort.current = null;
@@ -444,12 +468,7 @@ export function useMasqController() {
       neighbors: [],
     }));
     return next;
-  }, [
-    cancelConnectionAttempt,
-    disableSystemTunnel,
-    requireProfileReady,
-    run,
-  ]);
+  }, [cancelConnectionAttempt, disableSystemTunnel, requireProfileReady, run]);
 
   const removeWallet = useCallback(async () => {
     requireProfileReady();
@@ -461,12 +480,7 @@ export function useMasqController() {
     });
     setDraft(current => ({ ...current, walletSecret: '' }));
     return next;
-  }, [
-    cancelConnectionAttempt,
-    disableSystemTunnel,
-    requireProfileReady,
-    run,
-  ]);
+  }, [cancelConnectionAttempt, disableSystemTunnel, requireProfileReady, run]);
 
   const recoverNetworkProfile = useCallback(async () => {
     if (
@@ -723,39 +737,57 @@ export function useMasqController() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', nextState => {
+      const resumeEpoch = ++appStateResumeEpoch.current;
       if (nextState !== 'active') {
         cancelConnectionAttempt();
         masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
         return;
       }
-      if (!profileReadyRef.current) {
-        return;
-      }
-      const epoch = operationEpoch.current;
-      const initialization = initializationEpoch.current;
-      Promise.all([masqCore.getStatus(), masqCore.getNetworkStatus()])
-        .then(([nextStatus, nextNetwork]) => {
-          if (
-            !profileReadyRef.current ||
-            epoch !== operationEpoch.current ||
-            initialization !== initializationEpoch.current
-          ) {
-            return;
-          }
-          setStatus(nextStatus);
-          setNetwork(nextNetwork);
-          if (
-            profileReadyRef.current &&
-            desiredConnected.current &&
-            nextNetwork.available &&
-            !['connected', 'connecting'].includes(nextStatus.phase)
-          ) {
-            connect().catch(() => undefined);
-          }
-        })
-        .catch(() => undefined);
+
+      const resumeConnection = async () => {
+        await connectFlight.current.whenIdle();
+        if (
+          resumeEpoch !== appStateResumeEpoch.current ||
+          !profileReadyRef.current
+        ) {
+          return;
+        }
+
+        const epoch = operationEpoch.current;
+        const initialization = initializationEpoch.current;
+        const [nextStatus, nextNetwork] = await Promise.all([
+          masqCore.getStatus(),
+          masqCore.getNetworkStatus(),
+        ]);
+        if (
+          resumeEpoch !== appStateResumeEpoch.current ||
+          !profileReadyRef.current ||
+          epoch !== operationEpoch.current ||
+          initialization !== initializationEpoch.current
+        ) {
+          return;
+        }
+
+        setStatus(nextStatus);
+        setNetwork(nextNetwork);
+        if (
+          desiredConnected.current &&
+          nextNetwork.available &&
+          !(
+            nextStatus.phase === 'connected' &&
+            nextStatus.connectedNeighbors > 0
+          )
+        ) {
+          await connect();
+        }
+      };
+
+      resumeConnection().catch(() => undefined);
     });
-    return () => subscription.remove();
+    return () => {
+      appStateResumeEpoch.current += 1;
+      subscription.remove();
+    };
   }, [cancelConnectionAttempt, connect]);
 
   useEffect(
@@ -831,16 +863,23 @@ function assertSavedProfileMatchesStatus(
 function describeConnectionProgress(
   status: CoreStatus,
   network: NetworkStatus,
-  refresh: { attempt: number; maxAttempts: number } | null,
+  refresh: EntryNodeRefreshProgress | null,
 ) {
   if (!network.available && network.interface !== 'unknown') {
     return { step: 1, total: 5, label: 'Waiting for an internet connection' };
   }
-  if (refresh) {
+  if (refresh?.stage === 'discovery') {
     return {
       step: 2,
       total: 5,
       label: `Finding reachable entry nodes (${refresh.attempt}/${refresh.maxAttempts})`,
+    };
+  }
+  if (refresh?.stage === 'handshake') {
+    return {
+      step: 3,
+      total: 5,
+      label: `Connecting to an entry peer (attempt ${refresh.attempt}/${refresh.maxAttempts})`,
     };
   }
   if (status.connectedNeighbors < 1) {
