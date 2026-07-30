@@ -1,5 +1,8 @@
 package com.masqmobile
 
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -10,6 +13,42 @@ class EntryNodeDiscoverySelectionTest {
   private val keyA = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   private val keyB = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
   private val keyC = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+
+  @Test
+  fun preservesAnUnquotedPlainTextNodeFinderDescriptor() {
+    val raw = descriptor(keyA, "8.8.8.8", "4100")
+
+    assertEquals(raw, normalizeNodeFinderDescriptor("\n  $raw  \r\n"))
+  }
+
+  @Test
+  fun decodesAQuotedJsonNodeFinderDescriptor() {
+    val raw = descriptor(keyA, "8.8.8.8", "4100")
+
+    assertEquals(raw, normalizeNodeFinderDescriptor("\"$raw\""))
+  }
+
+  @Test
+  fun classifiesNodeFinderFailuresWithoutLoggingTheirDetails() {
+    assertEquals("NF_FETCH_DNS", nodeFinderFailureCode(UnknownHostException("private host")))
+    assertEquals(
+        "NF_FETCH_TIMEOUT",
+        nodeFinderFailureCode(IllegalStateException("wrapper", SocketTimeoutException("private"))),
+    )
+    assertEquals(
+        "NF_FETCH_INTERRUPTED",
+        nodeFinderFailureCode(InterruptedIOException("private")),
+    )
+    assertEquals("NF_FETCH_UNEXPECTED", nodeFinderFailureCode(IllegalStateException("private")))
+  }
+
+  @Test
+  fun limitsNodeFinderRequestsToThreeBatchesOfTwo() {
+    assertEquals(
+        listOf(listOf(0, 1), listOf(2, 3), listOf(4, 5)),
+        nodeFinderAttemptBatches(attempts = 6, maxConcurrentRequests = 2),
+    )
+  }
 
   @Test
   fun selectsFreshBeforePreferredAndCache() {

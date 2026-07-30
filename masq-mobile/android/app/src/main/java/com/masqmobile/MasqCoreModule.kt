@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.content.pm.PackageManager
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebStorage
 import androidx.webkit.Profile
@@ -36,6 +37,73 @@ import org.json.JSONObject
 internal fun shouldDiscoverEntryNodesBeforeStart(phase: String): Boolean =
     phase != "connected"
 
+internal fun safeLastErrorValue(value: Any?): String? =
+    (value as? String)?.takeIf(String::isNotBlank)
+
+internal fun safeCoreStatusDiagnostic(statusJson: String): String? {
+  val status = runCatching { JSONObject(statusJson) }.getOrNull() ?: return null
+  return formatSafeCoreStatusDiagnostic(
+      phase = status.optString("phase"),
+      engineAvailable = status.optBoolean("engineAvailable", false),
+      connectedNeighbors = status.optInt("connectedNeighbors", 0),
+      routeStage = status.optInt("routeStage", 0),
+      proxyEnabled = status.optBoolean("proxyEnabled", false),
+      lastError = safeLastErrorValue(status.opt("lastError")),
+  )
+}
+
+internal fun formatSafeCoreStatusDiagnostic(
+    phase: String,
+    engineAvailable: Boolean,
+    connectedNeighbors: Int,
+    routeStage: Int,
+    proxyEnabled: Boolean,
+    lastError: String?,
+): String {
+  val phase =
+      phase.takeIf {
+            it in
+                setOf(
+                    "unconfigured",
+                    "ready",
+                    "connecting",
+                    "connected",
+                    "paused",
+                    "stopping",
+                    "blocked",
+                    "error",
+                )
+          } ?: "unknown"
+  val errorSignal =
+      lastError
+          ?.let { CORE_PANIC_LOCATION_PATTERN.find(it) }
+          ?.let { match ->
+            val fileToken =
+                match.groupValues[1]
+                    .replace(CORE_UNSAFE_TOKEN_PATTERN, "_")
+                    .take(64)
+            val line = match.groupValues[2].toLongOrNull()?.coerceIn(0, 9_999_999) ?: 0
+            "panic_${fileToken}_$line"
+          }
+          ?: lastError
+          ?.let { CORE_ERROR_CODE_PATTERN.find(it)?.value }
+          ?: lastError
+              ?.let { CORE_EXIT_CODE_PATTERN.find(it)?.groupValues?.getOrNull(1) }
+              ?.toIntOrNull()
+              ?.coerceIn(-999, 999)
+              ?.let { "exit_$it" }
+          ?: if (lastError == null) "none" else "present"
+  return "CORE_STATUS phase=$phase engine=$engineAvailable " +
+      "neighbors=${connectedNeighbors.coerceIn(0, 99)} " +
+      "route_stage=${routeStage.coerceIn(0, 9)} proxy=$proxyEnabled error=$errorSignal"
+}
+
+private val CORE_ERROR_CODE_PATTERN = Regex("\\bE_[A-Z_]+\\b")
+private val CORE_EXIT_CODE_PATTERN = Regex("\\bstopped with code (-?\\d+)\\b")
+private val CORE_PANIC_LOCATION_PATTERN =
+    Regex("\\bE_CORE_PANIC_LOCATION: ([A-Za-z0-9_.-]{1,64}):(\\d{1,10})\\b")
+private val CORE_UNSAFE_TOKEN_PATTERN = Regex("[^A-Za-z0-9_]")
+
 internal object MasqCoreLifecycle {
   val lock = Any()
   val startGeneration = AtomicLong(0L)
@@ -57,6 +125,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               )))
   private val walletStore = SecureWalletStore(reactContext)
   private val entryNodeDiscovery = EntryNodeDiscovery(reactContext)
+  private val lastCoreDiagnostic = AtomicReference<String?>(null)
   private val restoreLock = Any()
   private val lifecycleLock = Any()
   private val pendingTunnelStarts = mutableMapOf<Long, PendingTunnelStart>()
@@ -98,7 +167,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     MasqCoreLifecycle.executor.execute {
       try {
         restoreCoreIfNeeded()
-        promise.resolve(statusJson())
+        val status = statusJson()
+        safeCoreStatusDiagnostic(status)?.let { diagnostic ->
+          if (lastCoreDiagnostic.getAndSet(diagnostic) != diagnostic) {
+            Log.i(CORE_DIAGNOSTIC_TAG, diagnostic)
+          }
+        }
+        promise.resolve(status)
       } catch (error: SecureWalletStore.UnreadableException) {
         promise.reject(
             "E_WALLET_STORAGE_UNREADABLE",
@@ -2621,6 +2696,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   companion object {
     const val NAME = NativeMasqCoreSpec.NAME
+    private const val CORE_DIAGNOSTIC_TAG = "MasqCoreStatus"
     private const val SAVED_CONFIG_KEY = "saved-consumer-config"
     private const val BLOCK_ADS_AND_TRACKERS_KEY =
         "browser-protection.block-ads-and-trackers"

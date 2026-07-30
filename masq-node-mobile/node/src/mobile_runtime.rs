@@ -11,6 +11,7 @@ use actix::{Addr, Arbiter, Recipient, System};
 use masq_lib::messages::{CountryGroups, ToMessageBody, UiSetExitLocationRequest};
 use masq_lib::ui_gateway::{MessageBody, NodeFromUiMessage};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -34,6 +35,7 @@ static REGISTERED_ACTOR_ARBITERS: AtomicUsize = AtomicUsize::new(0);
 static ACTOR_ARBITER_TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ACTOR_ARBITER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LAST_CONNECTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
+const CORE_PANIC_LOCATION_PREFIX: &str = "E_CORE_PANIC_LOCATION:";
 static AVAILABLE_EXIT_COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static EXIT_PREFERENCE: Mutex<Option<MobileExitPreference>> = Mutex::new(None);
 static NEIGHBORHOOD_UI: Mutex<Option<Recipient<NodeFromUiMessage>>> = Mutex::new(None);
@@ -65,10 +67,13 @@ impl MobileConnectionError {
     }
 
     fn takes_priority_over(self, current: Option<&str>) -> bool {
-        self == Self::PassLoopFound
-            || !current
-                .map(|message| message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
-                .unwrap_or(false)
+        !current
+            .map(|message| message.starts_with(CORE_PANIC_LOCATION_PREFIX))
+            .unwrap_or(false)
+            && (self == Self::PassLoopFound
+                || !current
+                    .map(|message| message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
+                    .unwrap_or(false))
     }
 }
 
@@ -146,12 +151,23 @@ pub struct MobileRuntimeSnapshot {
 /// its preferences. Keeping preparation outside this function prevents actor
 /// startup from clearing preferences that were queued just before spawning.
 pub fn run_embedded(args: &[String]) -> i32 {
+    install_early_panic_location_hook();
     let exit_code = catch_unwind(AssertUnwindSafe(|| {
         crate::sub_lib::main_tools::main_with_args(args)
     }))
     .unwrap_or(101);
     finish(exit_code);
     exit_code
+}
+
+fn install_early_panic_location_hook() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        if let Some(location) = panic_info.location() {
+            report_panic_location(location.file(), location.line());
+        } else {
+            report_panic_location("unknown", 0);
+        }
+    }));
 }
 
 pub fn prepare(proxy_port: u16) {
@@ -488,6 +504,29 @@ pub fn report_connection_error(error: MobileConnectionError) {
     }
 }
 
+pub fn report_panic_location(file: &str, line: u32) {
+    if !is_embedded() {
+        return;
+    }
+    let file_name = Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                })
+                .take(64)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    *LAST_CONNECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(format!("{CORE_PANIC_LOCATION_PREFIX} {file_name}:{line}"));
+}
+
 pub fn track_stream_connect_job() -> StreamConnectJobGuard {
     let tracked = is_embedded();
     if tracked {
@@ -800,6 +839,36 @@ mod tests {
         assert_eq!(
             snapshot().last_connection_error.as_deref(),
             Some("E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop")
+        );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn panic_location_keeps_only_a_bounded_file_name_and_line() {
+        prepare(44_443);
+
+        report_panic_location("/private/person/stream handler.rs", 123);
+
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("E_CORE_PANIC_LOCATION: streamhandler.rs:123")
+        );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn panic_location_is_not_overwritten_by_later_connection_errors() {
+        prepare(44_443);
+        report_panic_location("/private/person/bootstrapper.rs", 351);
+
+        report_connection_error(MobileConnectionError::StreamConnectionFailed);
+        report_connection_error(MobileConnectionError::PassLoopFound);
+
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("E_CORE_PANIC_LOCATION: bootstrapper.rs:351")
         );
         finish(0);
     }

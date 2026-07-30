@@ -2,11 +2,20 @@ package com.masqmobile
 
 import android.content.Context
 import android.util.Log
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.ConnectException
+import java.net.ProtocolException
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.net.UnknownServiceException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.SSLException
 import okhttp3.CacheControl
 import okhttp3.ConnectionSpec
 import okhttp3.HttpUrl
@@ -15,7 +24,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.ResponseBody
 import org.json.JSONArray
-import org.json.JSONTokener
 
 internal class EntryNodeDiscovery(context: Context) {
   private val preferences =
@@ -29,7 +37,7 @@ internal class EntryNodeDiscovery(context: Context) {
           .callTimeout(NODE_FINDER_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
           .followRedirects(false)
           .followSslRedirects(false)
-          .retryOnConnectionFailure(false)
+          .retryOnConnectionFailure(true)
           .connectionSpecs(listOf(ConnectionSpec.MODERN_TLS))
           .build()
 
@@ -43,15 +51,35 @@ internal class EntryNodeDiscovery(context: Context) {
       )
     }
 
-    val pool = Executors.newFixedThreadPool(NODE_FINDER_ATTEMPTS)
+    val pool = Executors.newFixedThreadPool(NODE_FINDER_MAX_CONCURRENT_REQUESTS)
     try {
-      val freshDescriptors =
-          pool
-              .invokeAll(
-                  (0 until NODE_FINDER_ATTEMPTS).map { attempt ->
-                    Callable { fetchCandidate(chain, generation, attempt) }
-                  })
-              .mapNotNull { future -> runCatching { future.get() }.getOrNull() }
+      val freshDescriptors = mutableListOf<String>()
+      val attemptBatches =
+          nodeFinderAttemptBatches(
+              NODE_FINDER_ATTEMPTS,
+              NODE_FINDER_MAX_CONCURRENT_REQUESTS,
+          )
+      for ((batchIndex, attempts) in attemptBatches.withIndex()) {
+        freshDescriptors +=
+            pool
+                .invokeAll(
+                    attempts.map { attempt ->
+                      Callable { fetchCandidate(chain, generation, attempt) }
+                    })
+                .mapNotNull { future -> runCatching { future.get() }.getOrNull() }
+        val usableFresh =
+            EntryNodeDiscoverySelection.select(
+                chain = chain,
+                freshDescriptors = freshDescriptors,
+                preferredDescriptors = emptyList(),
+                cachedDescriptors = emptyList(),
+            )
+        if (usableFresh.size >= REQUIRED_ENTRY_NODES) break
+        if (batchIndex < attemptBatches.lastIndex) {
+          safeDiagnostic("NF_BATCH_BACKOFF", "batch" to batchIndex)
+          Thread.sleep(NODE_FINDER_BATCH_BACKOFF_MS)
+        }
+      }
       val cachedDescriptors = loadCached(chain)
       val selected =
           EntryNodeDiscoverySelection.select(
@@ -110,6 +138,7 @@ internal class EntryNodeDiscovery(context: Context) {
             .cacheControl(CacheControl.FORCE_NETWORK)
             .header("Accept", "text/plain, application/json")
             .build()
+    val startedAt = System.nanoTime()
 
     return try {
       httpClient.newCall(request).execute().use { response ->
@@ -132,7 +161,7 @@ internal class EntryNodeDiscovery(context: Context) {
           safeDiagnostic("NF_FETCH_OVERSIZE", "attempt" to attempt)
           return null
         }
-        val descriptor = normalizeDescriptor(boundedBody)
+        val descriptor = normalizeNodeFinderDescriptor(boundedBody)
         if (EntryNodeDiscoverySelection.parse(descriptor, chain) == null) {
           safeDiagnostic("NF_FETCH_INVALID", "attempt" to attempt)
           return null
@@ -140,8 +169,17 @@ internal class EntryNodeDiscovery(context: Context) {
         safeDiagnostic("NF_FETCH_OK", "attempt" to attempt)
         descriptor
       }
-    } catch (_: Exception) {
-      safeDiagnostic("NF_FETCH_IO", "attempt" to attempt)
+    } catch (error: Exception) {
+      val elapsedMs =
+          TimeUnit.NANOSECONDS
+              .toMillis(System.nanoTime() - startedAt)
+              .coerceIn(0, Int.MAX_VALUE.toLong())
+              .toInt()
+      safeDiagnostic(
+          nodeFinderFailureCode(error),
+          "attempt" to attempt,
+          "elapsed_ms" to elapsedMs,
+      )
       null
     }
   }
@@ -173,13 +211,6 @@ internal class EntryNodeDiscovery(context: Context) {
     }
     if (total > MAX_RESPONSE_BYTES) return null
     return String(bytes, 0, total, StandardCharsets.UTF_8)
-  }
-
-  private fun normalizeDescriptor(value: String): String {
-    val trimmed = value.trim()
-    return runCatching { JSONTokener(trimmed).nextValue() }
-        .getOrNull()
-        .let { decoded -> if (decoded is String) decoded.trim() else trimmed }
   }
 
   private fun loadCached(chain: String): List<String> {
@@ -214,6 +245,8 @@ internal class EntryNodeDiscovery(context: Context) {
     const val LOG_TAG = "MasqNodeFinder"
     const val PUBLIC_SUBURB = "masqpublic1"
     const val NODE_FINDER_ATTEMPTS = 6
+    const val NODE_FINDER_MAX_CONCURRENT_REQUESTS = 2
+    const val NODE_FINDER_BATCH_BACKOFF_MS = 250L
     const val REQUIRED_ENTRY_NODES = 2
     const val NODE_FINDER_TIMEOUT_MS = 6000L
     const val NODE_FINDER_CALL_TIMEOUT_MS = 7000L
@@ -222,6 +255,80 @@ internal class EntryNodeDiscovery(context: Context) {
     val NF_CODE_PATTERN = Regex("NF_[A-Z_]+")
     val NF_METRIC_PATTERN = Regex("[a-z_]+")
   }
+}
+
+internal fun nodeFinderAttemptBatches(
+    attempts: Int,
+    maxConcurrentRequests: Int,
+): List<List<Int>> {
+  require(attempts > 0)
+  require(maxConcurrentRequests > 0)
+  return (0 until attempts).chunked(maxConcurrentRequests)
+}
+
+internal fun normalizeNodeFinderDescriptor(value: String): String {
+  val trimmed = value.trim()
+  // The production node-finder returns an unquoted text/plain descriptor. Feeding
+  // `masq://...` unconditionally to JSONTokener makes Android treat the scheme
+  // colon as a token delimiter and return only `masq`. Decode only an actual
+  // JSON string; preserve plain text byte-for-byte apart from surrounding space.
+  if (trimmed.length < 2 || trimmed.first() != '"' || trimmed.last() != '"') {
+    return trimmed
+  }
+  return decodeNodeFinderJsonString(trimmed)?.trim() ?: trimmed
+}
+
+private fun decodeNodeFinderJsonString(value: String): String? {
+  val decoded = StringBuilder(value.length - 2)
+  var index = 1
+  while (index < value.lastIndex) {
+    val character = value[index++]
+    if (character == '"' || character.code < 0x20) return null
+    if (character != '\\') {
+      decoded.append(character)
+      continue
+    }
+    if (index >= value.lastIndex) return null
+    when (val escaped = value[index++]) {
+      '"', '\\', '/' -> decoded.append(escaped)
+      'b' -> decoded.append('\b')
+      'f' -> decoded.append('\u000C')
+      'n' -> decoded.append('\n')
+      'r' -> decoded.append('\r')
+      't' -> decoded.append('\t')
+      'u' -> {
+        if (index + 4 > value.lastIndex) return null
+        val codePoint = value.substring(index, index + 4).toIntOrNull(16) ?: return null
+        decoded.append(codePoint.toChar())
+        index += 4
+      }
+      else -> return null
+    }
+  }
+  return decoded.toString()
+}
+
+internal fun nodeFinderFailureCode(error: Throwable): String {
+  var cause: Throwable? = error
+  var sawIoFailure = false
+  while (cause != null) {
+    when (cause) {
+      is UnknownHostException -> return "NF_FETCH_DNS"
+      is SSLException -> return "NF_FETCH_TLS"
+      is SocketTimeoutException -> return "NF_FETCH_TIMEOUT"
+      is InterruptedIOException -> return "NF_FETCH_INTERRUPTED"
+      is ConnectException -> return "NF_FETCH_CONNECT"
+      is UnknownServiceException, is ProtocolException -> return "NF_FETCH_PROTOCOL"
+      is SocketException -> return "NF_FETCH_SOCKET"
+      is SecurityException -> return "NF_FETCH_PERMISSION"
+      is IOException -> sawIoFailure = true
+    }
+    if (cause.javaClass.name == "android.os.NetworkOnMainThreadException") {
+      return "NF_FETCH_THREAD"
+    }
+    cause = cause.cause
+  }
+  return if (sawIoFailure) "NF_FETCH_IO" else "NF_FETCH_UNEXPECTED"
 }
 
 internal data class EntryNodeCandidate(

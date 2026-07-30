@@ -441,9 +441,14 @@ impl MobileCore {
                 } else {
                     self.phase = Phase::Error;
                     self.proxy_enabled = false;
-                    self.last_error = Some(format!(
-                        "The embedded MASQ Node stopped with code {exit_code}. Check the Node log."
-                    ));
+                    self.last_error = snapshot
+                        .last_connection_error
+                        .filter(|error| error.starts_with("E_CORE_PANIC_LOCATION:"))
+                        .or_else(|| {
+                            Some(format!(
+                                "The embedded MASQ Node stopped with code {exit_code}. Check the Node log."
+                            ))
+                        });
                 }
             }
         }
