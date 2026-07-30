@@ -78,18 +78,22 @@ impl StreamConnector for StreamConnectorReal {
 
         #[cfg(not(target_os = "ios"))]
         {
-            let future_logger = logger.clone();
+            let connect_logger = logger.clone();
+            let conversion_logger = logger.clone();
             let connect_job = crate::mobile_runtime::track_stream_connect_job();
-            Box::new(TCP_CONNECT_POOL.spawn_fn(move || {
-                let _connect_job = connect_job;
-                connect_one_socket(socket_addr, &future_logger).map_err(|error| {
-                    error!(
-                        future_logger,
-                        "Could not connect TCP stream; remote redacted"
-                    );
-                    error
-                })
-            }))
+            blocking_connect_then_convert(
+                move || {
+                    let _connect_job = connect_job;
+                    connect_standard_socket(socket_addr).map_err(|error| {
+                        error!(
+                            connect_logger,
+                            "Could not connect TCP stream; remote redacted"
+                        );
+                        error
+                    })
+                },
+                move |stream| finish_standard_socket(stream, &conversion_logger),
+            )
         }
     }
 
@@ -165,13 +169,47 @@ fn connect_one_socket(
     socket_addr: SocketAddr,
     logger: &Logger,
 ) -> Result<ConnectionInfo, io::Error> {
+    let stream = connect_standard_socket(socket_addr)?;
+    finish_standard_socket(stream, logger)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn connect_standard_socket(socket_addr: SocketAddr) -> Result<StdTcpStream, io::Error> {
     let stream =
         StdTcpStream::connect_timeout(&socket_addr, Duration::from_millis(CONNECT_TIMEOUT_MS))?;
     stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn finish_standard_socket(
+    stream: StdTcpStream,
+    logger: &Logger,
+) -> Result<ConnectionInfo, io::Error> {
     let tokio_stream = TcpStream::from_std(stream, &Handle::default())?;
     StreamConnectorReal {}
         .split_stream(tokio_stream, logger)
         .ok_or_else(|| io::Error::new(ErrorKind::Other, "Stream could not be split"))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn blocking_connect_then_convert<BlockingConnect, Convert>(
+    blocking_connect: BlockingConnect,
+    convert: Convert,
+) -> ConnectionInfoFuture
+where
+    BlockingConnect: FnOnce() -> Result<StdTcpStream, io::Error> + Send + 'static,
+    Convert: FnOnce(StdTcpStream) -> Result<ConnectionInfo, io::Error> + Send + 'static,
+{
+    // Keep only the potentially blocking connect(2) call on the bounded CPU
+    // pool. `and_then` is polled by the caller's Actix/Tokio executor, so
+    // `TcpStream::from_std` binds the socket to that executor's reactor rather
+    // than to a fallback reactor created on a CPU worker.
+    Box::new(
+        TCP_CONNECT_POOL
+            .spawn_fn(blocking_connect)
+            .and_then(convert),
+    )
 }
 
 #[cfg(target_os = "ios")]
@@ -273,6 +311,39 @@ mod tests {
             assert_eq!(connection_info.peer_addr, server.socket_addr());
             success()
         });
+    }
+
+    #[test]
+    fn async_connector_defers_tokio_conversion_to_the_polling_executor() {
+        let server = LittleTcpServer::start();
+        let socket_addr = server.socket_addr();
+        let logger = Logger::new("reactor-affinity");
+        let (blocking_thread_tx, blocking_thread_rx) = unbounded();
+        let (conversion_thread_tx, conversion_thread_rx) = unbounded();
+
+        let future = blocking_connect_then_convert(
+            move || {
+                blocking_thread_tx.send(thread::current().id()).unwrap();
+                connect_standard_socket(socket_addr)
+            },
+            move |stream| {
+                conversion_thread_tx.send(thread::current().id()).unwrap();
+                finish_standard_socket(stream, &logger)
+            },
+        );
+
+        FutureAsserter::new(future).assert(move |result| {
+            let connection_info = result.unwrap();
+            assert_eq!(connection_info.peer_addr, socket_addr);
+            success()
+        });
+
+        let blocking_thread = blocking_thread_rx.recv().unwrap();
+        let conversion_thread = conversion_thread_rx.recv().unwrap();
+        assert_ne!(
+            blocking_thread, conversion_thread,
+            "Tokio socket conversion must not run on the blocking connect worker"
+        );
     }
 
     #[test]
