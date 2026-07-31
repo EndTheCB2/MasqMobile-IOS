@@ -77,11 +77,28 @@ impl ConnectionProgress {
             return false;
         }
 
+        if matches!(
+            (&self.connection_stage, &connection_stage),
+            (
+                ConnectionStage::NeighborshipEstablished,
+                ConnectionStage::TcpConnectionEstablished
+            )
+        ) {
+            trace!(
+                logger,
+                "Ignoring a late TCP-success event after authenticated gossip established the neighborship; Node identity redacted."
+            );
+            return false;
+        }
+
         let transition_is_valid = matches!(
             (&self.connection_stage, &connection_stage),
             (
                 ConnectionStage::StageZero,
                 ConnectionStage::TcpConnectionEstablished
+            ) | (
+                ConnectionStage::StageZero,
+                ConnectionStage::NeighborshipEstablished
             ) | (ConnectionStage::StageZero, ConnectionStage::Failed(_))
                 | (
                     ConnectionStage::TcpConnectionEstablished,
@@ -491,7 +508,7 @@ mod tests {
         let mut subject = ConnectionProgress {
             initial_node_descriptor: make_node_descriptor(make_ip(1)),
             current_peer_addr: make_ip(1),
-            connection_stage: ConnectionStage::StageZero,
+            connection_stage: ConnectionStage::Failed(TcpConnectionFailed),
         };
 
         let event_was_applied = subject.update_stage(
@@ -500,7 +517,50 @@ mod tests {
         );
 
         assert!(!event_was_applied);
-        assert_eq!(subject.connection_stage, ConnectionStage::StageZero);
+        assert_eq!(
+            subject.connection_stage,
+            ConnectionStage::Failed(TcpConnectionFailed)
+        );
+    }
+
+    #[test]
+    fn authenticated_gossip_can_advance_directly_from_stage_zero() {
+        let mut subject = ConnectionProgress {
+            initial_node_descriptor: make_node_descriptor(make_ip(1)),
+            current_peer_addr: make_ip(1),
+            connection_stage: ConnectionStage::StageZero,
+        };
+
+        let event_was_applied = subject.update_stage(
+            &Logger::new("authenticated_gossip_can_advance_directly_from_stage_zero"),
+            ConnectionStage::NeighborshipEstablished,
+        );
+
+        assert!(event_was_applied);
+        assert_eq!(
+            subject.connection_stage,
+            ConnectionStage::NeighborshipEstablished
+        );
+    }
+
+    #[test]
+    fn late_tcp_success_is_idempotent_after_authenticated_gossip() {
+        let mut subject = ConnectionProgress {
+            initial_node_descriptor: make_node_descriptor(make_ip(1)),
+            current_peer_addr: make_ip(1),
+            connection_stage: ConnectionStage::NeighborshipEstablished,
+        };
+
+        let event_was_applied = subject.update_stage(
+            &Logger::new("late_tcp_success_is_idempotent_after_authenticated_gossip"),
+            ConnectionStage::TcpConnectionEstablished,
+        );
+
+        assert!(!event_was_applied);
+        assert_eq!(
+            subject.connection_stage,
+            ConnectionStage::NeighborshipEstablished
+        );
     }
 
     #[test]
@@ -1079,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn can_t_establish_neighborship_without_having_a_tcp_connection() {
+    fn authenticated_introduction_can_arrive_before_the_tcp_progress_event() {
         let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = OverallConnectionStatus::new(vec![node_descriptor]);
         let connection_progress_to_modify =
@@ -1088,13 +1148,13 @@ mod tests {
         let event_was_applied = OverallConnectionStatus::update_connection_stage(
             connection_progress_to_modify,
             ConnectionProgressEvent::IntroductionGossipReceived(make_ip(1)),
-            &Logger::new("can_t_establish_neighborship_without_having_a_tcp_connection"),
+            &Logger::new("authenticated_introduction_can_arrive_before_the_tcp_progress_event"),
         );
 
-        assert!(!event_was_applied);
+        assert!(event_was_applied);
         assert_eq!(
             connection_progress_to_modify.connection_stage,
-            ConnectionStage::StageZero
+            ConnectionStage::NeighborshipEstablished
         );
     }
 

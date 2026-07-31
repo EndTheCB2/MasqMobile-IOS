@@ -2271,6 +2271,7 @@ dependencies = [
  "fdlimit",
  "flexi_logger 0.15.12",
  "futures",
+ "futures-cpupool",
  "heck",
  "http 0.2.5",
  "indoc",

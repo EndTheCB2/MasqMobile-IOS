@@ -31,4 +31,37 @@ describe('SingleFlight', () => {
     await Promise.resolve();
     await expect(flight.run(async () => 7)).resolves.toBe(7);
   });
+
+  it('waits until the active operation settles successfully', async () => {
+    let resolve!: (value: number) => void;
+    const pending = new Promise<number>(done => {
+      resolve = done;
+    });
+    const flight = new SingleFlight<number>();
+    flight.run(() => pending);
+    const idle = flight.whenIdle();
+    const observer = jest.fn();
+    idle.then(observer);
+
+    await Promise.resolve();
+    expect(observer).not.toHaveBeenCalled();
+    resolve(42);
+    await expect(idle).resolves.toBeUndefined();
+    expect(flight.isRunning).toBe(false);
+  });
+
+  it('becomes idle after the active operation rejects', async () => {
+    let rejectFirst!: (reason: Error) => void;
+    const first = new Promise<number>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const flight = new SingleFlight<number>();
+    const failed = flight.run(() => first);
+    const idle = flight.whenIdle();
+
+    rejectFirst(new Error('cancelled'));
+    await expect(failed).rejects.toThrow('cancelled');
+    await expect(idle).resolves.toBeUndefined();
+    expect(flight.isRunning).toBe(false);
+  });
 });

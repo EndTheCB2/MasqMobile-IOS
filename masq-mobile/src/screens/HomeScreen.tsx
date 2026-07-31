@@ -2,9 +2,10 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import type { CoreStatus, NetworkStatus } from '../core/types';
 import type { MasqIssue } from '../core/issues';
+import type { EntryNodeRefreshProgress } from '../core/entryNodeRefresh';
 import type { WalletBalanceState } from '../core/walletBalance';
 import {
-  SYSTEM_TUNNEL_PUBLICLY_ENABLED,
+  systemTunnelTrafficDisposition,
   type SystemTunnelStatus,
 } from '../core/systemTunnel';
 import { HOP_OPTIONS, exitCountryName } from '../core/routingPreferences';
@@ -20,13 +21,18 @@ import { colors, radii } from '../ui/theme';
 interface Props {
   status: CoreStatus;
   busy: boolean;
+  profileReady: boolean;
+  initializationState: 'loading' | 'ready' | 'error';
+  profileRecoveryAvailable: boolean;
   network: NetworkStatus;
   connectionProgress: { step: number; total: number; label: string };
-  entryNodeRefresh: { attempt: number; maxAttempts: number } | null;
+  entryNodeRefresh: EntryNodeRefreshProgress | null;
   issue: MasqIssue | null;
   walletBalance: WalletBalanceState;
   systemTunnel: SystemTunnelStatus;
   onConnect: () => void;
+  onRetryInitialization: () => void;
+  onRecoverNetworkProfile: () => void;
   onDisconnect: () => void;
   onReset: () => void;
   onResetNetwork: () => void;
@@ -46,6 +52,9 @@ interface Props {
 export function HomeScreen({
   status,
   busy,
+  profileReady,
+  initializationState,
+  profileRecoveryAvailable,
   network,
   connectionProgress,
   entryNodeRefresh,
@@ -53,6 +62,8 @@ export function HomeScreen({
   walletBalance,
   systemTunnel,
   onConnect,
+  onRetryInitialization,
+  onRecoverNetworkProfile,
   onDisconnect,
   onReset,
   onResetNetwork,
@@ -68,8 +79,10 @@ export function HomeScreen({
   onUpdateMinHops,
   onRefreshWalletBalance,
 }: Props) {
-  const connected = status.phase === 'connected';
-  const configured = Boolean(status.chain && status.walletAddress);
+  const connected = profileReady && status.phase === 'connected';
+  const configured = Boolean(
+    profileReady && status.chain && status.walletAddress,
+  );
 
   return (
     <View style={styles.screen}>
@@ -84,8 +97,13 @@ export function HomeScreen({
             {issue.action === 'retry' ? (
               <Pressable
                 accessibilityRole="button"
+                accessibilityState={{ disabled: !profileReady }}
+                disabled={!profileReady}
                 onPress={onRetry}
-                style={styles.errorAction}
+                style={[
+                  styles.errorAction,
+                  !profileReady && styles.profileActionDisabled,
+                ]}
               >
                 <Text style={styles.errorActionText}>Retry connection</Text>
               </Pressable>
@@ -102,8 +120,13 @@ export function HomeScreen({
             {issue.action === 'network-profile' || issue.action === 'wallet' ? (
               <Pressable
                 accessibilityRole="button"
+                accessibilityState={{ disabled: !profileReady }}
+                disabled={!profileReady}
                 onPress={onOpenSetup}
-                style={styles.errorAction}
+                style={[
+                  styles.errorAction,
+                  !profileReady && styles.profileActionDisabled,
+                ]}
               >
                 <Text style={styles.errorActionText}>
                   {issue.action === 'wallet'
@@ -135,9 +158,19 @@ export function HomeScreen({
             />
             <Text style={styles.badgeText}>MASQ DMESH · CONSUME</Text>
           </View>
-          <Text style={styles.state}>{phaseLabel(status)}</Text>
+          <Text style={styles.state}>
+            {profileReady
+              ? phaseLabel(status)
+              : initializationState === 'loading'
+              ? 'Loading saved profile…'
+              : 'Saved profile unavailable'}
+          </Text>
           <Text style={styles.subtitle}>
-            {connected
+            {!profileReady
+              ? initializationState === 'loading'
+                ? 'Node and wallet actions stay locked until the complete saved profile is available.'
+                : 'Retry profile loading before changing Node, wallet or routing settings.'
+              : connected
               ? `${
                   status.routeHops
                     ? `${status.routeHops} ${
@@ -165,7 +198,44 @@ export function HomeScreen({
         </View>
 
         <View style={styles.actions}>
-          {connected ? (
+          {!profileReady ? (
+            <>
+              <Button
+                accessibilityLabel={
+                  initializationState === 'loading'
+                    ? 'Loading saved Node and wallet profile'
+                    : 'Retry saved profile loading'
+                }
+                accessibilityState={{
+                  busy: initializationState === 'loading',
+                  disabled: initializationState === 'loading',
+                }}
+                label={
+                  initializationState === 'loading'
+                    ? 'Loading saved profile…'
+                    : 'Retry profile loading'
+                }
+                onPress={onRetryInitialization}
+                busy={initializationState === 'loading'}
+                disabled={initializationState === 'loading'}
+              />
+              {initializationState === 'error' && profileRecoveryAvailable ? (
+                <>
+                  <Button
+                    label="Reset network profile · keep wallet"
+                    onPress={onRecoverNetworkProfile}
+                    tone="danger"
+                  />
+                  <Text style={styles.profileRecoveryHelper}>
+                    Use this only if Retry keeps failing. MASQ and Direct
+                    browsing remain blocked while MASQ Mobile removes the chain,
+                    RPC and entry-node settings. The consumer wallet stays on
+                    this device.
+                  </Text>
+                </>
+              ) : null}
+            </>
+          ) : connected ? (
             <>
               <Button
                 label={
@@ -189,14 +259,16 @@ export function HomeScreen({
                 label={
                   status.phase === 'connecting'
                     ? entryNodeRefresh
-                      ? `Refreshing entry nodes · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
+                      ? entryNodeRefresh.stage === 'discovery'
+                        ? `Finding entry nodes · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
+                        : `Connecting to entry peer · ${entryNodeRefresh.attempt}/${entryNodeRefresh.maxAttempts}`
                       : 'Contacting entry nodes…'
                     : configured
                     ? 'Connect to MASQ'
                     : 'Set up consumer wallet'
                 }
                 onPress={configured ? onConnect : onOpenSetup}
-                busy={busy}
+                busy={busy && status.phase !== 'connecting'}
                 disabled={
                   status.phase === 'connecting' ||
                   (status.phase === 'blocked' && configured)
@@ -216,7 +288,9 @@ export function HomeScreen({
             onPress={onOpenDirectBrowser}
             tone="secondary"
             disabled={
-              busy || (!network.available && network.interface !== 'unknown')
+              !profileReady ||
+              busy ||
+              (!network.available && network.interface !== 'unknown')
             }
           />
         </View>
@@ -343,14 +417,15 @@ export function HomeScreen({
           </View>
         ) : null}
 
-        {configured &&
-        systemTunnel.supported &&
-        (SYSTEM_TUNNEL_PUBLICLY_ENABLED || systemTunnel.phase !== 'off') ? (
+        {systemTunnel.supported ? (
           <Pressable
+            accessibilityState={{ disabled: !profileReady }}
             accessibilityRole="button"
+            disabled={!profileReady}
             onPress={onOpenTrafficRouting}
             style={({ pressed }) => [
               styles.trafficRouting,
+              !profileReady && styles.profileActionDisabled,
               pressed && styles.pressed,
             ]}
           >
@@ -359,14 +434,10 @@ export function HomeScreen({
                 <View style={styles.settingsBody}>
                   <Text style={styles.settingsEyebrow}>TRAFFIC SCOPE</Text>
                   <Text style={styles.settingsTitle}>
-                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
-                      ? systemTunnelTitle(systemTunnel)
-                      : 'Turn off experimental system routing'}
+                    {systemTunnelTitle(systemTunnel)}
                   </Text>
                   <Text style={styles.settingsMeta}>
-                    {SYSTEM_TUNNEL_PUBLICLY_ENABLED
-                      ? 'Configure whole-device or per-app routing'
-                      : 'New system tunnels are disabled in this preview'}
+                    {systemTunnelDetail(systemTunnel)}
                   </Text>
                 </View>
                 <Text style={styles.chevron}>›</Text>
@@ -376,9 +447,15 @@ export function HomeScreen({
         ) : null}
 
         <Pressable
+          accessibilityState={{ disabled: !profileReady }}
           accessibilityRole="button"
+          disabled={!profileReady}
           onPress={onOpenSetup}
-          style={({ pressed }) => [styles.settings, pressed && styles.pressed]}
+          style={({ pressed }) => [
+            styles.settings,
+            !profileReady && styles.profileActionDisabled,
+            pressed && styles.pressed,
+          ]}
         >
           <Card>
             <View style={styles.settingsRow}>
@@ -386,7 +463,11 @@ export function HomeScreen({
                 <Text style={styles.settingsEyebrow}>CONNECTION PROFILE</Text>
                 <Text style={styles.settingsTitle}>Node & wallet settings</Text>
                 <Text numberOfLines={1} style={styles.settingsMeta}>
-                  {status.walletAddress
+                  {!profileReady
+                    ? initializationState === 'loading'
+                      ? 'Loading the complete saved profile…'
+                      : 'Retry profile loading to edit safely'
+                    : status.walletAddress
                     ? `${status.chain} · ${status.minHops} ${
                         status.minHops === 1 ? 'hop' : 'hops'
                       } · ${exitCountryName(status.exitCountry)}`
@@ -511,20 +592,44 @@ function shortAddress(address: string): string {
 }
 
 function systemTunnelTitle(status: SystemTunnelStatus): string {
-  if (status.phase === 'blocked') {
-    return status.active
-      ? 'System traffic blocked'
-      : 'System routing unavailable';
+  const disposition = systemTunnelTrafficDisposition(status);
+  if (disposition === 'directRisk') {
+    return 'Traffic may be direct — check routing';
   }
-  if (status.mode === 'wholeDevice' && status.active) {
-    return 'Whole device protected';
+  if (disposition === 'blocked') {
+    return 'Captured system traffic is blocked';
   }
-  if (status.mode === 'selectedApps' && status.active) {
+  if (
+    disposition === 'masq' &&
+    status.mode === 'wholeDevice' &&
+    status.active
+  ) {
+    return 'Whole-device dogfood route active';
+  }
+  if (
+    disposition === 'masq' &&
+    status.mode === 'selectedApps' &&
+    status.active
+  ) {
     return `${status.selectedApps.length} selected app${
       status.selectedApps.length === 1 ? '' : 's'
-    } protected`;
+    } in active dogfood route`;
   }
   return 'Private browser only';
+}
+
+function systemTunnelDetail(status: SystemTunnelStatus): string {
+  const disposition = systemTunnelTrafficDisposition(status);
+  if (disposition === 'directRisk') {
+    return 'Android cannot confirm capture. Open Traffic scope and turn the route off or recover it.';
+  }
+  if (disposition === 'blocked') {
+    return 'Captured traffic is being held while the MASQ dogfood route is unavailable.';
+  }
+  if (disposition === 'masq') {
+    return 'IPv4 TCP/443 is reported through MASQ; dogfood limitations still apply.';
+  }
+  return 'Configure unsafe device or selected-app dogfood routing';
 }
 
 const styles = StyleSheet.create({
@@ -623,6 +728,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     paddingHorizontal: 11,
     paddingVertical: 9,
+  },
+  profileActionDisabled: { opacity: 0.48 },
+  profileRecoveryHelper: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: 'center',
   },
   errorActionText: { color: colors.white, fontSize: 12, fontWeight: '700' },
   actions: { gap: 11 },

@@ -9,6 +9,8 @@ import {
 } from 'react';
 import {
   ActivityIndicator,
+  AppState,
+  BackHandler,
   Platform,
   Pressable,
   StyleSheet,
@@ -43,10 +45,11 @@ import { masqCore } from '../core/masqCore';
 import { colors, radii } from '../ui/theme';
 
 export type BrowserMode = 'masq' | 'direct';
+export type BrowserCloseReason = 'user' | 'background';
 
 interface Props {
   mode: BrowserMode;
-  onClose: () => void;
+  onClose: (reason?: BrowserCloseReason) => Promise<void> | void;
 }
 
 interface ShouldStartLoadRequest extends WebViewNavigation {
@@ -102,10 +105,13 @@ const BrowserWebView = WebView as unknown as ComponentType<
 const MAX_TRANSIENT_RETRIES = 2;
 const MAX_HTTPS_REDIRECT_UPGRADES = 4;
 const FORM_SUBMISSION_NAVIGATIONS = new Set(['formsubmit', 'formresubmit']);
+type BrowserCloseState = 'open' | 'closing' | 'failed';
 
 export function BrowserScreen({ mode, onClose }: Props) {
   const isMasq = mode === 'masq';
   const webView = useRef<WebView>(null);
+  const closeInFlight = useRef(false);
+  const closeReason = useRef<BrowserCloseReason>('user');
   const retryCount = useRef(0);
   const httpsRedirectUpgrades = useRef(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -127,6 +133,8 @@ export function BrowserScreen({ mode, onClose }: Props) {
   );
   const [siteSettingsBusy, setSiteSettingsBusy] = useState(false);
   const [webViewGeneration, setWebViewGeneration] = useState(0);
+  const [closeState, setCloseState] = useState<BrowserCloseState>('open');
+  const [closeError, setCloseError] = useState<string | null>(null);
   const protectionStatusText = siteSettings?.protectionDisabled
     ? 'Off for this site'
     : protectionBusy && !protection
@@ -139,12 +147,12 @@ export function BrowserScreen({ mode, onClose }: Props) {
       : 'Page filtering'
     : 'Navigation paused';
 
-  const cancelScheduledRetry = () => {
+  const cancelScheduledRetry = useCallback(() => {
     if (retryTimer.current) {
       clearTimeout(retryTimer.current);
       retryTimer.current = null;
     }
-  };
+  }, []);
 
   const prepareProtection = useCallback(async () => {
     const operation = ++protectionOperation.current;
@@ -180,7 +188,68 @@ export function BrowserScreen({ mode, onClose }: Props) {
       siteSettingsOperation.current += 1;
       cancelScheduledRetry();
     };
-  }, [prepareProtection]);
+  }, [cancelScheduledRetry, prepareProtection]);
+
+  const closeBrowser = useCallback(
+    async (reason?: BrowserCloseReason) => {
+      if (closeInFlight.current) {
+        return;
+      }
+      const requestedReason = reason ?? closeReason.current;
+      closeReason.current = requestedReason;
+      closeInFlight.current = true;
+      protectionOperation.current += 1;
+      siteSettingsOperation.current += 1;
+      cancelScheduledRetry();
+      // Rendering the close state unmounts the WebView before native blocking is
+      // awaited. A rejected acknowledgement never restores the page.
+      setCloseState('closing');
+      setCloseError(null);
+      try {
+        await onClose(requestedReason);
+      } catch (caught) {
+        setCloseState('failed');
+        setCloseError(
+          caught instanceof Error
+            ? caught.message
+            : 'Browser traffic could not be confirmed blocked.',
+        );
+      } finally {
+        closeInFlight.current = false;
+      }
+    },
+    [cancelScheduledRetry, onClose],
+  );
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state !== 'active' && closeState === 'open') {
+        closeBrowser('background').catch(() => undefined);
+      }
+    });
+    return () => subscription.remove();
+  }, [closeBrowser, closeState]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (closeState !== 'open') {
+          return true;
+        }
+        if (canGoBack) {
+          webView.current?.goBack();
+          return true;
+        }
+        closeBrowser().catch(() => undefined);
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, [canGoBack, closeBrowser, closeState]);
 
   const cosmeticProtectionScript = useMemo(
     () =>
@@ -233,7 +302,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
         }
       }
     },
-    [mode],
+    [cancelScheduledRetry, mode],
   );
 
   const navigate = async () => {
@@ -508,6 +577,46 @@ export function BrowserScreen({ mode, onClose }: Props) {
     }
   };
 
+  if (closeState !== 'open') {
+    const closeFailed = closeState === 'failed';
+    return (
+      <View
+        accessibilityViewIsModal
+        style={[styles.screen, styles.closeState]}
+        testID="browser-close-state"
+      >
+        {closeFailed ? null : (
+          <ActivityIndicator color={colors.violet} size="large" />
+        )}
+        <Text style={styles.closeStateTitle}>
+          {closeFailed
+            ? 'Browser close needs confirmation'
+            : 'Closing browser safely'}
+        </Text>
+        <Text style={styles.closeStateText}>
+          {closeFailed
+            ? 'The page stays closed. Retry the close confirmation; browsing will not resume.'
+            : 'The page is closed while MASQ confirms that browser traffic is blocked.'}
+        </Text>
+        {closeError ? (
+          <Text accessibilityRole="alert" style={styles.closeStateError}>
+            {closeError}
+          </Text>
+        ) : null}
+        {closeFailed ? (
+          <Pressable
+            accessibilityLabel="Retry closing browser"
+            accessibilityRole="button"
+            onPress={() => closeBrowser().catch(() => undefined)}
+            style={styles.closeStateButton}
+          >
+            <Text style={styles.closeStateButtonText}>Retry close</Text>
+          </Pressable>
+        ) : null}
+      </View>
+    );
+  }
+
   return (
     <View style={styles.screen}>
       <View style={styles.topBar}>
@@ -516,10 +625,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
             isMasq ? 'Close private browser' : 'Close direct browser'
           }
           accessibilityRole="button"
-          onPress={() => {
-            cancelScheduledRetry();
-            onClose();
-          }}
+          onPress={() => closeBrowser().catch(() => undefined)}
           style={styles.iconButton}
         >
           <Text style={styles.close}>×</Text>
@@ -737,11 +843,11 @@ export function BrowserScreen({ mode, onClose }: Props) {
                 ) : (
                   <Text style={styles.protectionHint}>
                     Remembered sign-in stores WebView cookies and website data
-                    in the selected MASQ or Direct profile. Cross-site links
-                    and redirects switch profiles. Android blocks top-frame
-                    non-GET forms that could bypass that switch. MASQ never
-                    reads passwords or session tokens. Some providers,
-                    including Google, may refuse embedded sign-in.
+                    in the selected MASQ or Direct profile. Cross-site links and
+                    redirects switch profiles. Android blocks top-frame non-GET
+                    forms that could bypass that switch. MASQ never reads
+                    passwords or session tokens. Some providers, including
+                    Google, may refuse embedded sign-in.
                   </Text>
                 )}
                 <View style={styles.siteActions}>
@@ -1042,6 +1148,48 @@ function browserAddressError(caught: unknown): string {
 
 const styles = StyleSheet.create({
   screen: { backgroundColor: colors.ink, flex: 1 },
+  closeState: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  closeStateTitle: {
+    color: colors.white,
+    fontSize: 21,
+    fontWeight: '800',
+    marginTop: 18,
+    textAlign: 'center',
+  },
+  closeStateText: {
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 10,
+    maxWidth: 420,
+    textAlign: 'center',
+  },
+  closeStateError: {
+    color: '#FF9EAB',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 12,
+    maxWidth: 420,
+    textAlign: 'center',
+  },
+  closeStateButton: {
+    backgroundColor: colors.violet,
+    borderRadius: radii.medium,
+    marginTop: 20,
+    minWidth: 150,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  closeStateButtonText: {
+    color: colors.white,
+    fontSize: 14,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
   topBar: {
     alignItems: 'center',
     flexDirection: 'row',

@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::config::{Chain, MobileConfig};
 #[cfg(feature = "node-engine")]
-use crate::engine::EngineHandle;
+use crate::engine::{EngineHandle, RetryConnectionOutcome};
 use crate::wallet::WalletMaterial;
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -158,20 +158,30 @@ impl MobileCore {
                 return Ok(());
             }
             if let Some(engine) = self.engine.as_mut() {
-                engine.retry_connection(
+                let retry_outcome = engine.retry_connection(
                     &self
                         .config
                         .as_ref()
                         .expect("configuration checked above")
                         .neighbors,
                 )?;
-                self.phase = Phase::Connecting;
-                self.proxy_enabled = false;
-                self.connected_neighbors = 0;
-                self.route_hops = 0;
-                self.last_error = None;
-                self.refresh_engine_status();
-                return Ok(());
+                match retry_outcome {
+                    RetryConnectionOutcome::RetriedInPlace => {
+                        self.phase = Phase::Connecting;
+                        self.proxy_enabled = false;
+                        self.connected_neighbors = 0;
+                        self.route_hops = 0;
+                        self.last_error = None;
+                        self.refresh_engine_status();
+                        return Ok(());
+                    }
+                    RetryConnectionOutcome::RestartRequired => {
+                        // The old JoinHandle was already observed as finished
+                        // and reaped. A live embedded runtime is never stopped
+                        // merely because refreshed descriptors differ.
+                        self.engine.take();
+                    }
+                }
             }
             let engine = match EngineHandle::start(
                 self.config.as_ref().expect("configuration checked above"),
@@ -297,8 +307,8 @@ impl MobileCore {
         use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
         use std::time::Duration;
 
-        if !self.proxy_enabled || !matches!(self.phase, Phase::Connected) {
-            return self.fail("Enable a connected MASQ browser route before testing it.");
+        if !matches!(self.phase, Phase::Connected) {
+            return self.fail("Connect a MASQ route before testing it.");
         }
         let port = self
             .proxy_port
@@ -431,9 +441,14 @@ impl MobileCore {
                 } else {
                     self.phase = Phase::Error;
                     self.proxy_enabled = false;
-                    self.last_error = Some(format!(
-                        "The embedded MASQ Node stopped with code {exit_code}. Check the Node log."
-                    ));
+                    self.last_error = snapshot
+                        .last_connection_error
+                        .filter(|error| error.starts_with("E_CORE_PANIC_LOCATION:"))
+                        .or_else(|| {
+                            Some(format!(
+                                "The embedded MASQ Node stopped with code {exit_code}. Check the Node log."
+                            ))
+                        });
                 }
             }
         }
@@ -442,26 +457,56 @@ impl MobileCore {
 
 #[cfg(feature = "node-engine")]
 fn connection_timeout_message(snapshot: &crate::engine::EngineSnapshot) -> Option<String> {
-    if snapshot.running_for < std::time::Duration::from_secs(12) {
+    connection_timeout_message_for_milestone(
+        snapshot,
+        node_lib::mobile_runtime::entry_handshake_milestone(),
+    )
+}
+
+#[cfg(feature = "node-engine")]
+fn connection_timeout_message_for_milestone(
+    snapshot: &crate::engine::EngineSnapshot,
+    milestone: node_lib::mobile_runtime::EntryHandshakeMilestone,
+) -> Option<String> {
+    use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+    if snapshot.running_for < std::time::Duration::from_secs(32) {
         return None;
     }
-    match snapshot.last_connection_error.as_deref() {
-        Some(error) if error.contains("Operation not permitted") => Some(
-            "The operating system blocked the TCP connection to the MASQ entry nodes. Allow network access for MASQ in device settings, then try again."
+
+    // A pass loop is a protocol-level terminal signal and is more useful than
+    // the transport milestone that happened before it. It remains fixed text:
+    // no descriptor, address, identity, payload, or OS error is surfaced.
+    if snapshot
+        .last_connection_error
+        .as_deref()
+        .map(|error| error.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
+        .unwrap_or(false)
+    {
+        return Some(
+            "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop."
                 .to_owned(),
-        ),
-        Some(error) if error.contains("timed out") => Some(
-            "The MASQ entry nodes did not answer in time. Open Node & wallet settings to select fresh nodes."
-                .to_owned(),
-        ),
-        Some(error) => Some(format!(
-            "The MASQ entry-node handshake failed: {error}. Open Node & wallet settings to select fresh nodes."
-        )),
-        None => Some(
-            "MASQ is still waiting for an entry node. Check the device network connection or select fresh nodes."
-                .to_owned(),
-        ),
+        );
     }
+
+    let message = match milestone {
+        EntryHandshakeMilestone::None => {
+            "E_ENTRY_TCP_FAILED: MASQ could not establish an entry-node TCP transport."
+        }
+        EntryHandshakeMilestone::TcpConnected => {
+            "E_ENTRY_DEBUT_NOT_WRITTEN: MASQ could not confirm writing the entry handshake."
+        }
+        EntryHandshakeMilestone::DebutBytesWritten => {
+            "E_ENTRY_NO_INBOUND_BYTES: MASQ wrote the entry handshake but received no reply bytes."
+        }
+        EntryHandshakeMilestone::InboundBytesReceived => {
+            "E_ENTRY_INBOUND_NOT_ACCEPTED: MASQ received entry reply bytes, but they were not accepted as valid gossip."
+        }
+        EntryHandshakeMilestone::GossipAccepted => {
+            "E_ENTRY_GOSSIP_NOT_PROMOTED: MASQ accepted entry gossip, but the connection did not advance to a usable neighbor."
+        }
+    };
+    Some(message.to_owned())
 }
 
 fn engine_available() -> bool {
@@ -603,16 +648,73 @@ mod tests {
     #[cfg(feature = "node-engine")]
     #[test]
     fn delays_entry_node_errors_during_the_initial_retry_window() {
-        let snapshot = engine_snapshot(Some("Operation not permitted (os error 1)"), 11);
-        assert_eq!(connection_timeout_message(&snapshot), None);
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let snapshot = engine_snapshot(None, 31);
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &snapshot,
+                EntryHandshakeMilestone::GossipAccepted
+            ),
+            None
+        );
     }
 
     #[cfg(feature = "node-engine")]
     #[test]
-    fn explains_operating_system_socket_denials_after_the_retry_window() {
-        let snapshot = engine_snapshot(Some("Operation not permitted (os error 1)"), 12);
-        assert!(connection_timeout_message(&snapshot)
-            .expect("diagnostic expected")
-            .contains("Allow network access"));
+    fn entry_timeout_codes_identify_the_last_privacy_safe_handshake_milestone() {
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let snapshot = engine_snapshot(None, 32);
+        let cases = [
+            (EntryHandshakeMilestone::None, "E_ENTRY_TCP_FAILED:"),
+            (
+                EntryHandshakeMilestone::TcpConnected,
+                "E_ENTRY_DEBUT_NOT_WRITTEN:",
+            ),
+            (
+                EntryHandshakeMilestone::DebutBytesWritten,
+                "E_ENTRY_NO_INBOUND_BYTES:",
+            ),
+            (
+                EntryHandshakeMilestone::InboundBytesReceived,
+                "E_ENTRY_INBOUND_NOT_ACCEPTED:",
+            ),
+            (
+                EntryHandshakeMilestone::GossipAccepted,
+                "E_ENTRY_GOSSIP_NOT_PROMOTED:",
+            ),
+        ];
+
+        for (milestone, expected_code) in cases {
+            let message = connection_timeout_message_for_milestone(&snapshot, milestone)
+                .expect("diagnostic expected");
+            assert!(
+                message.starts_with(expected_code),
+                "expected {expected_code}, got {message}"
+            );
+        }
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn pass_loop_code_takes_priority_over_transport_milestones() {
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let snapshot = engine_snapshot(
+            Some("E_ENTRY_GOSSIP_PASS_LOOP: internal fixed diagnostic"),
+            32,
+        );
+
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &snapshot,
+                EntryHandshakeMilestone::InboundBytesReceived
+            ),
+            Some(
+                "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop."
+                    .to_owned()
+            )
+        );
     }
 }

@@ -95,6 +95,11 @@ if (configuredNodeFinderUrl && !validateNodeFinderUrl(configuredNodeFinderUrl)) 
 def debugNodeFinderUrl = configuredNodeFinderUrl ?: "https://dev2.api.masq.ai"
 def releaseNodeFinderUrl = configuredNodeFinderUrl ?: ""
 def nativePathRemapFlag = "-ffile-prefix-map=${System.getProperty('user.home')}=/build/source"
+def unsafeSystemRoutingDogfoodEnabled =
+    System.getenv("MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD") == "YES"
+def applicationLabelResource = unsafeSystemRoutingDogfoodEnabled ?
+    "@string/app_name_dogfood" :
+    "@string/app_name"
 
 android {
     ndkVersion rootProject.ext.ndkVersion
@@ -104,11 +109,26 @@ android {
     namespace "com.masqmobile"
     defaultConfig {
         applicationId "com.endthecb2.masqmobile"
+        if (unsafeSystemRoutingDogfoodEnabled) {
+            // A distinct application ID gives dogfood its own Android data sandbox,
+            // so it cannot replace the public app or read its wallet/profile data.
+            applicationIdSuffix ".dogfood"
+            versionNameSuffix "-dogfood"
+        }
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 4
-        versionName "1.0.0-preview.4"
-        buildConfigField "boolean", "MASQ_SYSTEM_TUNNEL_ENABLED", "false"
+        versionCode 6
+        versionName "1.0.0-preview.6"
+        if (unsafeSystemRoutingDogfoodEnabled) {
+            // Keep internal dogfood artifacts visibly distinct from public preview.6.
+            versionCode 6006
+        }
+        manifestPlaceholders = [masqAppLabel: applicationLabelResource]
+        buildConfigField(
+            "boolean",
+            "MASQ_SYSTEM_TUNNEL_ENABLED",
+            unsafeSystemRoutingDogfoodEnabled.toString()
+        )
         ndk {
             // The embedded MASQ core is built for modern 64-bit devices and emulators.
             abiFilters "arm64-v8a", "x86_64"
@@ -174,8 +194,11 @@ tasks.matching { it.name == "preBuild" }.configureEach {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+    // Keep node discovery on the same pinned OkHttp line as this React Native version.
+    implementation("com.squareup.okhttp3:okhttp:4.9.2")
     implementation("androidx.webkit:webkit:1.16.0")
     implementation("androidx.core:core-ktx:1.17.0")
+    testImplementation("junit:junit:4.13.2")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

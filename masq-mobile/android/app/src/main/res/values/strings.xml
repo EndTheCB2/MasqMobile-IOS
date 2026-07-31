@@ -1,3 +1,4 @@
 <resources>
-    <string name="app_name">MASQ</string>
+    <string name="app_name">Masq Community Mobile version</string>
+    <string name="app_name_dogfood">MASQ Dogfood (Unsafe)</string>
 </resources>

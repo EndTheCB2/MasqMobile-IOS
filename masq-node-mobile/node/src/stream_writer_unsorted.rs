@@ -67,6 +67,11 @@ impl Future for StreamWriterUnsorted {
                         }
                         Ok(Async::Ready(len)) => {
                             consecutive_write_errors = 0;
+                            if len > 0 {
+                                crate::mobile_runtime::report_entry_handshake_milestone(
+                                    crate::mobile_runtime::EntryHandshakeMilestone::DebutBytesWritten,
+                                );
+                            }
                             debug!(
                                 self.logger,
                                 "Wrote {}/{} bytes of clandestine data",

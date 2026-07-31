@@ -87,6 +87,36 @@ the page is blocked rather than loaded through the device's direct connection. A
 switches the browser to direct networking. The public iOS build does not claim to protect traffic
 from other apps.
 
+### Android system-routing dogfood
+
+Whole-device and selected-app routing are available only in a separately compiled Android
+**MASQ Dogfood (Unsafe)** package, not in the public preview. When the user explicitly selects
+apps, their Android package IDs and the consent timestamp are stored only in that dogfood app's
+private local preferences; they are not sent to the maintainer. Android applies VPN inclusion by
+UID, so apps that share a UID can share routing behavior, attached restricted profiles may also
+receive the scope, and a work-profile copy belongs to a separate Android user/profile scope. MASQ
+packages installed when the route is established are excluded so their Node/control traffic and
+explicit Direct browsers do not loop through that TUN.
+
+This internal adapter translates only captured IPv4 TCP connections to port 443 and virtual DNS
+through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and
+unknown transports—remains blocked only while Android still reports a valid TUN capture. Activation
+opens a real HTTP CONNECT tunnel to `example.com:443` through the current MASQ exit as a reachability
+test; it does not request a page or response body. Android snapshots package-to-UID inclusion and
+exclusion when the TUN is established. Turn routing off before installing, removing, enabling,
+disabling or updating apps, then reapply it; otherwise the saved selection/exclusion may no longer
+match the running UID scope. On Android 13 or later, activation is refused unless notification
+permission is granted so the ongoing unsafe-routing state remains visible; turning routing off
+does not require that permission.
+
+Revoking VPN permission, or termination of the service or app process, can restore direct
+networking; the dogfood build is not a fail-closed VPN guarantee. Android Always-on VPN and “Block
+connections without VPN”/lockdown mode are unsupported. The local loopback MASQ proxy is
+unauthenticated; a malicious local app that discovers its temporary port could use the route and
+consume wallet funds. This dogfood mode must not be represented as protecting all traffic and must
+not be publicly distributed until package-change recovery and per-run local proxy authentication
+or peer-UID enforcement are implemented.
+
 ### Direct browsing
 
 **Browse without MASQ** is a separate action that requires an explicit confirmation for every

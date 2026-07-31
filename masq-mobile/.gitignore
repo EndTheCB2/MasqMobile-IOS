@@ -38,6 +38,8 @@ local.properties
 # node.js
 #
 node_modules/
+# Git treats a dependency-directory symlink as a file, so keep that form untracked too.
+node_modules
 npm-debug.log
 yarn-error.log
 
