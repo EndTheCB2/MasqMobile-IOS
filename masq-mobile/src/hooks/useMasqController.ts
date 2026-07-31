@@ -173,6 +173,11 @@ export function useMasqController() {
             walletSecret: '',
           }
         : { ...DEFAULT_SETUP, neighbors: [], walletSecret: '' };
+      desiredConnected.current =
+        initialStatus.phase === 'connecting' ||
+        (initialStatus.phase === 'connected' &&
+          initialStatus.connectedNeighbors > 0 &&
+          initialStatus.routeStage > 0);
       setStatus(initialStatus);
       setNetwork(initialNetwork);
       setDraft(loadedDraft);
@@ -739,7 +744,6 @@ export function useMasqController() {
     const subscription = AppState.addEventListener('change', nextState => {
       const resumeEpoch = ++appStateResumeEpoch.current;
       if (nextState !== 'active') {
-        cancelConnectionAttempt();
         masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
         return;
       }
@@ -775,7 +779,8 @@ export function useMasqController() {
           nextNetwork.available &&
           !(
             nextStatus.phase === 'connected' &&
-            nextStatus.connectedNeighbors > 0
+            nextStatus.connectedNeighbors > 0 &&
+            nextStatus.routeStage > 0
           )
         ) {
           await connect();
@@ -788,7 +793,7 @@ export function useMasqController() {
       appStateResumeEpoch.current += 1;
       subscription.remove();
     };
-  }, [cancelConnectionAttempt, connect]);
+  }, [connect]);
 
   useEffect(
     () => () => {

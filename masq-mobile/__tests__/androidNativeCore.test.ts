@@ -32,6 +32,12 @@ describe('Android native MASQ core integration', () => {
   const vpnService = read(
     'android/app/src/main/java/com/masqmobile/MasqVpnService.kt',
   );
+  const sessionService = read(
+    'android/app/src/main/java/com/masqmobile/MasqSessionService.kt',
+  );
+  const backgroundRecovery = read(
+    'android/app/src/main/java/com/masqmobile/MasqBackgroundSessionRecovery.kt',
+  );
   const packetJni = read(
     'android/app/src/main/java/com/masqmobile/MasqPacketTunnelJni.kt',
   );
@@ -927,6 +933,89 @@ describe('Android native MASQ core integration', () => {
     );
   });
 
+  it('keeps only the user-requested consumer session alive during screen lock', () => {
+    const recoveryRequest = sessionService.slice(
+      sessionService.indexOf('private fun requestRecovery('),
+      sessionService.indexOf('private fun cancelRecovery()'),
+    );
+    const wakeAcquisition = sessionService.slice(
+      sessionService.indexOf('private fun acquireTimedWakeLock('),
+      sessionService.indexOf('private fun releaseWakeLock()'),
+    );
+
+    expect(manifest).toContain('android.permission.WAKE_LOCK');
+    expect(manifest).toContain('android:name=".MasqSessionService"');
+    expect(manifest).toContain('android:foregroundServiceType="specialUse"');
+    expect(manifest).toContain('android:stopWithTask="false"');
+    expect(manifest).toContain(
+      'User-initiated MASQ consumer peer session kept active while the screen is locked',
+    );
+    expect(sessionService).toContain(
+      'class MasqSessionService : Service()',
+    );
+    expect(sessionService).not.toContain(
+      'class MasqSessionService : VpnService()',
+    );
+    expect(sessionService).toContain(
+      'PowerManager.PARTIAL_WAKE_LOCK',
+    );
+    expect(sessionService).toContain('setReferenceCounted(false)');
+    expect(sessionService).toContain(
+      'lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS)',
+    );
+    expect(wakeAcquisition).toContain(
+      'val scheduleRenewal = forceRenewal || !lock.isHeld',
+    );
+    expect(wakeAcquisition.indexOf('if (scheduleRenewal)')).toBeLessThan(
+      wakeAcquisition.indexOf(
+        'mainHandler.removeCallbacks(renewWakeLockRunnable)',
+      ),
+    );
+    expect(sessionService).toContain('runCatching { lock.release() }');
+    expect(sessionService).toContain('ServiceCompat.startForeground(');
+    expect(sessionService).toContain(
+      'ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE',
+    );
+    expect(sessionService).toContain('.setOngoing(true)');
+    expect(sessionService).toContain('return START_STICKY');
+    expect(sessionService).toContain('return START_NOT_STICKY');
+    expect(sessionService).toContain('MasqCoreLifecycle.executor.execute');
+    expect(sessionService).toContain('MasqSessionIntentStore(context)');
+    expect(sessionService).toContain(
+      'activeInstance.get()?.adoptGeneration',
+    );
+    expect(sessionService).toContain(
+      'screenOff && networkAvailable && cpuRequired',
+    );
+    expect(sessionService).toContain(
+      'phase == "connected" && connectedNeighbors > 0 && routeStage > 0',
+    );
+    expect(sessionService).toContain(
+      'NetworkCapabilities.NET_CAPABILITY_VALIDATED',
+    );
+    expect(sessionService).toContain('CONNECTING_PROGRESS_TIMEOUT_MILLIS');
+    expect(sessionService).toContain('recoveryEpoch.incrementAndGet()');
+    expect(sessionService).toContain('stopSelfResult(startId)');
+    expect(sessionService).toContain(
+      'requestRecovery(nextRecoveryDelayMillis())',
+    );
+    expect(recoveryRequest.indexOf('cpuRequired = true')).toBeLessThan(
+      recoveryRequest.indexOf(
+        'if (recoveryRunningToken != NO_RECOVERY_TOKEN) return',
+      ),
+    );
+    expect(backgroundRecovery).toContain('SecureWalletStore(context)');
+    expect(backgroundRecovery).toContain('entryNodeDiscovery.discover(');
+    expect(backgroundRecovery).toContain('MasqCoreJni.nativeStart()');
+    expect(backgroundRecovery).toContain(
+      'MasqCoreLifecycle.startGeneration.get() == recoveryGeneration',
+    );
+    expect(backgroundRecovery.indexOf('entryNodeDiscovery.discover('))
+      .toBeLessThan(backgroundRecovery.indexOf('walletStore.load()'));
+    expect(sessionService).not.toContain('VpnService.prepare');
+    expect(sessionService).not.toContain('.Builder()');
+  });
+
   it('cleans up Android native executors and pending tunnel acknowledgements', () => {
     const invalidation = moduleSource.slice(
       moduleSource.indexOf('override fun invalidate()'),
@@ -1213,14 +1302,31 @@ describe('Android native MASQ core integration', () => {
       'MasqCoreJni.nativeStart()',
       configureIndex,
     );
+    const backgroundStart = sessionService.slice(
+      sessionService.indexOf('fun start(context: Context): Long'),
+      sessionService.indexOf('fun stop(context: Context): Boolean'),
+    );
 
     expect(moduleSource).toContain('internal object MasqCoreLifecycle');
     expect(moduleSource).toContain('val startGeneration = AtomicLong(0L)');
     expect(moduleSource).toContain(
       'val executor = Executors.newSingleThreadExecutor()',
     );
-    expect(start).toContain(
+    expect(backgroundStart).toContain(
       'MasqCoreLifecycle.startGeneration.incrementAndGet()',
+    );
+    expect(
+      backgroundStart.indexOf(
+        'activeInstance.get()?.recoveryEpoch?.incrementAndGet()',
+      ),
+    ).toBeLessThan(
+      backgroundStart.indexOf(
+        'MasqCoreLifecycle.startGeneration.incrementAndGet()',
+      ),
+    );
+    expect(backgroundStart).toContain('intentStore.clearDesiredFailClosed()');
+    expect(start.indexOf('MasqSessionService.start(')).toBeLessThan(
+      start.indexOf('MasqCoreLifecycle.executor.execute'),
     );
     expect(start).toContain('catch (_: StaleStartException)');
     expect(start).not.toContain('promise.resolve(MasqCoreJni.nativeStart())');
@@ -1249,10 +1355,16 @@ describe('Android native MASQ core integration', () => {
     expect(stop.indexOf('invalidatePendingStarts()')).toBeLessThan(
       stop.indexOf('MasqCoreLifecycle.executor.execute'),
     );
+    expect(stop.indexOf('MasqSessionService.stop(')).toBeLessThan(
+      stop.indexOf('MasqCoreLifecycle.executor.execute'),
+    );
     expect(stop.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
       stop.indexOf('MasqCoreJni.nativeStop()'),
     );
     expect(shutdown.indexOf('invalidatePendingStarts()')).toBeLessThan(
+      shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
+    );
+    expect(shutdown.indexOf('MasqSessionService.stop(')).toBeLessThan(
       shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
     );
     expect(
@@ -1264,6 +1376,7 @@ describe('Android native MASQ core integration', () => {
       'promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)',
     );
     expect(rejection).toContain('} else if (error == null) {');
+    expect(rejection).not.toContain('MasqSessionService.stop');
   });
 
   it('serializes destructive Android actions behind one process-global start fence', () => {

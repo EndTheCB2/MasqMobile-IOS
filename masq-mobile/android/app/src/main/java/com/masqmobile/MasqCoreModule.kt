@@ -561,14 +561,21 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun start(promise: Promise) {
-    val generation =
-        synchronized(MasqCoreLifecycle.lock) {
-          MasqCoreLifecycle.startGeneration.incrementAndGet()
-        }
     if (!MasqCoreJni.isAvailable) {
       promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
       return
     }
+    val generation =
+        try {
+          MasqSessionService.start(reactApplicationContext)
+        } catch (error: RuntimeException) {
+          promise.reject(
+              "E_BACKGROUND_SESSION_START",
+              "Android could not keep the MASQ connection active while the app is in the background.",
+              error,
+          )
+          return
+        }
     MasqCoreLifecycle.executor.execute {
       try {
         requireCurrentStart(generation)
@@ -713,13 +720,18 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun stop(promise: Promise) {
     invalidatePendingStarts()
+    val backgroundIntentCleared = MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
-      promise.resolve(statusJson())
+      resolveBackgroundSessionStop(promise, backgroundIntentCleared, statusJson())
       return
     }
     MasqCoreLifecycle.executor.execute {
       try {
-        promise.resolve(MasqCoreJni.nativeStop())
+        resolveBackgroundSessionStop(
+            promise,
+            backgroundIntentCleared,
+            MasqCoreJni.nativeStop(),
+        )
       } catch (error: RuntimeException) {
         promise.reject("E_CORE_STOP", "The MASQ core could not be stopped.", error)
       }
@@ -728,13 +740,18 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun shutdown(promise: Promise) {
     invalidatePendingStarts()
+    val backgroundIntentCleared = MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
-      promise.resolve(statusJson())
+      resolveBackgroundSessionStop(promise, backgroundIntentCleared, statusJson())
       return
     }
     MasqCoreLifecycle.executor.execute {
       try {
-        promise.resolve(MasqCoreJni.nativeShutdown())
+        resolveBackgroundSessionStop(
+            promise,
+            backgroundIntentCleared,
+            MasqCoreJni.nativeShutdown(),
+        )
       } catch (error: RuntimeException) {
         promise.reject(
             "E_CORE_SHUTDOWN",
@@ -742,6 +759,21 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             error,
         )
       }
+    }
+  }
+
+  private fun resolveBackgroundSessionStop(
+      promise: Promise,
+      backgroundIntentCleared: Boolean,
+      status: String,
+  ) {
+    if (backgroundIntentCleared) {
+      promise.resolve(status)
+    } else {
+      promise.reject(
+          "E_BACKGROUND_SESSION_STOP",
+          "The MASQ connection was stopped, but Android could not persist the disconnected state.",
+      )
     }
   }
 
@@ -799,6 +831,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun reset(promise: Promise) {
+    invalidatePendingStarts()
+    MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
       promise.reject(
           "E_CORE_UNAVAILABLE",
@@ -806,7 +840,6 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       )
       return
     }
-    invalidatePendingStarts()
     resetSystemTunnelForFullReset(promise)
   }
 
@@ -957,6 +990,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun resetNetworkProfile(promise: Promise) {
     invalidatePendingStarts()
+    MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
       promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
       return
@@ -1108,6 +1142,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun removeWallet(promise: Promise) {
     invalidatePendingStarts()
+    MasqSessionService.stop(reactApplicationContext)
     MasqCoreLifecycle.executor.execute {
       if (!MasqCoreJni.isAvailable) {
         promise.reject(

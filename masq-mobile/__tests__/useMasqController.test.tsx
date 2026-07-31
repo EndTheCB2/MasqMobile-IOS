@@ -922,7 +922,7 @@ describe('useMasqController entry-node connection lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('waits for an abandoned background start before resuming a stale connecting engine', async () => {
+  it('keeps an in-flight connection alive across screen lock and backgrounding', async () => {
     let appStateListener!: (state: AppStateStatus) => void;
     jest
       .spyOn(AppState, 'addEventListener')
@@ -931,62 +931,49 @@ describe('useMasqController entry-node connection lifecycle', () => {
         return { remove: jest.fn() };
       });
     const firstNativeStart = deferred<CoreStatus>();
-    let firstNativeStartSettled = false;
     const connectedStatus: CoreStatus = {
       ...CONFIGURED_STATUS,
       connectedNeighbors: 1,
       phase: 'connected',
+      routeStage: 1,
     };
-    const start = jest
-      .spyOn(masqCore, 'start')
-      .mockImplementationOnce(() =>
-        firstNativeStart.promise.finally(() => {
-          firstNativeStartSettled = true;
-        }),
-      )
-      .mockImplementationOnce(async () => {
-        expect(firstNativeStartSettled).toBe(true);
-        return connectedStatus;
-      });
     jest
       .mocked(masqCore.getStatus)
       .mockResolvedValueOnce({ ...CONFIGURED_STATUS })
-      .mockResolvedValueOnce({
-        ...CONFIGURED_STATUS,
-        phase: 'connecting',
-      });
+      .mockResolvedValue(connectedStatus);
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockImplementationOnce(() => firstNativeStart.promise);
     const shutdown = jest.spyOn(masqCore, 'shutdown');
+    const setBrowserRoutingMode = jest.spyOn(
+      masqCore,
+      'setBrowserRoutingMode',
+    );
     const reset = jest.spyOn(masqCore, 'reset');
     const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const removeWallet = jest.spyOn(masqCore, 'removeWallet');
     const renderer = await renderController(value => {
       current = value;
     });
-    let abandonedConnection!: Promise<unknown>;
+    let connection!: Promise<CoreStatus>;
 
     await ReactTestRenderer.act(async () => {
-      abandonedConnection = current.connect().catch(error => error);
+      connection = current.connect();
       await Promise.resolve();
     });
     expect(start).toHaveBeenCalledTimes(1);
 
     ReactTestRenderer.act(() => appStateListener('background'));
-    ReactTestRenderer.act(() => appStateListener('active'));
     await ReactTestRenderer.act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(start).toHaveBeenCalledTimes(1);
+    expect(setBrowserRoutingMode).toHaveBeenCalledWith('blocked');
 
-    // A second background event invalidates the pending resume. It must not
-    // restart MASQ after the old native call eventually settles.
-    ReactTestRenderer.act(() => appStateListener('background'));
     await ReactTestRenderer.act(async () => {
-      firstNativeStart.resolve({
-        ...CONFIGURED_STATUS,
-        phase: 'connecting',
-      });
-      await abandonedConnection;
+      firstNativeStart.resolve(connectedStatus);
+      await connection;
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -997,11 +984,9 @@ describe('useMasqController entry-node connection lifecycle', () => {
       appStateListener('active');
       await Promise.resolve();
       await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
     });
 
-    expect(start).toHaveBeenCalledTimes(2);
+    expect(start).toHaveBeenCalledTimes(1);
     expect(current.status).toEqual(connectedStatus);
     expect(current.entryNodeRefresh).toBeNull();
     expect(current.busy).toBe(false);
