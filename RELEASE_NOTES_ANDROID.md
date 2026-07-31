@@ -19,7 +19,7 @@ before installing or updating.
 
 ## Updating
 
-Preview.2 through preview.5 users can install preview.6 directly over the existing app. Do not
+Preview.2 through preview.4 users can install preview.6 directly over the existing app. Do not
 uninstall or reset the app: preview.6 retains the same package ID and signing certificate, so
 Android preserves local wallet and profile data.
 
@@ -33,8 +33,17 @@ Uninstalling without that backup removes the locally encrypted wallet and profil
 not affected. Future releases must retain preview.2 certificate SHA-256
 `346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`.
 
-## Improvements since preview.5
+## Improvements since preview.4
 
+- A user-requested MASQ consumer session now runs in an Android foreground service, allowing the
+  connection to remain active when the app is backgrounded or the screen is locked.
+- A bounded screen-off CPU lease is renewed only while MASQ needs it and is released when the
+  screen turns on, the user disconnects, or validated network access disappears.
+- If Android reclaims the app process, the service can restore the saved consumer profile and
+  device-encrypted wallet, rediscover entry nodes, and retry the private connection without
+  enabling whole-device VPN routing.
+- Connection health now requires a real entry peer and route progress; stalled or zero-peer states
+  trigger bounded automatic recovery instead of showing a false connected state.
 - Profile-dependent actions remain disabled until saved native status and configuration have both
   been restored, preventing startup taps from using temporary defaults.
 - A configured native core without a matching saved profile now fails closed with a retry action
@@ -66,6 +75,8 @@ not affected. Future releases must retain preview.2 certificate SHA-256
 - ENS `.eth` websites through the eth.limo HTTPS gateway without search or Direct fallback.
 - Temporary WebView sessions by default. Remembered exact-host sign-ins are offered only when the
   installed Android WebView supports isolated multi-profile storage.
+- A persistent, low-priority Android notification while a requested MASQ connection is active in
+  the background.
 
 ## Service disclosure
 
@@ -84,6 +95,9 @@ not a Google Play production release.
   device connection.
 - Direct browsing exposes the public IP of the current connection or VPN.
 - Whole-device and selected-app routing cannot be started in this preview.
+- Keeping a connection active while the screen is off can increase battery use. Android Doze,
+  manufacturer battery policies, loss of validated network access, or a user force-stop can still
+  suspend or end the connection.
 - Browser protection is best effort and does not claim YouTube ad blocking.
 - GitHub-installed builds do not update automatically.
 - Back up the wallet recovery phrase before uninstalling. Never post it in a GitHub issue.

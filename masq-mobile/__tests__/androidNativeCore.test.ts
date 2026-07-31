@@ -359,6 +359,9 @@ describe('Android native MASQ core integration', () => {
     expect(strings).toContain(
       '<string name="app_name_dogfood">MASQ Dogfood (Unsafe)</string>',
     );
+    expect(strings).toContain(
+      '<string name="app_name">Masq Community Mobile version</string>',
+    );
     expect(gradle).toContain(
       '"MASQ_SYSTEM_TUNNEL_ENABLED",\n            unsafeSystemRoutingDogfoodEnabled.toString()',
     );

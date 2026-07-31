@@ -76,6 +76,10 @@ or from GitHub.
 - The app consumes MASQ routes; it does not serve traffic for other peers.
 - **MASQ Private** fails closed. It does not silently fall back to the device connection.
 - **Browse without MASQ** is an explicit direct mode and exposes the connection's normal public IP.
+- After the user connects, Android shows a persistent low-priority notification so the consumer
+  session can remain active while the app is backgrounded or the screen is locked.
+- Screen-off operation can increase battery use. Android Doze, manufacturer battery restrictions,
+  loss of validated network access, or a user force-stop can still suspend or end the connection.
 - Android whole-device and selected-app routing is withheld from this public preview until the
   complete `VpnService` lifecycle passes fail-closed leak testing.
 - Browser protection is best effort. This public build does not claim YouTube ad blocking.
