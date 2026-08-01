@@ -154,20 +154,22 @@ checksum = "e1a336b00b6906085a0c12756be49e24698b3ce6b0dfbe517029be8cee05f84b"
 
 [[package]]
 name = "bincode-next"
-version = "2.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbe9e7e6d14aeb39557f226bff158a30e367fac279d0e69b8b42fb41999f9a86"
+checksum = "1d6626829353ae29293be5c86f42de5f0468bc758af074b0c7d08f07e538ccbc"
 dependencies = [
  "bincode_derive-next",
+ "pastey",
+ "rapidhash",
  "serde",
  "unty-next",
 ]
 
 [[package]]
 name = "bincode_derive-next"
-version = "2.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2af389a025376dbbe728c43dfa5c08f866116c0b62627787c21ca1c69e2b8dec"
+checksum = "409532b1da3be643427e49c2f79e0c47d445f695e1b028270d9e80e9044d7d1c"
 dependencies = [
  "virtue-next",
 ]
@@ -1256,6 +1258,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,6 +1389,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rapidhash"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "redox_syscall"
@@ -1617,9 +1634,9 @@ dependencies = [
 
 [[package]]
 name = "socks5-impl"
-version = "0.8.7"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9791d88383282983f29c649ecedece00fbaf31cbfb8f1c6e633c022b97918eaa"
+checksum = "603c87de0b9cacb81986f80d5a59acc9341ba05afda3b8dad430d44862d4b97c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1786,9 +1803,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",
@@ -1869,9 +1886,9 @@ dependencies = [
 
 [[package]]
 name = "tun"
-version = "0.8.13"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f5b5535b5fb263435229075e5ccc1cb74ccc01f288650b642b28e0b27869fcd"
+checksum = "8bb55e468c585e02ef89ba7a1a9848871ac942dfc64547ad4d1166b0f61a98be"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -1891,9 +1908,9 @@ dependencies = [
 
 [[package]]
 name = "tun2proxy"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "058486886fa3987ca284673b467f52f7c60e22ac6cf5d1e91f2d63b8f024bad4"
+checksum = "0c0c4cb74f5f7df1bdbe11ee8a8ec0202603e1caa5db51f0f757bc92c8886799"
 dependencies = [
  "android_logger",
  "async-trait",
