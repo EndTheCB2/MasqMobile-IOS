@@ -209,6 +209,61 @@ class SystemRoutingStatusTest {
   }
 
   @Test
+  fun revokedCallbackAfterAnExplicitOffStateNormalizesToIdle() {
+    val status =
+        SystemRoutingStatus.derive(
+            supported = true,
+            desiredRevision = null,
+            desiredMode = SystemRoutingMode.OFF,
+            desiredSelectedApps = emptyList(),
+            failClosedDesired = false,
+            appliedRevision = null,
+            appliedMode = SystemRoutingMode.OFF,
+            appliedSelectedApps = emptyList(),
+            transition = SystemRoutingTransition.REVOKED,
+            tunPresent = false,
+            translatorReady = false,
+            coreRouteReady = false,
+            alwaysOn = false,
+            lockdown = false,
+            lastError = SystemRoutingDiagnostic.PERMISSION_REVOKED,
+        )
+
+    assertFalse(status.active)
+    assertEquals(SystemRoutingPhase.OFF, status.phase)
+    assertEquals(SystemRoutingTrafficDisposition.OFF, status.trafficDisposition)
+    assertEquals(null, status.lastError)
+  }
+
+  @Test
+  fun revokedOffStateDoesNotHideATunnelCleanupFailure() {
+    val status =
+        SystemRoutingStatus.derive(
+            supported = true,
+            desiredRevision = null,
+            desiredMode = SystemRoutingMode.OFF,
+            desiredSelectedApps = emptyList(),
+            failClosedDesired = false,
+            appliedRevision = null,
+            appliedMode = SystemRoutingMode.OFF,
+            appliedSelectedApps = emptyList(),
+            transition = SystemRoutingTransition.REVOKED,
+            tunPresent = false,
+            translatorReady = false,
+            coreRouteReady = false,
+            alwaysOn = false,
+            lockdown = false,
+            lastError = SystemRoutingDiagnostic.TUNNEL_CLOSE_FAILED,
+        )
+
+    assertEquals(SystemRoutingPhase.REVOKED, status.phase)
+    assertEquals(
+        SystemRoutingDiagnostic.TUNNEL_CLOSE_FAILED,
+        status.lastError,
+    )
+  }
+
+  @Test
   fun selectedPackagesPreserveExactCaseAndRejectWhitespace() {
     val exactCase =
         selectedStatus(

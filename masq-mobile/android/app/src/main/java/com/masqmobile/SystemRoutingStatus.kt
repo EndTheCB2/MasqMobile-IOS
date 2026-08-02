@@ -131,15 +131,34 @@ class SystemRoutingStatus private constructor(
               desiredMode != SystemRoutingMode.OFF &&
               desiredMode == appliedMode &&
               desiredApps == appliedApps
+      // Android can deliver VpnService.onRevoke after an explicit shutdown has
+      // already persisted an off policy and released the TUN. In that terminal
+      // state there is no routing intent left to recover, so retaining a
+      // permission-revoked phase/error would present historical cleanup as a
+      // current fault and trap the UI behind another no-op "Turn off" action.
+      val stalePermissionRevocation =
+          transition == SystemRoutingTransition.REVOKED &&
+              desiredMode == SystemRoutingMode.OFF &&
+              appliedMode == SystemRoutingMode.OFF &&
+              !tunPresent &&
+              (lastError == null ||
+                  lastError == SystemRoutingDiagnostic.PERMISSION_REVOKED)
+      val effectiveTransition =
+          if (stalePermissionRevocation) {
+            SystemRoutingTransition.IDLE
+          } else {
+            transition
+          }
+      val effectiveLastError = if (stalePermissionRevocation) null else lastError
       val routeHealthy =
           supported &&
               policiesMatch &&
               tunPresent &&
               translatorReady &&
               coreRouteReady &&
-              lastError == null
+              effectiveLastError == null
       val phase =
-          when (transition) {
+          when (effectiveTransition) {
             SystemRoutingTransition.REQUESTING_PERMISSION ->
                 SystemRoutingPhase.REQUESTING_PERMISSION
             SystemRoutingTransition.STARTING_BLOCKING ->
@@ -199,7 +218,7 @@ class SystemRoutingStatus private constructor(
           trafficObserved = routeHealthy && trafficObserved,
           alwaysOn = alwaysOn,
           lockdown = lockdown,
-          lastError = lastError,
+          lastError = effectiveLastError,
       )
     }
 
