@@ -95,6 +95,7 @@ simple-server = "0.4.0"
 serial_test_derive = "0.5.1"
 serial_test = "0.5.1"
 test_utilities = { path = "../test_utilities"}
+tempfile = "3.1.0"
 trust-dns-proto = "0.8.0"
 
 [[bin]]
@@ -114,6 +115,7 @@ name = "node_lib"
 path = "src/lib.rs"
 
 [patch.crates-io]
+net2 = { path = "../vendor/net2-0.2.39" }
 web3 = { path = "../vendor/web3-0.11.0" }
 
 #[profile.release]

@@ -25,6 +25,7 @@ export interface MasqConfig {
 export interface CoreStatus {
   phase: CorePhase;
   engineAvailable: boolean;
+  engineGeneration: number;
   proxyEnabled: boolean;
   proxyPort: number | null;
   chain: Chain | null;
@@ -49,6 +50,46 @@ export interface NetworkStatus {
   generation: number;
 }
 
+export interface DebtSummary {
+  totalMasqWei: string;
+  creditorCount: number;
+  settlementInProgress: boolean;
+}
+
+export interface DebtSettlementQuote {
+  quoteId: string;
+  createdAtUnixSeconds: number;
+  expiresAtUnixSeconds: number;
+  totalMasqWei: string;
+  estimatedL2FeeWei: string;
+  masqBalanceWei: string;
+  baseEthBalanceWei: string;
+  creditorCount: number;
+  hasMoreCreditors: boolean;
+  feeEstimateIncludesL1DataFee: false;
+  requiresDeviceAuthentication: false;
+  requiresExplicitConfirmation: true;
+}
+
+export type DebtSettlementPhase =
+  | 'idle'
+  | 'reserved'
+  | 'submitted'
+  | 'attention'
+  | 'failed'
+  | 'completed';
+
+export interface DebtSettlementStatus {
+  operationId: string | null;
+  phase: DebtSettlementPhase;
+  totalMasqWei: string;
+  estimatedL2FeeWei: string;
+  transactionCount: number;
+  confirmedTransactionCount: number;
+  transactionHashes: string[];
+  errorCode: string | null;
+}
+
 export interface SetupDraft extends Omit<MasqConfig, 'configVersion'> {
   configVersion?: number;
   walletImportMode: WalletImportMode;
@@ -63,6 +104,7 @@ export const DEFAULT_RPC_URLS: Record<Chain, string> = {
 export const EMPTY_STATUS: CoreStatus = {
   phase: 'unconfigured',
   engineAvailable: false,
+  engineGeneration: 0,
   proxyEnabled: false,
   proxyPort: null,
   chain: null,

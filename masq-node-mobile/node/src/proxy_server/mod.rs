@@ -1930,6 +1930,7 @@ impl ProxyServer {
                     Some(socket_addr) => {
                         let last_data = response.sequenced_packet.last_data;
                         let sequence_number_opt = Some(browser_sequence_number);
+                        let delivered_bytes = response.sequenced_packet.data.len();
                         self.subs
                             .as_ref()
                             .expect("Dispatcher unbound in ProxyServer")
@@ -1941,6 +1942,7 @@ impl ProxyServer {
                                 data: response.sequenced_packet.data,
                             })
                             .expect("Dispatcher is dead");
+                        crate::mobile_runtime::report_bytes_down(delivered_bytes);
                         if last_data {
                             self.purge_stream_key(
                                 &stream_key,
@@ -2440,6 +2442,7 @@ impl ProxyServer {
                         .expect("Accountant is dead");
                 }
                 args.hopper_sub.try_send(pkg).expect("Hopper is dead");
+                crate::mobile_runtime::report_bytes_up(payload_size);
                 if let Some(shutdown_sub) = args.retire_stream_key_sub_opt {
                     debug!(
                         logger,

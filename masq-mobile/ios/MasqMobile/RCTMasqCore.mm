@@ -915,6 +915,7 @@ using NoArgumentFunction = char *(*)();
 using StringArgumentFunction = char *(*)(const char *);
 using BooleanArgumentFunction = char *(*)(bool);
 using UInt8ArgumentFunction = char *(*)(uint8_t);
+using ThreeStringArgumentFunction = char *(*)(const char *, const char *, const char *);
 using FreeStringFunction = void (*)(char *);
 
 NSString *const MasqConfigDefaultsKey = @"MASQSavedConsumerConfig";
@@ -1348,6 +1349,15 @@ template <> NoArgumentFunction symbol<NoArgumentFunction>(const char *name) {
   if (strcmp(name, "masq_mobile_preflight_proxy") == 0) {
     return &masq_mobile_preflight_proxy;
   }
+  if (strcmp(name, "masq_mobile_get_debt_summary") == 0) {
+    return &masq_mobile_get_debt_summary;
+  }
+  if (strcmp(name, "masq_mobile_prepare_debt_settlement") == 0) {
+    return &masq_mobile_prepare_debt_settlement;
+  }
+  if (strcmp(name, "masq_mobile_get_debt_settlement_status") == 0) {
+    return &masq_mobile_get_debt_settlement_status;
+  }
   return nullptr;
 }
 
@@ -1381,10 +1391,18 @@ template <> FreeStringFunction symbol<FreeStringFunction>(const char *name) {
       : nullptr;
 }
 
+template <>
+ThreeStringArgumentFunction symbol<ThreeStringArgumentFunction>(const char *name) {
+  return strcmp(name, "masq_mobile_confirm_debt_settlement") == 0
+      ? &masq_mobile_confirm_debt_settlement
+      : nullptr;
+}
+
 NSString *unavailableStatus(NSString *reason) {
   NSDictionary *status = @{
     @"phase" : @"blocked",
     @"engineAvailable" : @NO,
+    @"engineGeneration" : @0,
     @"proxyEnabled" : @NO,
     @"proxyPort" : [NSNull null],
     @"chain" : [NSNull null],
@@ -1416,6 +1434,10 @@ bool coreAvailable() {
          symbol<NoArgumentFunction>("masq_mobile_reset_network_profile") != nullptr &&
          symbol<NoArgumentFunction>("masq_mobile_remove_wallet") != nullptr &&
          symbol<NoArgumentFunction>("masq_mobile_preflight_proxy") != nullptr &&
+         symbol<NoArgumentFunction>("masq_mobile_get_debt_summary") != nullptr &&
+         symbol<NoArgumentFunction>("masq_mobile_prepare_debt_settlement") != nullptr &&
+         symbol<NoArgumentFunction>("masq_mobile_get_debt_settlement_status") != nullptr &&
+         symbol<ThreeStringArgumentFunction>("masq_mobile_confirm_debt_settlement") != nullptr &&
          symbol<BooleanArgumentFunction>("masq_mobile_set_proxy_enabled") != nullptr &&
          symbol<FreeStringFunction>("masq_mobile_string_free") != nullptr;
 }
@@ -1569,6 +1591,31 @@ NSString *_Nullable invoke(BooleanArgumentFunction function, bool argument) {
 
 NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
   return copyCoreResult(function(argument));
+}
+
+NSString *_Nullable invoke(ThreeStringArgumentFunction function,
+                            NSString *first,
+                            NSString *second,
+                            NSString *third) {
+  return copyCoreResult(
+      function(first.UTF8String, second.UTF8String, third.UTF8String));
+}
+
+NSString *_Nullable financialResultError(NSString *_Nullable result) {
+  if (![result isKindOfClass:[NSString class]]) {
+    return @"The native MASQ settlement core returned no result.";
+  }
+  NSData *data = [result dataUsingEncoding:NSUTF8StringEncoding];
+  NSDictionary *decoded = data
+      ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil]
+      : nil;
+  if (![decoded isKindOfClass:[NSDictionary class]]) {
+    return @"The native MASQ settlement result is invalid.";
+  }
+  id error = decoded[@"error"];
+  return [error isKindOfClass:[NSString class]] && [error length] > 0
+      ? error
+      : nil;
 }
 
 } // namespace
@@ -2345,6 +2392,94 @@ NSString *_Nullable invoke(UInt8ArgumentFunction function, uint8_t argument) {
         return;
       }
       resolve(result);
+    }
+  });
+}
+
+- (void)getDebtSummary:(RCTPromiseResolveBlock)resolve
+                 reject:(RCTPromiseRejectBlock)reject {
+  @synchronized(coreLifecycleLock()) {
+    if (![self restoreCoreIfNeeded] || !coreAvailable()) {
+      reject(@"E_CORE_UNAVAILABLE",
+             @"The native MASQ core is unavailable for debt settlement.", nil);
+      return;
+    }
+    NSString *result =
+        invoke(symbol<NoArgumentFunction>("masq_mobile_get_debt_summary"));
+    NSString *error = financialResultError(result);
+    error ? reject(@"E_DEBT_SUMMARY", error, nil) : resolve(result);
+  }
+}
+
+- (void)prepareDebtSettlement:(RCTPromiseResolveBlock)resolve
+                        reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    @synchronized(coreLifecycleLock()) {
+      if (![self restoreCoreIfNeeded] || !coreAvailable()) {
+        reject(@"E_CORE_UNAVAILABLE",
+               @"The native MASQ core is unavailable for debt settlement.", nil);
+        return;
+      }
+      NSString *result = invoke(symbol<NoArgumentFunction>(
+          "masq_mobile_prepare_debt_settlement"));
+      NSString *error = financialResultError(result);
+      error ? reject(@"E_DEBT_SETTLEMENT_PREPARE", error, nil) : resolve(result);
+    }
+  });
+}
+
+- (void)confirmDebtSettlement:(NSString *)quoteId
+              maximumMasqWei:(NSString *)maximumMasqWei
+ maximumEstimatedL2FeeWei:(NSString *)maximumEstimatedL2FeeWei
+                     resolve:(RCTPromiseResolveBlock)resolve
+                      reject:(RCTPromiseRejectBlock)reject {
+  NSRegularExpression *quotePattern = [NSRegularExpression
+      regularExpressionWithPattern:@"^[0-9a-f]{32}$" options:0 error:nil];
+  NSRegularExpression *weiPattern = [NSRegularExpression
+      regularExpressionWithPattern:@"^[0-9]{1,39}$" options:0 error:nil];
+  BOOL validQuote = quoteId &&
+      [quotePattern firstMatchInString:quoteId options:0
+                                 range:NSMakeRange(0, quoteId.length)] != nil;
+  BOOL validMasq = maximumMasqWei &&
+      [weiPattern firstMatchInString:maximumMasqWei options:0
+                               range:NSMakeRange(0, maximumMasqWei.length)] != nil;
+  BOOL validFee = maximumEstimatedL2FeeWei &&
+      [weiPattern firstMatchInString:maximumEstimatedL2FeeWei options:0
+                               range:NSMakeRange(0, maximumEstimatedL2FeeWei.length)] != nil;
+  if (!validQuote || !validMasq || !validFee) {
+    reject(@"E_DEBT_SETTLEMENT_INPUT",
+           @"The reviewed MASQ settlement values are invalid.", nil);
+    return;
+  }
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    @synchronized(coreLifecycleLock()) {
+      if (![self restoreCoreIfNeeded] || !coreAvailable()) {
+        reject(@"E_CORE_UNAVAILABLE",
+               @"The native MASQ core is unavailable for debt settlement.", nil);
+        return;
+      }
+      NSString *result = invoke(
+          symbol<ThreeStringArgumentFunction>("masq_mobile_confirm_debt_settlement"),
+          quoteId, maximumMasqWei, maximumEstimatedL2FeeWei);
+      NSString *error = financialResultError(result);
+      error ? reject(@"E_DEBT_SETTLEMENT_CONFIRM", error, nil) : resolve(result);
+    }
+  });
+}
+
+- (void)getDebtSettlementStatus:(RCTPromiseResolveBlock)resolve
+                          reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    @synchronized(coreLifecycleLock()) {
+      if (![self restoreCoreIfNeeded] || !coreAvailable()) {
+        reject(@"E_CORE_UNAVAILABLE",
+               @"The native MASQ core is unavailable for debt settlement.", nil);
+        return;
+      }
+      NSString *result = invoke(symbol<NoArgumentFunction>(
+          "masq_mobile_get_debt_settlement_status"));
+      NSString *error = financialResultError(result);
+      error ? reject(@"E_DEBT_SETTLEMENT_STATUS", error, nil) : resolve(result);
     }
   });
 }

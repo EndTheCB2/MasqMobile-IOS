@@ -1,6 +1,8 @@
 mod lifecycle;
 
+use std::ffi::c_void;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 
 use jni::EnvUnowned;
@@ -8,9 +10,13 @@ use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint};
 use once_cell::sync::Lazy;
-use tun2proxy::{ArgDns, ArgProxy, Args, CancellationToken};
+use tun2proxy::{
+    ArgDns, ArgProxy, Args, CancellationToken, TrafficStatus, tun2proxy_set_traffic_status_callback,
+};
 
-use lifecycle::{BeginError, CompletionOutcome, LifecycleController, RunCompletion};
+use lifecycle::{
+    BeginError, CompletionOutcome, LifecycleController, LifecycleSnapshot, RunCompletion,
+};
 
 const START_STOPPED: i32 = 0;
 const START_FAILED: i32 = -1;
@@ -19,6 +25,24 @@ const START_BUSY: i32 = -3;
 const START_STALE_COMPLETION: i32 = -4;
 
 static TUNNEL_LIFECYCLE: Lazy<LifecycleController> = Lazy::new(LifecycleController::default);
+static ACTIVE_TRAFFIC_GENERATION: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_TRAFFIC_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn record_traffic_observation(
+    status: *const TrafficStatus,
+    _context: *mut c_void,
+) {
+    let Some(status) = (unsafe { status.as_ref() }) else {
+        return;
+    };
+    if status.tx == 0 && status.rx == 0 {
+        return;
+    }
+    let generation = ACTIVE_TRAFFIC_GENERATION.load(Ordering::Acquire);
+    if generation > 0 {
+        OBSERVED_TRAFFIC_GENERATION.store(generation, Ordering::Release);
+    }
+}
 
 fn run(tun_fd: i32, proxy_port: u16, mtu: u16) -> i32 {
     if tun_fd < 0 || proxy_port == 0 || !(1280..=9000).contains(&mtu) {
@@ -56,6 +80,14 @@ fn run(tun_fd: i32, proxy_port: u16, mtu: u16) -> i32 {
     else {
         return completion_code(TUNNEL_LIFECYCLE.complete(generation, RunCompletion::Failed));
     };
+    ACTIVE_TRAFFIC_GENERATION.store(generation, Ordering::Release);
+    unsafe {
+        tun2proxy_set_traffic_status_callback(
+            1,
+            Some(record_traffic_observation),
+            std::ptr::null_mut(),
+        );
+    }
     let completion = runtime.block_on(async {
         let mut worker = Box::pin(tun2proxy::general_run_async(
             args,
@@ -88,6 +120,12 @@ fn run(tun_fd: i32, proxy_port: u16, mtu: u16) -> i32 {
             Err(_) => RunCompletion::Failed,
         }
     });
+    let _ = ACTIVE_TRAFFIC_GENERATION.compare_exchange(
+        generation,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     completion_code(TUNNEL_LIFECYCLE.complete(generation, completion))
 }
 
@@ -102,6 +140,15 @@ fn completion_code(outcome: CompletionOutcome) -> i32 {
         CompletionOutcome::Failed => START_FAILED,
         CompletionOutcome::Stale => START_STALE_COMPLETION,
     }
+}
+
+fn tunnel_state_json(snapshot: LifecycleSnapshot, observed_generation: u64) -> String {
+    let traffic_observed = snapshot.generation > 0 && observed_generation == snapshot.generation;
+    let lifecycle_json = snapshot.to_json();
+    format!(
+        "{},\"trafficObserved\":{traffic_observed}}}",
+        lifecycle_json.strip_suffix('}').unwrap_or(&lifecycle_json),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -134,13 +181,19 @@ pub extern "system" fn Java_com_masqmobile_MasqPacketTunnelJni_nativeStateJson<'
     mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    env.with_env(|env| JString::from_str(env, TUNNEL_LIFECYCLE.snapshot().to_json()))
+    let snapshot = TUNNEL_LIFECYCLE.snapshot();
+    let state_json = tunnel_state_json(
+        snapshot,
+        OBSERVED_TRAFFIC_GENERATION.load(Ordering::Acquire),
+    );
+    env.with_env(|env| JString::from_str(env, state_json))
         .resolve::<ThrowRuntimeExAndDefault>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecycle::{LastResult, TunnelState};
 
     #[test]
     fn rejects_invalid_configuration_without_starting_a_tunnel() {
@@ -159,6 +212,35 @@ mod tests {
         assert_eq!(
             completion_code(CompletionOutcome::Stale),
             START_STALE_COMPLETION
+        );
+    }
+
+    #[test]
+    fn state_json_reports_traffic_only_for_the_current_generation() {
+        let snapshot = LifecycleSnapshot {
+            state: TunnelState::Running,
+            generation: 7,
+            last_result: None,
+        };
+
+        assert_eq!(
+            tunnel_state_json(snapshot, 7),
+            r#"{"state":"running","generation":7,"lastResult":null,"trafficObserved":true}"#,
+        );
+        assert_eq!(
+            tunnel_state_json(snapshot, 6),
+            r#"{"state":"running","generation":7,"lastResult":null,"trafficObserved":false}"#,
+        );
+        assert_eq!(
+            tunnel_state_json(
+                LifecycleSnapshot {
+                    state: TunnelState::Idle,
+                    generation: 0,
+                    last_result: Some(LastResult::Stopped),
+                },
+                0,
+            ),
+            r#"{"state":"idle","generation":0,"lastResult":"stopped","trafficObserved":false}"#,
         );
     }
 }

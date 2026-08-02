@@ -37,6 +37,10 @@ export function PrivacyScreen({
           text="Your recovery phrase or private key is stored in device-bound secure storage. It is removed only when you choose Remove wallet or Reset everything. Never send recovery words to support."
         />
         <Disclosure
+          title="Debt settlement is an explicit blockchain action"
+          text="Review MASQ debts shows the amount, creditor count and an estimated Base L2 fee before anything is signed. No device code or biometric check is used: tapping Settle now is the final confirmation. The wallet signs locally, but submitted transaction hashes, wallet addresses, token transfers and fees are public on Base. The displayed estimate excludes Base's variable L1 data fee, so the final fee can be higher. An uncertain submission is never retried automatically."
+        />
+        <Disclosure
           title="MASQ Private is fail-closed"
           text="The selected blockchain RPC receives your IP address, wallet address and JSON-RPC requests. MASQ entry, relay and exit nodes process the routing metadata needed to carry traffic. Destination sites see the exit node's IP address. If a MASQ route is unavailable, MASQ Private blocks browsing and never switches to Direct."
         />
@@ -66,8 +70,8 @@ export function PrivacyScreen({
         />
         {Platform.OS === 'android' && systemRoutingSupported ? (
           <Disclosure
-            title="Android dogfood system routing is limited"
-            text="Only the separately compiled MASQ Dogfood (Unsafe) build can capture whole-device or selected-app traffic. It translates captured IPv4 TCP/443 and virtual DNS through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and unknown transports—is blocked only while capture remains valid. Activation opens a real CONNECT tunnel to example.com:443 through the MASQ exit to test reachability, without requesting a page or body. Selected package IDs and the consent timestamp stay on this device. Android snapshots package-to-UID scope when the route is created: shared-UID apps can share routing, attached restricted profiles may receive the scope, and work profiles are separate. Turn routing off before installing, removing, enabling, disabling or updating apps, then reapply it. Android 13 or later must grant notification permission before activation so the ongoing unsafe-routing state stays visible; turning routing off never requires that permission. VPN revocation or service/app-process death can restore direct traffic; Always-on/lockdown is unsupported. The temporary loopback MASQ proxy is unauthenticated, so a malicious local app that discovers its port could consume the route and wallet funds. This internal build must not be distributed publicly until package-change recovery and local proxy authentication are implemented."
+            title="Android community system routing is limited"
+            text="Only the separately compiled MASQ community preview build can capture whole-device or selected-app traffic. It translates captured IPv4 TCP/443 and virtual DNS through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and unknown transports—is blocked only while capture remains valid. Activation completes a TLS handshake and an encrypted HEAD request to example.com through the MASQ exit; no page body is downloaded. Selected package IDs and the consent timestamp stay on this device. Android snapshots package-to-UID scope when the route is created: shared-UID apps can share routing, attached restricted profiles may receive the scope, and work profiles are separate. Turn routing off before installing, removing, enabling, disabling or updating apps, then reapply it. Android 13 or later must grant notification permission before activation so the ongoing experimental-routing state stays visible; turning routing off never requires that permission. VPN revocation or service/app-process death can restore direct traffic; Always-on/lockdown is unsupported. The temporary loopback MASQ proxy is unauthenticated, so a malicious local app that discovers its port could consume the route and wallet funds. This internal build must not be distributed publicly until package-change recovery and local proxy authentication are implemented."
           />
         ) : null}
         <Disclosure

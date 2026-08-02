@@ -14,6 +14,18 @@ interface ConnectionReadinessOptions {
   onStatus?: (status: CoreStatus) => void;
 }
 
+export function isCoreReadyForSystemRouting(status: CoreStatus): boolean {
+  return (
+    status.phase === 'connected' &&
+    status.connectedNeighbors > 0 &&
+    status.routeStage > 0 &&
+    status.proxyPort !== null &&
+    Number.isInteger(status.proxyPort) &&
+    status.proxyPort > 0 &&
+    status.proxyPort <= 65_535
+  );
+}
+
 export async function startAndAwaitMasqConnection(
   start: () => Promise<CoreStatus>,
   getStatus: () => Promise<CoreStatus>,

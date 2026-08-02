@@ -1,6 +1,19 @@
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 
-import type { CoreStatus, NetworkStatus } from '../core/types';
+import type {
+  CoreStatus,
+  DebtSettlementQuote,
+  DebtSettlementStatus,
+  DebtSummary,
+  NetworkStatus,
+} from '../core/types';
 import type { MasqIssue } from '../core/issues';
 import type { EntryNodeRefreshProgress } from '../core/entryNodeRefresh';
 import type { WalletBalanceState } from '../core/walletBalance';
@@ -29,6 +42,11 @@ interface Props {
   entryNodeRefresh: EntryNodeRefreshProgress | null;
   issue: MasqIssue | null;
   walletBalance: WalletBalanceState;
+  debtSummary?: DebtSummary;
+  debtSettlementQuote?: DebtSettlementQuote | null;
+  debtSettlementStatus?: DebtSettlementStatus;
+  debtSettlementBusy?: boolean;
+  debtSettlementError?: string | null;
   systemTunnel: SystemTunnelStatus;
   onConnect: () => void;
   onRetryInitialization: () => void;
@@ -47,6 +65,12 @@ interface Props {
   onOpenPrivacy: () => void;
   onUpdateMinHops: (minHops: number) => void;
   onRefreshWalletBalance: () => void;
+  onRefreshDebtSummary?: () => void;
+  onReviewDebtSettlement?: () => void;
+  onConfirmDebtSettlement?: () => void;
+  onRetryDebtSettlement?: () => void;
+  onDismissDebtSettlement?: () => void;
+  onOpenSettlementTransaction?: (transactionHash: string) => void;
 }
 
 export function HomeScreen({
@@ -60,6 +84,24 @@ export function HomeScreen({
   entryNodeRefresh,
   issue,
   walletBalance,
+  debtSummary = {
+    totalMasqWei: '0',
+    creditorCount: 0,
+    settlementInProgress: false,
+  },
+  debtSettlementQuote = null,
+  debtSettlementStatus = {
+    operationId: null,
+    phase: 'idle',
+    totalMasqWei: '0',
+    estimatedL2FeeWei: '0',
+    transactionCount: 0,
+    confirmedTransactionCount: 0,
+    transactionHashes: [],
+    errorCode: null,
+  },
+  debtSettlementBusy = false,
+  debtSettlementError = null,
   systemTunnel,
   onConnect,
   onRetryInitialization,
@@ -78,6 +120,12 @@ export function HomeScreen({
   onOpenPrivacy,
   onUpdateMinHops,
   onRefreshWalletBalance,
+  onRefreshDebtSummary = () => undefined,
+  onReviewDebtSettlement = () => undefined,
+  onConfirmDebtSettlement = () => undefined,
+  onRetryDebtSettlement = () => undefined,
+  onDismissDebtSettlement = () => undefined,
+  onOpenSettlementTransaction = () => undefined,
 }: Props) {
   const connected = profileReady && status.phase === 'connected';
   const configured = Boolean(
@@ -86,6 +134,73 @@ export function HomeScreen({
 
   return (
     <View style={styles.screen}>
+      <Modal
+        animationType="fade"
+        onRequestClose={onDismissDebtSettlement}
+        transparent
+        visible={debtSettlementQuote !== null}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.settlementModal}>
+            <Text style={styles.walletEyebrow}>REVIEW PAYMENT</Text>
+            <Text style={styles.settlementTitle}>Settle MASQ debts now</Text>
+            {debtSettlementQuote ? (
+              <>
+                <View style={styles.settlementRows}>
+                  <SettlementRow
+                    label="MASQ debt"
+                    value={`${formatMasqWei(
+                      debtSettlementQuote.totalMasqWei,
+                    )} MASQ`}
+                  />
+                  <SettlementRow
+                    label="Creditors"
+                    value={String(debtSettlementQuote.creditorCount)}
+                  />
+                  <SettlementRow
+                    label="Estimated Base L2 fee"
+                    value={`${formatEthWei(
+                      debtSettlementQuote.estimatedL2FeeWei,
+                    )} ETH`}
+                  />
+                </View>
+                <Text style={styles.settlementWarning}>
+                  Base also charges an L1 data fee that cannot be hard-capped by
+                  this app and is not included above. The final fee can be
+                  higher. MASQ never retries an ambiguous submission
+                  automatically.
+                </Text>
+                {debtSettlementQuote.hasMoreCreditors ? (
+                  <Text style={styles.settlementWarning}>
+                    This payment covers the 20 oldest debts. Review another
+                    settlement after these transactions are confirmed.
+                  </Text>
+                ) : null}
+                <Text style={styles.settlementConfirmationHint}>
+                  No device code or biometric check is used. Tapping “Settle
+                  now” is the final in-app confirmation.
+                </Text>
+                {debtSettlementError ? (
+                  <Text style={styles.balanceError}>{debtSettlementError}</Text>
+                ) : null}
+                <View style={styles.settlementActions}>
+                  <Button
+                    disabled={debtSettlementBusy}
+                    label="Cancel"
+                    onPress={onDismissDebtSettlement}
+                    tone="secondary"
+                  />
+                  <Button
+                    busy={debtSettlementBusy}
+                    label="Settle now"
+                    onPress={onConfirmDebtSettlement}
+                  />
+                </View>
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
       <ScreenHeader title="MASQ" />
       <ScrollView
         contentContainerStyle={styles.content}
@@ -364,6 +479,101 @@ export function HomeScreen({
               {walletBalance.state === 'error' ? (
                 <Text style={styles.balanceError}>{walletBalance.message}</Text>
               ) : null}
+              <View style={styles.debtDivider} />
+              <View style={styles.walletHeader}>
+                <View style={styles.debtHeading}>
+                  <Text style={styles.walletEyebrow}>OUTSTANDING DEBT</Text>
+                  <Text style={styles.debtAmount}>
+                    {formatMasqWei(debtSummary.totalMasqWei)} MASQ
+                  </Text>
+                  <Text style={styles.walletHelper}>
+                    {debtSummary.creditorCount} creditor
+                    {debtSummary.creditorCount === 1 ? '' : 's'}
+                  </Text>
+                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={debtSettlementBusy}
+                  onPress={onRefreshDebtSummary}
+                  style={({ pressed }) => [
+                    styles.walletRefresh,
+                    pressed && styles.pressed,
+                  ]}
+                >
+                  <Text style={styles.walletRefreshText}>Refresh debts</Text>
+                </Pressable>
+              </View>
+              {debtSettlementStatus.phase !== 'idle' ? (
+                <View style={styles.settlementStatus}>
+                  <Text style={styles.settlementStatusTitle}>
+                    {settlementStatusTitle(debtSettlementStatus)}
+                  </Text>
+                  <Text style={styles.walletHelper}>
+                    {debtSettlementStatus.confirmedTransactionCount}/
+                    {debtSettlementStatus.transactionCount} transactions
+                    confirmed
+                  </Text>
+                  {debtSettlementStatus.errorCode ? (
+                    <Text style={styles.balanceError}>
+                      {debtSettlementStatus.errorCode ===
+                      'E_SETTLEMENT_RPC_AMBIGUOUS'
+                        ? 'The RPC response was ambiguous. MASQ will not submit these payments again automatically.'
+                        : 'This settlement needs attention before another payment can be made.'}
+                    </Text>
+                  ) : null}
+                  {debtSettlementStatus.phase === 'attention' &&
+                  debtSettlementStatus.errorCode ===
+                    'E_SETTLEMENT_RPC_AMBIGUOUS' ? (
+                    <>
+                      <Text style={styles.walletHelper}>
+                        A manual retry broadcasts only the exact saved
+                        transactions. It does not create a new payment, change
+                        recipients or use new nonces.
+                      </Text>
+                      <Button
+                        busy={debtSettlementBusy}
+                        disabled={debtSettlementBusy}
+                        label="Retry exact saved transactions"
+                        onPress={onRetryDebtSettlement}
+                        tone="secondary"
+                      />
+                    </>
+                  ) : null}
+                  {debtSettlementStatus.transactionHashes.map(hash => (
+                    <Pressable
+                      accessibilityRole="link"
+                      key={hash}
+                      onPress={() => onOpenSettlementTransaction(hash)}
+                    >
+                      <Text style={styles.transactionLink}>
+                        View {shortHash(hash)} on BaseScan
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
+              {debtSettlementError && !debtSettlementQuote ? (
+                <Text style={styles.balanceError}>{debtSettlementError}</Text>
+              ) : null}
+              <Button
+                busy={debtSettlementBusy}
+                disabled={
+                  debtSummary.totalMasqWei === '0' ||
+                  debtSummary.settlementInProgress ||
+                  debtSettlementBusy
+                }
+                label={
+                  debtSummary.settlementInProgress
+                    ? 'Settlement pending'
+                    : 'Review MASQ debts'
+                }
+                onPress={onReviewDebtSettlement}
+                tone="secondary"
+              />
+              <Text style={styles.walletHelper}>
+                Settling early can reduce delinquency risk, but cannot guarantee
+                that a provider has not already applied its own policy.
+              </Text>
             </Card>
           </View>
         ) : null}
@@ -551,6 +761,52 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
+function SettlementRow({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.settlementRow}>
+      <Text style={styles.settlementRowLabel}>{label}</Text>
+      <Text style={styles.settlementRowValue}>{value}</Text>
+    </View>
+  );
+}
+
+function formatTokenWei(value: string, maximumDecimals: number): string {
+  const padded = value.padStart(19, '0');
+  const whole = padded.slice(0, -18).replace(/^0+(?=\d)/, '');
+  const fraction = padded
+    .slice(-18)
+    .slice(0, maximumDecimals)
+    .replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function formatMasqWei(value: string): string {
+  return formatTokenWei(value, 9);
+}
+
+function formatEthWei(value: string): string {
+  return formatTokenWei(value, 8);
+}
+
+function shortHash(hash: string): string {
+  return `${hash.slice(0, 8)}…${hash.slice(-6)}`;
+}
+
+function settlementStatusTitle(status: DebtSettlementStatus): string {
+  switch (status.phase) {
+    case 'completed':
+      return 'Debt settlement confirmed';
+    case 'attention':
+      return 'Debt settlement needs attention';
+    case 'failed':
+      return 'Debt settlement failed';
+    case 'reserved':
+      return 'Debt settlement reserved';
+    default:
+      return 'Debt settlement submitted';
+  }
+}
+
 function phaseLabel(status: CoreStatus): string {
   switch (status.phase) {
     case 'connected':
@@ -604,7 +860,7 @@ function systemTunnelTitle(status: SystemTunnelStatus): string {
     status.mode === 'wholeDevice' &&
     status.active
   ) {
-    return 'Whole-device dogfood route active';
+    return 'Whole-device HTTPS route ready';
   }
   if (
     disposition === 'masq' &&
@@ -613,7 +869,7 @@ function systemTunnelTitle(status: SystemTunnelStatus): string {
   ) {
     return `${status.selectedApps.length} selected app${
       status.selectedApps.length === 1 ? '' : 's'
-    } in active dogfood route`;
+    } in active community route`;
   }
   return 'Private browser only';
 }
@@ -624,12 +880,14 @@ function systemTunnelDetail(status: SystemTunnelStatus): string {
     return 'Android cannot confirm capture. Open Traffic scope and turn the route off or recover it.';
   }
   if (disposition === 'blocked') {
-    return 'Captured traffic is being held while the MASQ dogfood route is unavailable.';
+    return 'Captured traffic is being held while the MASQ community route is unavailable.';
   }
   if (disposition === 'masq') {
-    return 'IPv4 TCP/443 is reported through MASQ; dogfood limitations still apply.';
+    return status.trafficObserved === true
+      ? 'A captured IPv4 TCP/443 session reached the local MASQ adapter.'
+      : 'MASQ is ready; no compatible external app traffic has been observed yet.';
   }
-  return 'Configure unsafe device or selected-app dogfood routing';
+  return 'Configure experimental device or selected-app routing';
 }
 
 const styles = StyleSheet.create({
@@ -799,6 +1057,80 @@ const styles = StyleSheet.create({
   },
   fundsWarningText: { color: '#FFD48A', fontSize: 11, lineHeight: 16 },
   balanceError: { color: colors.red, fontSize: 11, marginTop: 8 },
+  debtDivider: {
+    backgroundColor: colors.line,
+    height: 1,
+    marginVertical: 16,
+  },
+  debtHeading: { flex: 1 },
+  debtAmount: {
+    color: colors.white,
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 5,
+  },
+  settlementStatus: {
+    backgroundColor: '#0A1A28',
+    borderColor: colors.line,
+    borderRadius: 10,
+    borderWidth: 1,
+    marginBottom: 12,
+    marginTop: 12,
+    padding: 11,
+  },
+  settlementStatusTitle: {
+    color: colors.white,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  transactionLink: {
+    color: '#85C9F6',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 8,
+  },
+  modalBackdrop: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 5, 10, 0.82)',
+    flex: 1,
+    justifyContent: 'center',
+    padding: 20,
+  },
+  settlementModal: {
+    backgroundColor: colors.panel,
+    borderColor: colors.line,
+    borderRadius: 22,
+    borderWidth: 1,
+    maxWidth: 520,
+    padding: 20,
+    width: '100%',
+  },
+  settlementTitle: {
+    color: colors.white,
+    fontSize: 23,
+    fontWeight: '800',
+    marginTop: 7,
+  },
+  settlementRows: { gap: 9, marginTop: 18 },
+  settlementRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  settlementRowLabel: { color: colors.muted, fontSize: 13 },
+  settlementRowValue: { color: colors.white, fontSize: 13, fontWeight: '800' },
+  settlementWarning: {
+    color: '#FFD48A',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 16,
+  },
+  settlementConfirmationHint: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 12,
+  },
+  settlementActions: { gap: 10, marginTop: 18 },
   settings: { marginTop: 12 },
   trafficRouting: { marginTop: 12 },
   routeLengthCard: {

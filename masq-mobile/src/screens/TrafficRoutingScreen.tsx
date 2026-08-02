@@ -12,11 +12,13 @@ import {
 
 import {
   appliedSystemTunnelScope,
-  appliedSystemTunnelScopeKey,
+  desiredSystemTunnelScope,
+  desiredSystemTunnelScopeKey,
   systemTunnelTrafficDisposition,
   type RoutableApp,
   type SystemTunnelMode,
   type SystemTunnelStatus,
+  type SystemTunnelTrafficDisposition,
 } from '../core/systemTunnel';
 import { Button, ErrorBanner, ScreenHeader } from '../ui/components';
 import { colors, radii } from '../ui/theme';
@@ -39,24 +41,56 @@ export function TrafficRoutingScreen({
   onBack,
 }: Props) {
   const appliedScope = appliedSystemTunnelScope(status);
-  const appliedScopeKey = appliedSystemTunnelScopeKey(status);
+  const desiredScope = desiredSystemTunnelScope(status);
+  const desiredScopeKey = desiredSystemTunnelScopeKey(status);
   const trafficDisposition = systemTunnelTrafficDisposition(status);
-  const observedAppliedScopeKey = useRef(appliedScopeKey);
-  const [choice, setChoice] = useState<SystemTunnelMode>(appliedScope.mode);
-  const [selectedApps, setSelectedApps] = useState(appliedScope.selectedApps);
+  const observedDesiredScopeKey = useRef(desiredScopeKey);
+  const draftDirty = useRef(false);
+  const submittedDraft = useRef<{
+    mode: SystemTunnelMode;
+    selectedApps: string[];
+  } | null>(null);
+  const [choice, setChoice] = useState<SystemTunnelMode>(desiredScope.mode);
+  const [selectedApps, setSelectedApps] = useState(
+    desiredScope.selectedApps,
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (observedAppliedScopeKey.current === appliedScopeKey) {
+    if (observedDesiredScopeKey.current === desiredScopeKey) {
       return;
     }
-    observedAppliedScopeKey.current = appliedScopeKey;
-    setChoice(appliedScope.mode);
-    setSelectedApps(appliedScope.selectedApps);
-  }, [appliedScope.mode, appliedScope.selectedApps, appliedScopeKey]);
+    observedDesiredScopeKey.current = desiredScopeKey;
+    const submitted = submittedDraft.current;
+    if (
+      draftDirty.current &&
+      (!submitted ||
+        !scopeMatchesDraft(
+          desiredScope.mode,
+          desiredScope.selectedApps,
+          submitted,
+        ))
+    ) {
+      return;
+    }
+    draftDirty.current = false;
+    submittedDraft.current = null;
+    setChoice(desiredScope.mode);
+    setSelectedApps(desiredScope.selectedApps);
+  }, [desiredScope.mode, desiredScope.selectedApps, desiredScopeKey]);
+
+  const routingPhase = status.routingPhase || status.phase;
+  const hasRoutingIntent =
+    desiredScope.mode !== 'off' ||
+    appliedScope.mode !== 'off' ||
+    status.tunPresent === true ||
+    routingPhase !== 'off';
+  const editable = status.supported && !hasRoutingIntent;
 
   const apply = async (mode: SystemTunnelMode, apps: string[]) => {
     setError(null);
+    draftDirty.current = true;
+    submittedDraft.current = { mode, selectedApps: [...apps] };
     try {
       if (
         mode !== 'off' &&
@@ -70,13 +104,13 @@ export function TrafficRoutingScreen({
           : await PermissionsAndroid.request(permission, {
               title: 'Allow the MASQ routing status notice',
               message:
-                'Unsafe dogfood routing needs a visible ongoing notice so you can see when captured traffic is active, blocked, or may be direct.',
+                'Experimental community routing needs a visible ongoing notice so you can see when captured traffic is active, blocked, or may be direct.',
               buttonPositive: 'Allow notice',
               buttonNegative: 'Cancel',
             });
         if (outcome !== PermissionsAndroid.RESULTS.GRANTED) {
           throw new Error(
-            'Allow notifications before starting dogfood system routing. Turning routing off remains available without this permission.',
+            'Allow notifications before starting community system routing. Turning routing off remains available without this permission.',
           );
         }
       }
@@ -91,6 +125,8 @@ export function TrafficRoutingScreen({
   };
 
   const toggleApp = (id: string) => {
+    draftDirty.current = true;
+    submittedDraft.current = null;
     setSelectedApps(current =>
       current.includes(id)
         ? current.filter(app => app !== id)
@@ -104,11 +140,11 @@ export function TrafficRoutingScreen({
       stopping ? 'Turn off system routing?' : 'Confirm unsafe system routing',
       stopping
         ? 'MASQ will stop the experimental system route. Included apps will use their normal connection after native shutdown completes.'
-        : 'This internal dogfood route is not a VPN safety guarantee. It sends IPv4 TCP connections to port 443 through MASQ and handles DNS virtually. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP, and unknown transports—stays blocked while capture is valid. Continue?',
+        : 'This experimental community route is not a VPN safety guarantee. It sends IPv4 TCP connections to port 443 through MASQ and handles DNS virtually. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP, and unknown transports—stays blocked while capture is valid. Continue?',
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: stopping ? 'Turn off' : 'Apply dogfood route',
+          text: stopping ? 'Turn off' : 'Apply community route',
           style: stopping ? 'destructive' : 'default',
           onPress: () => {
             apply(mode, apps).catch(() => undefined);
@@ -130,7 +166,7 @@ export function TrafficRoutingScreen({
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={styles.eyebrow}>DOGFOOD SCOPE</Text>
+        <Text style={styles.eyebrow}>COMMUNITY ROUTING SCOPE</Text>
         <Text style={styles.title}>Choose eligible traffic</Text>
         <Text style={styles.intro}>
           Configure the experimental Android system route exposed by this native
@@ -148,15 +184,15 @@ export function TrafficRoutingScreen({
         {status.supported ? (
           <View style={styles.dogfoodWarning}>
             <Text style={styles.dogfoodWarningTitle}>
-              Unsafe internal dogfood
+              Experimental community routing
             </Text>
             <Text style={styles.dogfoodWarningText}>
               Only IPv4 TCP connections to port 443 are sent through MASQ. DNS
               is handled virtually. All other captured IP traffic—including
               other TCP ports, non-DNS UDP, IPv6, ICMP, and unknown
               transports—is blocked while capture is valid. Activation opens
-              a real CONNECT tunnel to example.com:443 through the MASQ exit
-              to test reachability, without requesting a page or body. MASQ
+              an encrypted connection to example.com through the MASQ exit
+              and requests only response headers; no page body is downloaded. MASQ
               packages installed when the route is created are excluded, but
               Android snapshots package UIDs at that moment. Turn routing off
               before installing, removing, enabling, disabling, or updating
@@ -195,36 +231,56 @@ export function TrafficRoutingScreen({
           </View>
         ) : null}
 
-        {status.supported ? (
+        {status.supported && hasRoutingIntent ? (
+          <RoutingStatusCard
+            appliedMode={appliedScope.mode}
+            appliedSelectedApps={appliedScope.selectedApps}
+            desiredMode={desiredScope.mode}
+            desiredSelectedApps={desiredScope.selectedApps}
+            disposition={trafficDisposition}
+            routingPhase={routingPhase}
+            trafficObserved={status.trafficObserved === true}
+          />
+        ) : null}
+
+        {editable ? (
           <>
             <ScopeCard
               active={choice === 'off'}
               detail="Only the isolated MASQ browser uses MASQ. Other apps keep their normal connection."
               label="Private browser only"
-              onPress={() => setChoice('off')}
+              onPress={() => {
+                draftDirty.current = true;
+                submittedDraft.current = null;
+                setChoice('off');
+              }}
             />
             <ScopeCard
               active={choice === 'wholeDevice'}
               detail="Capture Android app traffic; route only IPv4 TCP/443 and virtual DNS. Other traffic is blocked while capture remains valid."
-              disabled={status.phase !== 'off'}
               label="Whole device"
-              onPress={() => setChoice('wholeDevice')}
+              onPress={() => {
+                draftDirty.current = true;
+                submittedDraft.current = null;
+                setChoice('wholeDevice');
+              }}
             />
             <ScopeCard
               active={choice === 'selectedApps'}
               detail="Capture selected app UIDs; route only IPv4 TCP/443 and virtual DNS. Other traffic is blocked while capture remains valid."
-              disabled={status.phase !== 'off'}
               label="Selected apps"
-              onPress={() => setChoice('selectedApps')}
+              onPress={() => {
+                draftDirty.current = true;
+                submittedDraft.current = null;
+                setChoice('selectedApps');
+              }}
             />
           </>
         ) : null}
 
-        {status.supported &&
-        choice === 'selectedApps' &&
-        status.phase === 'off' ? (
+        {editable && choice === 'selectedApps' ? (
           <View style={styles.appsCard}>
-            <Text style={styles.appsTitle}>Apps in this dogfood route</Text>
+            <Text style={styles.appsTitle}>Apps in this community route</Text>
             <Text style={styles.appsHelper}>
               Only launchable apps are listed. Package IDs and the consent
               timestamp stay on this device. Android applies VPN rules to UIDs:
@@ -266,7 +322,7 @@ export function TrafficRoutingScreen({
           </View>
         ) : null}
 
-        {status.supported && status.phase === 'off' && choice !== 'off' ? (
+        {editable && choice !== 'off' ? (
           <Button
             busy={busy}
             disabled={
@@ -277,8 +333,8 @@ export function TrafficRoutingScreen({
             label={
               connected
                 ? choice === 'wholeDevice'
-                  ? 'Apply whole-device dogfood'
-                  : 'Apply selected-app dogfood'
+                  ? 'Apply whole-device routing'
+                  : 'Apply selected-app routing'
                 : 'Connect MASQ first'
             }
             onPress={() =>
@@ -288,10 +344,10 @@ export function TrafficRoutingScreen({
               )
             }
           />
-        ) : status.supported && status.phase !== 'off' ? (
+        ) : status.supported && hasRoutingIntent ? (
           <View style={styles.routeActions}>
-            {status.mode !== 'off' &&
-            status.phase !== 'stopping' &&
+            {desiredScope.mode !== 'off' &&
+            (routingPhase === 'blocked' || routingPhase === 'revoked') &&
             trafficDisposition !== 'masq' ? (
               <Button
                 busy={busy}
@@ -299,17 +355,19 @@ export function TrafficRoutingScreen({
                 label={connected ? 'Retry MASQ route' : 'Connect MASQ first'}
                 onPress={() =>
                   apply(
-                    status.mode,
-                    status.mode === 'selectedApps' ? status.selectedApps : [],
+                    desiredScope.mode,
+                    desiredScope.mode === 'selectedApps'
+                      ? desiredScope.selectedApps
+                      : [],
                   )
                 }
               />
             ) : null}
             <Button
               busy={busy}
-              disabled={busy || status.phase === 'stopping'}
+              disabled={busy || routingPhase === 'stopping'}
               label={
-                status.phase === 'stopping'
+                routingPhase === 'stopping'
                   ? 'Stopping system routing…'
                   : 'Turn off system routing'
               }
@@ -357,6 +415,112 @@ function ScopeCard({
       </View>
     </Pressable>
   );
+}
+
+function RoutingStatusCard({
+  appliedMode,
+  appliedSelectedApps,
+  desiredMode,
+  desiredSelectedApps,
+  disposition,
+  routingPhase,
+  trafficObserved,
+}: {
+  appliedMode: SystemTunnelMode;
+  appliedSelectedApps: string[];
+  desiredMode: SystemTunnelMode;
+  desiredSelectedApps: string[];
+  disposition: SystemTunnelTrafficDisposition;
+  routingPhase: string;
+  trafficObserved: boolean;
+}) {
+  const traffic =
+    disposition === 'masq'
+      ? trafficObserved
+        ? 'Captured HTTPS session reached the local MASQ adapter'
+        : 'MASQ route ready · waiting for compatible app traffic'
+      : disposition === 'blocked'
+        ? 'Captured traffic blocked'
+        : disposition === 'directRisk'
+          ? 'Capture not confirmed — traffic may be direct'
+          : 'System routing off';
+  return (
+    <View style={styles.routingStatus}>
+      <Text style={styles.routingStatusTitle}>System route status</Text>
+      <RoutingStatusRow
+        label="Requested"
+        value={scopeDescription(desiredMode, desiredSelectedApps)}
+      />
+      <RoutingStatusRow
+        label="Captured"
+        value={scopeDescription(appliedMode, appliedSelectedApps)}
+      />
+      <RoutingStatusRow label="Traffic" value={traffic} />
+      <RoutingStatusRow
+        label="Phase"
+        value={routingPhaseDescription(routingPhase, disposition)}
+      />
+    </View>
+  );
+}
+
+function RoutingStatusRow({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.routingStatusRow}>
+      <Text style={styles.routingStatusLabel}>{label}</Text>
+      <Text style={styles.routingStatusValue}>{value}</Text>
+    </View>
+  );
+}
+
+function scopeDescription(mode: SystemTunnelMode, apps: string[]): string {
+  if (mode === 'wholeDevice') return 'Whole device · compatible HTTPS only';
+  if (mode === 'selectedApps') {
+    return `${apps.length} selected app${apps.length === 1 ? '' : 's'}`;
+  }
+  return 'Not captured';
+}
+
+function scopeMatchesDraft(
+  mode: SystemTunnelMode,
+  selectedApps: string[],
+  draft: { mode: SystemTunnelMode; selectedApps: string[] },
+): boolean {
+  if (mode !== draft.mode || selectedApps.length !== draft.selectedApps.length) {
+    return false;
+  }
+  const expected = new Set(draft.selectedApps);
+  return expected.size === selectedApps.length &&
+    selectedApps.every(app => expected.has(app));
+}
+
+function routingPhaseDescription(
+  phase: string,
+  disposition: SystemTunnelTrafficDisposition,
+): string {
+  switch (phase) {
+    case 'requestingPermission':
+      return 'Waiting for Android VPN permission';
+    case 'starting':
+    case 'startingBlocking':
+      return 'Creating a blocking Android route';
+    case 'reconnecting':
+      return 'Reconnecting the MASQ data path';
+    case 'active':
+      return disposition === 'masq'
+        ? 'Route ready'
+        : disposition === 'blocked'
+          ? 'Route health mismatch · traffic blocked'
+          : 'Route health mismatch · capture not confirmed';
+    case 'stopping':
+      return 'Stopping';
+    case 'revoked':
+      return 'Android VPN permission revoked';
+    case 'blocked':
+      return 'Waiting for a safe MASQ route';
+    default:
+      return 'Off';
+  }
 }
 
 const styles = StyleSheet.create({
@@ -434,6 +598,40 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 19,
     marginTop: 6,
+  },
+  routingStatus: {
+    backgroundColor: '#102338',
+    borderColor: '#31506C',
+    borderRadius: radii.medium,
+    borderWidth: 1,
+    marginBottom: 14,
+    padding: 14,
+  },
+  routingStatusTitle: {
+    color: colors.white,
+    fontSize: 15,
+    fontWeight: '900',
+    marginBottom: 5,
+  },
+  routingStatusRow: {
+    borderTopColor: '#29445E',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 9,
+  },
+  routingStatusLabel: {
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginRight: 12,
+  },
+  routingStatusValue: {
+    color: colors.white,
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '700',
+    textAlign: 'right',
   },
   scope: {
     alignItems: 'flex-start',

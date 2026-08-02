@@ -5,6 +5,15 @@ export type SystemTunnelPhase =
   | 'active'
   | 'stopping'
   | 'blocked';
+export type SystemTunnelRoutingPhase =
+  | 'off'
+  | 'requestingPermission'
+  | 'startingBlocking'
+  | 'reconnecting'
+  | 'active'
+  | 'blocked'
+  | 'stopping'
+  | 'revoked';
 export type SystemTunnelTrafficDisposition =
   | 'masq'
   | 'blocked'
@@ -13,15 +22,27 @@ export type SystemTunnelTrafficDisposition =
 
 export interface SystemTunnelStatus {
   active: boolean;
+  alwaysOn?: boolean;
   appliedMode?: SystemTunnelMode;
   appliedRevision?: number | null;
   appliedSelectedApps?: string[];
+  coreRouteReady?: boolean;
+  desiredMode?: SystemTunnelMode;
+  desiredRevision?: number | null;
+  desiredSelectedApps?: string[];
+  failClosedDesired?: boolean;
   lastError: string | null;
+  lockdown?: boolean;
   mode: SystemTunnelMode;
   phase: SystemTunnelPhase;
+  routingPhase?: SystemTunnelRoutingPhase;
+  schemaVersion?: number;
   selectedApps: string[];
   supported: boolean;
   trafficDisposition?: SystemTunnelTrafficDisposition;
+  trafficObserved?: boolean;
+  translatorReady?: boolean;
+  tunPresent?: boolean;
 }
 
 export interface RoutableApp {
@@ -52,6 +73,7 @@ export function decodeSystemTunnelStatus(
     wireStatus,
     'schemaVersion',
   );
+  const versioned = wireStatus.schemaVersion === 2;
   const hasTrafficDisposition = Object.prototype.hasOwnProperty.call(
     wireStatus,
     'trafficDisposition',
@@ -63,8 +85,10 @@ export function decodeSystemTunnelStatus(
   if (
     typeof status.supported !== 'boolean' ||
     typeof status.active !== 'boolean' ||
-    (hasSchemaVersion && wireStatus.schemaVersion !== 2) ||
-    (wireStatus.schemaVersion === 2 && !hasTrafficDisposition) ||
+    (hasSchemaVersion && !versioned) ||
+    (versioned &&
+      (!hasTrafficDisposition ||
+        !isVersionedSystemTunnelStatus(status, wireStatus))) ||
     (hasTrafficDisposition &&
       !['masq', 'blocked', 'directRisk', 'off'].includes(
         String(status.trafficDisposition),
@@ -101,11 +125,87 @@ export function decodeSystemTunnelStatus(
   return status as SystemTunnelStatus;
 }
 
+function isVersionedSystemTunnelStatus(
+  status: Partial<SystemTunnelStatus>,
+  wireStatus: Record<string, unknown>,
+): boolean {
+  const desiredMode = status.desiredMode;
+  const appliedMode = status.appliedMode;
+  const desiredApps = status.desiredSelectedApps;
+  const appliedApps = status.appliedSelectedApps;
+  return (
+    [
+      'active',
+      'alwaysOn',
+      'coreRouteReady',
+      'failClosedDesired',
+      'lockdown',
+      'supported',
+      'trafficObserved',
+      'translatorReady',
+      'tunPresent',
+    ].every(field => typeof wireStatus[field] === 'boolean') &&
+    [
+      'off',
+      'requestingPermission',
+      'startingBlocking',
+      'reconnecting',
+      'active',
+      'blocked',
+      'stopping',
+      'revoked',
+    ].includes(String(status.routingPhase)) &&
+    ['off', 'wholeDevice', 'selectedApps'].includes(desiredMode || '') &&
+    ['off', 'wholeDevice', 'selectedApps'].includes(appliedMode || '') &&
+    validRevision(status.desiredRevision) &&
+    validRevision(status.appliedRevision) &&
+    validScope(desiredMode, status.desiredRevision, desiredApps) &&
+    validScope(appliedMode, status.appliedRevision, appliedApps) &&
+    status.mode === desiredMode &&
+    Array.isArray(status.selectedApps) &&
+    sameApps(status.selectedApps, desiredApps || [])
+  );
+}
+
+function validRevision(value: unknown): value is number | null {
+  return (
+    value === null ||
+    (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
+  );
+}
+
+function validScope(
+  mode: SystemTunnelMode | undefined,
+  revision: number | null | undefined,
+  apps: string[] | undefined,
+): boolean {
+  if (
+    !mode ||
+    !Array.isArray(apps) ||
+    !apps.every(app => typeof app === 'string' && app.length > 0)
+  ) {
+    return false;
+  }
+  if (mode === 'off') {
+    return apps.length === 0;
+  }
+  if (revision === null || revision === undefined) {
+    return false;
+  }
+  return mode === 'selectedApps' ? apps.length > 0 : apps.length === 0;
+}
+
 export function systemTunnelTrafficDisposition(
   status: SystemTunnelStatus,
 ): SystemTunnelTrafficDisposition {
   if (status.trafficDisposition) {
-    return status.trafficDisposition;
+    if (status.trafficDisposition !== 'masq') {
+      return status.trafficDisposition;
+    }
+    if (isVerifiedSystemTunnelRoute(status)) {
+      return 'masq';
+    }
+    return status.tunPresent ? 'blocked' : 'directRisk';
   }
   if (status.active && status.phase === 'active') {
     return 'masq';
@@ -117,6 +217,64 @@ export function systemTunnelTrafficDisposition(
     return 'directRisk';
   }
   return 'off';
+}
+
+export function isVerifiedSystemTunnelRoute(
+  status: SystemTunnelStatus,
+): boolean {
+  if (
+    !status.active ||
+    status.phase !== 'active' ||
+    (status.routingPhase !== undefined && status.routingPhase !== 'active')
+  ) {
+    return false;
+  }
+  if (status.schemaVersion !== 2) {
+    return true;
+  }
+  const desired = desiredSystemTunnelScope(status);
+  const applied = appliedSystemTunnelScope(status);
+  return (
+    status.trafficDisposition === 'masq' &&
+    status.tunPresent === true &&
+    status.translatorReady === true &&
+    status.coreRouteReady === true &&
+    desired.revision !== null &&
+    desired.revision !== 'legacy' &&
+    desired.revision === applied.revision &&
+    desired.mode !== 'off' &&
+    desired.mode === applied.mode &&
+    sameApps(desired.selectedApps, applied.selectedApps)
+  );
+}
+
+export function desiredSystemTunnelScope(status: SystemTunnelStatus): {
+  mode: SystemTunnelMode;
+  revision: number | null | 'legacy';
+  selectedApps: string[];
+} {
+  const { desiredMode, desiredRevision, desiredSelectedApps } = status;
+  const hasCompositeScope =
+    desiredMode !== undefined &&
+    desiredRevision !== undefined &&
+    desiredSelectedApps !== undefined;
+  return hasCompositeScope
+    ? {
+        mode: desiredMode,
+        revision: desiredRevision,
+        selectedApps: desiredSelectedApps,
+      }
+    : {
+        mode: status.mode,
+        revision: 'legacy',
+        selectedApps: status.selectedApps,
+      };
+}
+
+export function desiredSystemTunnelScopeKey(
+  status: SystemTunnelStatus,
+): string {
+  return systemTunnelScopeKey(desiredSystemTunnelScope(status));
 }
 
 export function appliedSystemTunnelScope(status: SystemTunnelStatus): {
@@ -145,7 +303,14 @@ export function appliedSystemTunnelScope(status: SystemTunnelStatus): {
 export function appliedSystemTunnelScopeKey(
   status: SystemTunnelStatus,
 ): string {
-  const scope = appliedSystemTunnelScope(status);
+  return systemTunnelScopeKey(appliedSystemTunnelScope(status));
+}
+
+function systemTunnelScopeKey(scope: {
+  mode: SystemTunnelMode;
+  revision: number | null | 'legacy';
+  selectedApps: string[];
+}): string {
   return [
     scope.revision === null || scope.revision === 'legacy'
       ? 'none'
@@ -153,6 +318,15 @@ export function appliedSystemTunnelScopeKey(
     scope.mode,
     ...[...scope.selectedApps].sort(),
   ].join('\u0000');
+}
+
+function sameApps(first: string[], second: string[]): boolean {
+  const sortedFirst = [...first].sort();
+  const sortedSecond = [...second].sort();
+  return (
+    first.length === second.length &&
+    sortedFirst.every((app, index) => app === sortedSecond[index])
+  );
 }
 
 export function decodeRoutableApps(serialized: string): RoutableApp[] {

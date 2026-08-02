@@ -7,13 +7,24 @@ import org.junit.Test
 class MasqSessionServiceTest {
   @Test
   fun requiresAConnectedPeerAndRouteBeforeReportingAHealthySession() {
-    val healthy = MasqSessionCoreSnapshot("connected", connectedNeighbors = 1, routeStage = 1)
-    val noPeer = MasqSessionCoreSnapshot("connected", connectedNeighbors = 0, routeStage = 1)
-    val noRoute = MasqSessionCoreSnapshot("connected", connectedNeighbors = 1, routeStage = 0)
+    val healthy =
+        MasqSessionCoreSnapshot(
+            "connected",
+            connectedNeighbors = 1,
+            routeStage = 1,
+            proxyPort = 44_443,
+            engineGeneration = 3,
+        )
+    val noPeer = healthy.copy(connectedNeighbors = 0)
+    val noRoute = healthy.copy(routeStage = 0)
+    val noProxy = healthy.copy(proxyPort = 0)
+    val noEngine = healthy.copy(engineGeneration = 0)
 
     assertTrue(healthy.isHealthyConnectedSession())
     assertFalse(noPeer.isHealthyConnectedSession())
     assertFalse(noRoute.isHealthyConnectedSession())
+    assertFalse(noProxy.isHealthyConnectedSession())
+    assertFalse(noEngine.isHealthyConnectedSession())
   }
 
   @Test

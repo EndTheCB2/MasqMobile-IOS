@@ -1953,6 +1953,7 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "libsecp256k1 0.7.0",
+ "native-tls",
  "node",
  "once_cell",
  "serde",
@@ -2210,9 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "net2"
-version = "0.2.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ebc3ec692ed7c9a255596c67808dee269f64655d8baf7b4f0638e51ba1d6853"
+version = "0.2.39"
 dependencies = [
  "cfg-if 0.1.10",
  "libc",
@@ -2308,6 +2307,7 @@ dependencies = [
  "sodiumoxide",
  "sysinfo",
  "system-configuration",
+ "tempfile",
  "test_utilities",
  "thousands",
  "time 0.3.11",

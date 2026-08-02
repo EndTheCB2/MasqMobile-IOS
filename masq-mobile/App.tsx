@@ -18,6 +18,7 @@ import {
   closeBrowserSession,
   prepareBrowserSession,
 } from './src/core/browserSession';
+import { isCoreReadyForSystemRouting } from './src/core/connectionReadiness';
 import { buildRedactedDiagnostics } from './src/core/diagnostics';
 import { classifyMasqIssue } from './src/core/issues';
 import {
@@ -429,6 +430,11 @@ function AppContent() {
           entryNodeRefresh={controller.entryNodeRefresh}
           issue={activeIssue}
           walletBalance={controller.walletBalance}
+          debtSummary={controller.debtSummary}
+          debtSettlementQuote={controller.debtSettlementQuote}
+          debtSettlementStatus={controller.debtSettlementStatus}
+          debtSettlementBusy={controller.debtSettlementBusy}
+          debtSettlementError={controller.debtSettlementError}
           systemTunnel={controller.systemTunnel}
           onConnect={connect}
           onRetryInitialization={() => {
@@ -461,6 +467,28 @@ function AppContent() {
           onRefreshWalletBalance={() =>
             controller.refreshWalletBalance().catch(() => undefined)
           }
+          onRefreshDebtSummary={() =>
+            controller.refreshDebtSummary().catch(() => undefined)
+          }
+          onReviewDebtSettlement={() =>
+            controller.reviewDebtSettlement().catch(() => undefined)
+          }
+          onConfirmDebtSettlement={() =>
+            controller.confirmDebtSettlement().catch(() => undefined)
+          }
+          onRetryDebtSettlement={() =>
+            controller.retryDebtSettlement().catch(() => undefined)
+          }
+          onDismissDebtSettlement={controller.dismissDebtSettlement}
+          onOpenSettlementTransaction={transactionHash => {
+            const explorer =
+              controller.status.chain === 'base-sepolia'
+                ? 'https://sepolia.basescan.org/tx/'
+                : 'https://basescan.org/tx/';
+            Linking.openURL(`${explorer}${transactionHash}`).catch(() =>
+              setRouteError('The BaseScan transaction link could not be opened.'),
+            );
+          }}
           status={controller.status}
         />
       ) : null}
@@ -482,7 +510,7 @@ function AppContent() {
       {route === 'routing' ? (
         <TrafficRoutingScreen
           busy={controller.systemTunnelBusy}
-          connected={controller.status.phase === 'connected'}
+          connected={isCoreReadyForSystemRouting(controller.status)}
           routableApps={controller.routableApps}
           status={controller.systemTunnel}
           onApply={controller.updateSystemTunnel}

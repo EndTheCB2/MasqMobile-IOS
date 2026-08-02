@@ -22,6 +22,7 @@ internal data class PacketTunnelSnapshot(
     val state: PacketTunnelNativeState,
     val generation: Long?,
     val lastResult: String?,
+    val trafficObserved: Boolean = false,
 )
 
 internal interface PacketTunnelNativeApi {
@@ -52,6 +53,7 @@ internal object JniPacketTunnelNativeApi : PacketTunnelNativeApi {
             },
         generation = value.optLong("generation").takeIf { it > 0 },
         lastResult = value.optString("lastResult").takeIf(String::isNotBlank),
+        trafficObserved = value.optBoolean("trafficObserved", false),
     )
   }
 }

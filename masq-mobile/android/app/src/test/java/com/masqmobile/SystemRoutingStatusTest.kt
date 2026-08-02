@@ -13,6 +13,17 @@ class SystemRoutingStatusTest {
     assertTrue(status.active)
     assertEquals(SystemRoutingPhase.ACTIVE, status.phase)
     assertEquals(SystemRoutingTrafficDisposition.MASQ, status.trafficDisposition)
+    assertFalse(status.trafficObserved)
+  }
+
+  @Test
+  fun trafficObservationIsReportedOnlyForAHealthyCurrentRoute() {
+    val observed = wholeDeviceStatus(trafficObserved = true)
+    val staleObservation =
+        wholeDeviceStatus(coreRouteReady = false, trafficObserved = true)
+
+    assertTrue(observed.trafficObserved)
+    assertFalse(staleObservation.trafficObserved)
   }
 
   @Test
@@ -231,7 +242,8 @@ class SystemRoutingStatusTest {
                 desiredApps =
                     listOf("org.example.browser", "Com.Example.Video"),
                 appliedApps =
-                    listOf("Com.Example.Video", "org.example.browser"),
+            listOf("Com.Example.Video", "org.example.browser"),
+                trafficObserved = true,
             )
             .toJson(),
     )
@@ -253,6 +265,7 @@ class SystemRoutingStatusTest {
       tunPresent: Boolean = true,
       translatorReady: Boolean = true,
       coreRouteReady: Boolean = true,
+      trafficObserved: Boolean = false,
       lastError: SystemRoutingDiagnostic? = null,
   ): SystemRoutingStatus =
       SystemRoutingStatus.derive(
@@ -268,6 +281,7 @@ class SystemRoutingStatusTest {
           tunPresent = tunPresent,
           translatorReady = translatorReady,
           coreRouteReady = coreRouteReady,
+          trafficObserved = trafficObserved,
           alwaysOn = true,
           lockdown = true,
           lastError = lastError,
@@ -280,6 +294,7 @@ class SystemRoutingStatusTest {
       appliedApps: Iterable<String> = listOf("com.example.browser"),
       alwaysOn: Boolean = true,
       lockdown: Boolean = true,
+      trafficObserved: Boolean = false,
   ): SystemRoutingStatus =
       SystemRoutingStatus.derive(
           supported = true,
@@ -294,6 +309,7 @@ class SystemRoutingStatusTest {
           tunPresent = true,
           translatorReady = true,
           coreRouteReady = true,
+          trafficObserved = trafficObserved,
           alwaysOn = alwaysOn,
           lockdown = lockdown,
       )

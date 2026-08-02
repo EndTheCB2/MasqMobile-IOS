@@ -3,6 +3,9 @@ import {
   appliedSystemTunnelScopeKey,
   decodeRoutableApps,
   decodeSystemTunnelStatus,
+  desiredSystemTunnelScope,
+  desiredSystemTunnelScopeKey,
+  isVerifiedSystemTunnelRoute,
   systemTunnelTrafficDisposition,
 } from '../src/core/systemTunnel';
 
@@ -66,6 +69,8 @@ describe('system tunnel native decoding', () => {
     expect(versioned.schemaVersion).toBe(2);
     expect(versioned.routingPhase).toBe('active');
     expect(versioned.trafficDisposition).toBe('masq');
+    expect(decoded.trafficObserved).toBe(true);
+    expect(isVerifiedSystemTunnelRoute(decoded)).toBe(true);
   });
 
   it.each(['masq', 'blocked', 'directRisk', 'off'] as const)(
@@ -87,7 +92,6 @@ describe('system tunnel native decoding', () => {
               : trafficDisposition === 'off'
                 ? 'off'
                 : 'blocked',
-            schemaVersion: 2,
             selectedApps: [],
             supported: true,
             trafficDisposition,
@@ -169,6 +173,77 @@ describe('system tunnel native decoding', () => {
         appliedRevision: 8,
       }),
     ).not.toBe(appliedSystemTunnelScopeKey(first));
+  });
+
+  it('uses desired scope for the editable draft while applied capture changes', () => {
+    const starting = decodeSystemTunnelStatus(
+      JSON.stringify({
+        active: false,
+        alwaysOn: false,
+        appliedMode: 'off',
+        appliedRevision: null,
+        appliedSelectedApps: [],
+        coreRouteReady: false,
+        desiredMode: 'wholeDevice',
+        desiredRevision: 12,
+        desiredSelectedApps: [],
+        failClosedDesired: false,
+        lastError: null,
+        lockdown: false,
+        mode: 'wholeDevice',
+        phase: 'starting',
+        routingPhase: 'startingBlocking',
+        schemaVersion: 2,
+        selectedApps: [],
+        supported: true,
+        trafficDisposition: 'directRisk',
+        trafficObserved: false,
+        translatorReady: false,
+        tunPresent: false,
+      }),
+    );
+    const captured = {
+      ...starting,
+      appliedMode: 'wholeDevice' as const,
+      appliedRevision: 12,
+      routingPhase: 'reconnecting' as const,
+      trafficDisposition: 'blocked' as const,
+      tunPresent: true,
+    };
+
+    expect(desiredSystemTunnelScope(starting)).toEqual({
+      mode: 'wholeDevice',
+      revision: 12,
+      selectedApps: [],
+    });
+    expect(desiredSystemTunnelScopeKey(captured)).toBe(
+      desiredSystemTunnelScopeKey(starting),
+    );
+    expect(appliedSystemTunnelScopeKey(captured)).not.toBe(
+      appliedSystemTunnelScopeKey(starting),
+    );
+  });
+
+  it('downgrades an inconsistent native MASQ claim to blocked or direct risk', () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        path.resolve(
+          __dirname,
+          '../android/app/src/test/resources/system-routing-status-v2.json',
+        ),
+        'utf8',
+      ),
+    );
+    const translatorStopped = decodeSystemTunnelStatus(
+      JSON.stringify({ ...fixture, translatorReady: false }),
+    );
+    const captureGone = decodeSystemTunnelStatus(
+      JSON.stringify({ ...fixture, tunPresent: false }),
+    );
+
+    expect(isVerifiedSystemTunnelRoute(translatorStopped)).toBe(false);
+    expect(systemTunnelTrafficDisposition(translatorStopped)).toBe('blocked');
+    expect(systemTunnelTrafficDisposition(captureGone)).toBe('directRisk');
   });
 
   it('rejects an incomplete applied native scope', () => {

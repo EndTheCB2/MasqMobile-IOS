@@ -46,6 +46,7 @@ class SystemRoutingStatus private constructor(
     val tunPresent: Boolean,
     val translatorReady: Boolean,
     val coreRouteReady: Boolean,
+    val trafficObserved: Boolean,
     val alwaysOn: Boolean,
     val lockdown: Boolean,
     val lastError: SystemRoutingDiagnostic?,
@@ -79,6 +80,7 @@ class SystemRoutingStatus private constructor(
         append(",\"tunPresent\":").append(tunPresent)
         append(",\"translatorReady\":").append(translatorReady)
         append(",\"coreRouteReady\":").append(coreRouteReady)
+        append(",\"trafficObserved\":").append(trafficObserved)
         append(",\"alwaysOn\":").append(alwaysOn)
         append(",\"lockdown\":").append(lockdown)
         append('}')
@@ -100,6 +102,7 @@ class SystemRoutingStatus private constructor(
         tunPresent: Boolean,
         translatorReady: Boolean,
         coreRouteReady: Boolean,
+        trafficObserved: Boolean = false,
         alwaysOn: Boolean,
         lockdown: Boolean,
         lastError: SystemRoutingDiagnostic? = null,
@@ -193,6 +196,7 @@ class SystemRoutingStatus private constructor(
           tunPresent = tunPresent,
           translatorReady = translatorReady,
           coreRouteReady = coreRouteReady,
+          trafficObserved = routeHealthy && trafficObserved,
           alwaysOn = alwaysOn,
           lockdown = lockdown,
           lastError = lastError,

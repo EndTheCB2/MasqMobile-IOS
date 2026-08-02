@@ -23,6 +23,27 @@ const ROUTABLE_APPS = [
   { id: 'org.example.video', label: 'Video' },
 ];
 
+function versionedStatus(
+  overrides: Partial<SystemTunnelStatus> = {},
+): SystemTunnelStatus {
+  return {
+    ...OFF_STATUS,
+    alwaysOn: false,
+    coreRouteReady: false,
+    desiredMode: 'off',
+    desiredRevision: null,
+    desiredSelectedApps: [],
+    failClosedDesired: false,
+    lockdown: false,
+    routingPhase: 'off',
+    schemaVersion: 2,
+    trafficObserved: false,
+    translatorReady: false,
+    tunPresent: false,
+    ...overrides,
+  };
+}
+
 function screen(
   status: SystemTunnelStatus,
   onApply: jest.Mock = jest.fn().mockResolvedValue(undefined),
@@ -67,7 +88,7 @@ describe('TrafficRoutingScreen native support gate', () => {
     expect(rendered).toContain('System tunnel unavailable');
     expect(rendered).not.toContain('Whole device');
     expect(rendered).not.toContain('Selected apps');
-    expect(rendered).not.toContain('Unsafe internal dogfood');
+    expect(rendered).not.toContain('Experimental community routing');
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -80,14 +101,15 @@ describe('TrafficRoutingScreen native support gate', () => {
     const rendered = JSON.stringify(renderer.toJSON());
     expect(rendered).toContain('Whole device');
     expect(rendered).toContain('Selected apps');
-    expect(rendered).toContain('Unsafe internal dogfood');
+    expect(rendered).toContain('Experimental community routing');
     expect(rendered).toContain(
       'Only IPv4 TCP connections to port 443 are sent through MASQ',
     );
     expect(rendered).toContain('DNS is handled virtually');
     expect(rendered).toContain('All other captured IP traffic');
     expect(rendered).toContain('ICMP, and unknown');
-    expect(rendered).toContain('example.com:443');
+    expect(rendered).toContain('encrypted connection to example.com');
+    expect(rendered).toContain('no page body is downloaded');
     expect(rendered).toContain(
       'MASQ packages installed when the route is created are excluded',
     );
@@ -154,6 +176,72 @@ describe('TrafficRoutingScreen native support gate', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
+  it('does not replace a dirty draft when an unrelated desired revision arrives', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(screen(versionedStatus()));
+    });
+    ReactTestRenderer.act(() => {
+      findControl(renderer, 'Selected apps').props.onPress();
+    });
+    ReactTestRenderer.act(() => {
+      findControl(renderer, 'Example').props.onPress();
+    });
+
+    ReactTestRenderer.act(() => {
+      renderer.update(
+        screen(
+          versionedStatus({
+            desiredRevision: 17,
+          }),
+        ),
+      );
+    });
+
+    expect(
+      findControl(renderer, 'Selected apps').props.accessibilityState.checked,
+    ).toBe(true);
+    expect(
+      findControl(renderer, 'Example').props.accessibilityState.checked,
+    ).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('keeps the requested whole-device scope while capture is starting', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(screen(versionedStatus()));
+    });
+    ReactTestRenderer.act(() => {
+      findControl(renderer, 'Whole device').props.onPress();
+    });
+
+    ReactTestRenderer.act(() => {
+      renderer.update(
+        screen(
+          versionedStatus({
+            desiredMode: 'wholeDevice',
+            desiredRevision: 12,
+            mode: 'wholeDevice',
+            phase: 'starting',
+            routingPhase: 'startingBlocking',
+            trafficDisposition: 'directRisk',
+          }),
+        ),
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('Requested');
+    expect(rendered).toContain('Whole device · compatible HTTPS only');
+    expect(rendered).toContain('Captured');
+    expect(rendered).toContain('Not captured');
+    expect(rendered).toContain('Creating a blocking Android route');
+    expect(rendered).not.toContain('Retry MASQ route');
+    expect(rendered).not.toContain('Private browser only');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('offers a reachable retry that reuses the exact saved scope', async () => {
     const onApply = jest.fn().mockResolvedValue(undefined);
     let renderer!: ReactTestRenderer.ReactTestRenderer;
@@ -182,6 +270,38 @@ describe('TrafficRoutingScreen native support gate', () => {
     expect(onApply).toHaveBeenCalledWith('selectedApps', [
       'org.example.video',
     ]);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('distinguishes a ready route from observed external app traffic', () => {
+    const active = versionedStatus({
+      active: true,
+      appliedMode: 'wholeDevice',
+      appliedRevision: 14,
+      coreRouteReady: true,
+      desiredMode: 'wholeDevice',
+      desiredRevision: 14,
+      mode: 'wholeDevice',
+      phase: 'active',
+      routingPhase: 'active',
+      trafficDisposition: 'masq',
+      translatorReady: true,
+      tunPresent: true,
+    });
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(screen(active));
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'MASQ route ready · waiting for compatible app traffic',
+    );
+    ReactTestRenderer.act(() => {
+      renderer.update(screen({ ...active, trafficObserved: true }));
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Captured HTTPS session reached the local MASQ adapter',
+    );
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -225,7 +345,7 @@ describe('TrafficRoutingScreen native support gate', () => {
 
       expect(onApply).not.toHaveBeenCalled();
       expect(JSON.stringify(renderer.toJSON())).toContain(
-        'Allow notifications before starting dogfood system routing',
+        'Allow notifications before starting community system routing',
       );
     } finally {
       ReactTestRenderer.act(() => renderer?.unmount());
@@ -293,7 +413,7 @@ describe('TrafficRoutingScreen native support gate', () => {
     }
   });
 
-  it('resynchronizes the draft when the applied native revision changes', () => {
+  it('shows a new desired native revision separately from applied capture', () => {
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {
       renderer = ReactTestRenderer.create(
@@ -318,12 +438,11 @@ describe('TrafficRoutingScreen native support gate', () => {
       );
     });
 
-    expect(
-      findControl(renderer, 'Whole device').props.accessibilityState.checked,
-    ).toBe(true);
-    expect(
-      findControl(renderer, 'Selected apps').props.accessibilityState.checked,
-    ).toBe(false);
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('Requested');
+    expect(rendered).toContain('Whole device · compatible HTTPS only');
+    expect(rendered).toContain('Captured');
+    expect(rendered).not.toContain('Private browser only');
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -341,7 +460,7 @@ describe('TrafficRoutingScreen native support gate', () => {
       findControl(renderer, 'Example').props.onPress();
     });
     ReactTestRenderer.act(() => {
-      findControl(renderer, 'Apply selected-app dogfood').props.onPress();
+      findControl(renderer, 'Apply selected-app routing').props.onPress();
     });
 
     expect(onApply).not.toHaveBeenCalled();
@@ -352,7 +471,7 @@ describe('TrafficRoutingScreen native support gate', () => {
     );
     const buttons = alert.mock.calls[0][2]!;
     const confirm = buttons.find(
-      button => button.text === 'Apply dogfood route',
+      button => button.text === 'Apply community route',
     );
     await ReactTestRenderer.act(async () => {
       confirm?.onPress?.();
@@ -442,6 +561,35 @@ describe('TrafficRoutingScreen native support gate', () => {
       'instead of sent through the normal connection',
     );
     expect(rendered).not.toContain('Traffic may be direct');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not call an inconsistent native active phase ready', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        screen(
+          versionedStatus({
+            active: true,
+            appliedMode: 'wholeDevice',
+            appliedRevision: 22,
+            coreRouteReady: false,
+            desiredMode: 'wholeDevice',
+            desiredRevision: 22,
+            mode: 'wholeDevice',
+            phase: 'active',
+            routingPhase: 'active',
+            trafficDisposition: 'masq',
+            translatorReady: true,
+            tunPresent: true,
+          }),
+        ),
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('Route health mismatch · traffic blocked');
+    expect(rendered).not.toContain('Route ready');
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });

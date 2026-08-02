@@ -24,6 +24,18 @@ fn with_core(operation: impl FnOnce(&mut MobileCore) -> Result<(), String>) -> *
     into_c_string(core.status_json())
 }
 
+fn with_core_value(
+    operation: impl FnOnce(&mut MobileCore) -> Result<String, String>,
+) -> *mut c_char {
+    let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let value = match operation(&mut core) {
+        Ok(value) => value,
+        Err(error) => serde_json::to_string(&serde_json::json!({ "error": error }))
+            .expect("native error serialization is infallible"),
+    };
+    into_c_string(value)
+}
+
 fn read_argument(value: *const c_char) -> Result<String, String> {
     if value.is_null() {
         return Err("Missing argument.".to_owned());
@@ -119,6 +131,44 @@ pub extern "C" fn masq_mobile_preflight_proxy() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn masq_mobile_set_proxy_enabled(enabled: bool) -> *mut c_char {
     with_core(|core| core.set_proxy_enabled(enabled))
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_get_debt_summary() -> *mut c_char {
+    with_core_value(|core| core.debt_summary_json())
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_prepare_debt_settlement() -> *mut c_char {
+    with_core_value(MobileCore::prepare_debt_settlement_json)
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_confirm_debt_settlement(
+    quote_id: *const c_char,
+    maximum_masq_wei: *const c_char,
+    maximum_estimated_l2_fee_wei: *const c_char,
+) -> *mut c_char {
+    let quote_id = read_argument(quote_id);
+    let maximum_masq_wei = read_argument(maximum_masq_wei);
+    let maximum_estimated_l2_fee_wei = read_argument(maximum_estimated_l2_fee_wei);
+    with_core_value(|core| {
+        core.confirm_debt_settlement_json(
+            &quote_id?,
+            &maximum_masq_wei?,
+            &maximum_estimated_l2_fee_wei?,
+        )
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_get_debt_settlement_status() -> *mut c_char {
+    with_core_value(|core| core.debt_settlement_status_json())
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_retry_debt_settlement() -> *mut c_char {
+    with_core_value(MobileCore::retry_debt_settlement_json)
 }
 
 #[no_mangle]

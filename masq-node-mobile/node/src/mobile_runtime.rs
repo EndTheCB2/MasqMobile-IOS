@@ -13,7 +13,9 @@ use masq_lib::ui_gateway::{MessageBody, NodeFromUiMessage};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +28,8 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
 static ROUTE_STAGE: AtomicU8 = AtomicU8::new(0);
 static ROUTE_HOPS: AtomicU8 = AtomicU8::new(0);
+static BYTES_UP: AtomicU64 = AtomicU64::new(0);
+static BYTES_DOWN: AtomicU64 = AtomicU64::new(0);
 static ENTRY_HANDSHAKE_MILESTONE: AtomicU8 = AtomicU8::new(EntryHandshakeMilestone::None as u8);
 static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(NO_EXIT_CODE);
 static SYSTEM: Mutex<Option<System>> = Mutex::new(None);
@@ -142,6 +146,8 @@ pub struct MobileRuntimeSnapshot {
     pub route_stage: u8,
     /// Actual outward MASQ hops in the most recently selected route.
     pub route_hops: u8,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
     pub last_exit_code: Option<i32>,
     pub last_connection_error: Option<String>,
     pub available_exit_countries: Vec<String>,
@@ -180,6 +186,8 @@ pub fn prepare(proxy_port: u16) {
     PROXY_PORT.store(proxy_port, Ordering::SeqCst);
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    BYTES_UP.store(0, Ordering::SeqCst);
+    BYTES_DOWN.store(0, Ordering::SeqCst);
     reset_entry_handshake_milestone();
     LAST_EXIT_CODE.store(NO_EXIT_CODE, Ordering::SeqCst);
     *LAST_CONNECTION_ERROR
@@ -579,6 +587,26 @@ pub fn report_available_exit_countries(mut countries: Vec<String>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = countries;
 }
 
+fn add_bytes(counter: &AtomicU64, amount: usize) {
+    if !is_embedded() {
+        return;
+    }
+    let amount = u64::try_from(amount).unwrap_or(u64::MAX);
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+/// Records clear client payload accepted for an outward mobile MASQ route.
+pub fn report_bytes_up(amount: usize) {
+    add_bytes(&BYTES_UP, amount);
+}
+
+/// Records clear response payload delivered from a mobile MASQ exit to the local client.
+pub fn report_bytes_down(amount: usize) {
+    add_bytes(&BYTES_DOWN, amount);
+}
+
 pub fn stop() {
     if !is_embedded() {
         return;
@@ -617,6 +645,8 @@ pub fn snapshot() -> MobileRuntimeSnapshot {
         },
         route_stage: ROUTE_STAGE.load(Ordering::SeqCst),
         route_hops: ROUTE_HOPS.load(Ordering::SeqCst),
+        bytes_up: BYTES_UP.load(Ordering::SeqCst),
+        bytes_down: BYTES_DOWN.load(Ordering::SeqCst),
         last_exit_code: if last_exit_code == NO_EXIT_CODE {
             None
         } else {
@@ -688,6 +718,8 @@ mod tests {
                 proxy_port: Some(44_443),
                 route_stage: 2,
                 route_hops: 3,
+                bytes_up: 0,
+                bytes_down: 0,
                 last_exit_code: None,
                 last_connection_error: None,
                 available_exit_countries: vec![],
@@ -705,6 +737,8 @@ mod tests {
                 proxy_port: None,
                 route_stage: 0,
                 route_hops: 0,
+                bytes_up: 0,
+                bytes_down: 0,
                 last_exit_code: Some(0),
                 last_connection_error: None,
                 available_exit_countries: vec![],
@@ -724,6 +758,26 @@ mod tests {
             Some("Stream connection failed")
         );
 
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn snapshot_tracks_mobile_payload_bytes_and_resets_them_for_a_new_run() {
+        prepare(44_443);
+        report_bytes_up(123);
+        report_bytes_up(7);
+        report_bytes_down(456);
+
+        let active = snapshot();
+        assert_eq!(active.bytes_up, 130);
+        assert_eq!(active.bytes_down, 456);
+
+        finish(0);
+        prepare(44_444);
+        let restarted = snapshot();
+        assert_eq!(restarted.bytes_up, 0);
+        assert_eq!(restarted.bytes_down, 0);
         finish(0);
     }
 

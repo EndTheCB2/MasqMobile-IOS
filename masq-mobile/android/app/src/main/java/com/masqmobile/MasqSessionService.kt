@@ -37,6 +37,8 @@ internal data class MasqSessionCoreSnapshot(
     val phase: String,
     val connectedNeighbors: Int,
     val routeStage: Int,
+    val proxyPort: Int = 0,
+    val engineGeneration: Long = 0,
 )
 
 internal fun masqSessionCoreSnapshot(statusJson: String): MasqSessionCoreSnapshot? =
@@ -46,13 +48,19 @@ internal fun masqSessionCoreSnapshot(statusJson: String): MasqSessionCoreSnapsho
                 phase = status.optString("phase"),
                 connectedNeighbors = status.optInt("connectedNeighbors", 0),
                 routeStage = status.optInt("routeStage", 0),
+                proxyPort = status.optInt("proxyPort", 0),
+                engineGeneration = status.optLong("engineGeneration", 0L),
             )
           }
         }
         .getOrNull()
 
 internal fun MasqSessionCoreSnapshot.isHealthyConnectedSession(): Boolean =
-    phase == "connected" && connectedNeighbors > 0 && routeStage > 0
+    phase == "connected" &&
+        connectedNeighbors > 0 &&
+        routeStage > 0 &&
+        proxyPort in 1..65535 &&
+        engineGeneration > 0
 
 internal fun masqSessionNotificationText(state: MasqSessionNotificationState): String =
     when (state) {
@@ -143,10 +151,11 @@ class MasqSessionService : Service() {
                       }
                       .getOrNull()
                 }
+            val coreGeneration = MasqCoreLifecycle.startGeneration.get()
             mainHandler.post {
               monitorInFlight.set(false)
               if (!destroyed && isSessionDesired()) {
-                applyCoreSnapshot(snapshot)
+                applyCoreSnapshot(snapshot, coreGeneration)
                 mainHandler.postDelayed(this, STATUS_POLL_INTERVAL_MILLIS)
               }
             }
@@ -320,8 +329,14 @@ class MasqSessionService : Service() {
     return true
   }
 
-  private fun applyCoreSnapshot(snapshot: MasqSessionCoreSnapshot?) {
+  private fun applyCoreSnapshot(
+      snapshot: MasqSessionCoreSnapshot?,
+      coreGeneration: Long,
+  ) {
     val now = SystemClock.elapsedRealtime()
+    if (snapshot?.isHealthyConnectedSession() != true) {
+      MasqVpnService.publishCoreRouteUnavailable(this)
+    }
     when {
       snapshot?.isHealthyConnectedSession() == true -> {
         moduleStartupDeadlineElapsed = 0L
@@ -331,6 +346,12 @@ class MasqSessionService : Service() {
         cpuRequired = true
         updateNotification(MasqSessionNotificationState.CONNECTED)
         refreshWakeLock()
+        MasqVpnService.recoverCoreRouteIfNeeded(
+            this,
+                snapshot.proxyPort,
+                coreGeneration,
+                snapshot.engineGeneration,
+            )
       }
       snapshot?.phase == "connecting" && connectingIsMakingProgress(snapshot, now) -> {
         terminalObservations = 0

@@ -16,6 +16,9 @@ import {
 import {
   EMPTY_STATUS,
   type CoreStatus,
+  type DebtSettlementQuote,
+  type DebtSettlementStatus,
+  type DebtSummary,
   type MasqConfig,
   type NetworkStatus,
 } from './types';
@@ -87,6 +90,15 @@ export interface MasqCore {
   resetNetworkProfile(): Promise<CoreStatus>;
   removeWallet(): Promise<CoreStatus>;
   preflightBrowserProxy(): Promise<CoreStatus>;
+  getDebtSummary(): Promise<DebtSummary>;
+  prepareDebtSettlement(): Promise<DebtSettlementQuote>;
+  confirmDebtSettlement(
+    quoteId: string,
+    maximumMasqWei: string,
+    maximumEstimatedL2FeeWei: string,
+  ): Promise<DebtSettlementStatus>;
+  retryDebtSettlement(): Promise<DebtSettlementStatus>;
+  getDebtSettlementStatus(): Promise<DebtSettlementStatus>;
   getSystemTunnelStatus(): Promise<SystemTunnelStatus>;
   getRoutableApps(): Promise<RoutableApp[]>;
   setSystemTunnel(
@@ -183,6 +195,42 @@ class NativeCore implements MasqCore {
 
   async preflightBrowserProxy(): Promise<CoreStatus> {
     return decodeOperationStatus(await NativeMasqCore!.preflightBrowserProxy());
+  }
+
+  async getDebtSummary(): Promise<DebtSummary> {
+    return decodeDebtSummary(await NativeMasqCore!.getDebtSummary());
+  }
+
+  async prepareDebtSettlement(): Promise<DebtSettlementQuote> {
+    return decodeDebtSettlementQuote(
+      await NativeMasqCore!.prepareDebtSettlement(),
+    );
+  }
+
+  async confirmDebtSettlement(
+    quoteId: string,
+    maximumMasqWei: string,
+    maximumEstimatedL2FeeWei: string,
+  ): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.confirmDebtSettlement(
+        quoteId,
+        maximumMasqWei,
+        maximumEstimatedL2FeeWei,
+      ),
+    );
+  }
+
+  async getDebtSettlementStatus(): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.getDebtSettlementStatus(),
+    );
+  }
+
+  async retryDebtSettlement(): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.retryDebtSettlement(),
+    );
   }
 
   async getSystemTunnelStatus(): Promise<SystemTunnelStatus> {
@@ -351,6 +399,26 @@ class MissingNativeCore implements MasqCore {
     return this.status;
   }
 
+  async getDebtSummary(): Promise<DebtSummary> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async prepareDebtSettlement(): Promise<DebtSettlementQuote> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async confirmDebtSettlement(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async getDebtSettlementStatus(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async retryDebtSettlement(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
   async getSystemTunnelStatus(): Promise<SystemTunnelStatus> {
     return {
       supported: false,
@@ -459,6 +527,104 @@ function decodeBrowserRoutingMode(serialized: string): BrowserRoutingMode {
   return serialized;
 }
 
+function isWeiString(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9]{1,39}$/.test(value);
+}
+
+function isSafeCount(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+export function decodeDebtSummary(serialized: string): DebtSummary {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid MASQ debt summary.');
+  }
+  const summary = parsed as Partial<DebtSummary>;
+  if (
+    !isWeiString(summary.totalMasqWei) ||
+    !isSafeCount(summary.creditorCount) ||
+    typeof summary.settlementInProgress !== 'boolean'
+  ) {
+    throw new Error('The native core returned an invalid MASQ debt summary.');
+  }
+  return summary as DebtSummary;
+}
+
+export function decodeDebtSettlementQuote(
+  serialized: string,
+): DebtSettlementQuote {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid settlement quote.');
+  }
+  const quote = parsed as Partial<DebtSettlementQuote>;
+  if (
+    typeof quote.quoteId !== 'string' ||
+    !/^[0-9a-f]{32}$/.test(quote.quoteId) ||
+    !isSafeCount(quote.createdAtUnixSeconds) ||
+    !isSafeCount(quote.expiresAtUnixSeconds) ||
+    quote.expiresAtUnixSeconds <= quote.createdAtUnixSeconds ||
+    !isWeiString(quote.totalMasqWei) ||
+    !isWeiString(quote.estimatedL2FeeWei) ||
+    !isWeiString(quote.masqBalanceWei) ||
+    !isWeiString(quote.baseEthBalanceWei) ||
+    !isSafeCount(quote.creditorCount) ||
+    quote.creditorCount < 1 ||
+    quote.creditorCount > 20 ||
+    typeof quote.hasMoreCreditors !== 'boolean' ||
+    quote.feeEstimateIncludesL1DataFee !== false ||
+    quote.requiresDeviceAuthentication !== false ||
+    quote.requiresExplicitConfirmation !== true
+  ) {
+    throw new Error('The native core returned an invalid settlement quote.');
+  }
+  return quote as DebtSettlementQuote;
+}
+
+export function decodeDebtSettlementStatus(
+  serialized: string,
+): DebtSettlementStatus {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid settlement status.');
+  }
+  const status = parsed as Partial<DebtSettlementStatus>;
+  const phases = [
+    'idle',
+    'reserved',
+    'submitted',
+    'attention',
+    'failed',
+    'completed',
+  ];
+  if (
+    (typeof status.operationId !== 'string' && status.operationId !== null) ||
+    (typeof status.operationId === 'string' &&
+      !/^[0-9a-f]{32}$/.test(status.operationId)) ||
+    typeof status.phase !== 'string' ||
+    !phases.includes(status.phase) ||
+    !isWeiString(status.totalMasqWei) ||
+    !isWeiString(status.estimatedL2FeeWei) ||
+    !isSafeCount(status.transactionCount) ||
+    !isSafeCount(status.confirmedTransactionCount) ||
+    status.confirmedTransactionCount > status.transactionCount ||
+    !Array.isArray(status.transactionHashes) ||
+    status.transactionHashes.length !== status.transactionCount ||
+    !status.transactionHashes.every(
+      hash => typeof hash === 'string' && /^0x[0-9a-f]{64}$/.test(hash),
+    ) ||
+    (typeof status.errorCode !== 'string' && status.errorCode !== null)
+  ) {
+    throw new Error('The native core returned an invalid settlement status.');
+  }
+  return status as DebtSettlementStatus;
+}
+
 function decodeStatus(serialized: string): CoreStatus {
   const parsed: unknown = JSON.parse(serialized);
   if (!isCoreStatus(parsed)) {
@@ -485,6 +651,9 @@ function isCoreStatus(value: unknown): value is CoreStatus {
   return (
     typeof status.phase === 'string' &&
     typeof status.engineAvailable === 'boolean' &&
+    typeof status.engineGeneration === 'number' &&
+    Number.isSafeInteger(status.engineGeneration) &&
+    status.engineGeneration >= 0 &&
     typeof status.proxyEnabled === 'boolean' &&
     (typeof status.proxyPort === 'number' || status.proxyPort === null) &&
     (typeof status.chain === 'string' || status.chain === null) &&

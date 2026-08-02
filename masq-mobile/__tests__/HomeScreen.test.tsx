@@ -6,6 +6,8 @@ import { HomeScreen } from '../src/screens/HomeScreen';
 import {
   EMPTY_STATUS,
   type CoreStatus,
+  type DebtSettlementQuote,
+  type DebtSummary,
   type NetworkStatus,
 } from '../src/core/types';
 import { EMPTY_WALLET_BALANCE } from '../src/core/walletBalance';
@@ -40,6 +42,11 @@ function homeScreen(
     systemTunnel?: SystemTunnelStatus;
     entryNodeRefresh?: EntryNodeRefreshProgress | null;
     connectionProgress?: { step: number; total: number; label: string };
+    debtSummary?: DebtSummary;
+    debtSettlementQuote?: DebtSettlementQuote | null;
+    onReviewDebtSettlement?: () => void;
+    onConfirmDebtSettlement?: () => void;
+    onDismissDebtSettlement?: () => void;
   } = {},
 ) {
   return (
@@ -66,6 +73,8 @@ function homeScreen(
       }
       issue={null}
       walletBalance={EMPTY_WALLET_BALANCE}
+      debtSummary={options.debtSummary}
+      debtSettlementQuote={options.debtSettlementQuote}
       systemTunnel={options.systemTunnel ?? UNSUPPORTED_SYSTEM_TUNNEL}
       network={options.network ?? network}
       onConnect={jest.fn()}
@@ -85,6 +94,15 @@ function homeScreen(
       onShareDiagnostics={jest.fn()}
       onUpdateMinHops={jest.fn()}
       onRefreshWalletBalance={jest.fn()}
+      onReviewDebtSettlement={
+        options.onReviewDebtSettlement ?? jest.fn()
+      }
+      onConfirmDebtSettlement={
+        options.onConfirmDebtSettlement ?? jest.fn()
+      }
+      onDismissDebtSettlement={
+        options.onDismissDebtSettlement ?? jest.fn()
+      }
       status={{
         ...EMPTY_STATUS,
         chain: 'base-mainnet',
@@ -219,7 +237,7 @@ describe('HomeScreen connection controls', () => {
     expect(rendered).toContain('TRAFFIC SCOPE');
     expect(rendered).toContain('Private browser only');
     expect(rendered).toContain(
-      'Configure unsafe device or selected-app dogfood routing',
+      'Configure experimental device or selected-app routing',
     );
     const control = renderer.root.find(
       node =>
@@ -296,7 +314,7 @@ describe('HomeScreen connection controls', () => {
         node
           .findAllByType(Text)
           .some(
-            text => text.props.children === 'Whole-device dogfood route active',
+            text => text.props.children === 'Whole-device HTTPS route ready',
           ),
     );
     ReactTestRenderer.act(() => control.props.onPress());
@@ -555,6 +573,85 @@ describe('HomeScreen connection controls', () => {
           .some(text => text.props.children === 'Browse without MASQ'),
     );
     expect(directButton.props.disabled).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('requires an explicit in-app confirmation without device authentication', () => {
+    const onReviewDebtSettlement = jest.fn();
+    const onConfirmDebtSettlement = jest.fn();
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          { phase: 'ready' },
+          {
+            busy: false,
+            debtSummary: {
+              totalMasqWei: '230081000000000',
+              creditorCount: 11,
+              settlementInProgress: false,
+            },
+            onReviewDebtSettlement,
+          },
+        ),
+      );
+    });
+
+    const reviewButton = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Review MASQ debts'),
+    );
+    ReactTestRenderer.act(() => reviewButton.props.onPress());
+    expect(onReviewDebtSettlement).toHaveBeenCalledTimes(1);
+
+    ReactTestRenderer.act(() => {
+      renderer.update(
+        homeScreen(
+          jest.fn(),
+          { phase: 'ready' },
+          {
+            busy: false,
+            debtSummary: {
+              totalMasqWei: '230081000000000',
+              creditorCount: 11,
+              settlementInProgress: false,
+            },
+            debtSettlementQuote: {
+              quoteId: '0123456789abcdef0123456789abcdef',
+              createdAtUnixSeconds: 1_700_000_000,
+              expiresAtUnixSeconds: 1_700_000_300,
+              totalMasqWei: '230081000000000',
+              estimatedL2FeeWei: '4200000000000',
+              masqBalanceWei: '1000000000000000000',
+              baseEthBalanceWei: '100000000000000000',
+              creditorCount: 11,
+              hasMoreCreditors: false,
+              feeEstimateIncludesL1DataFee: false,
+              requiresDeviceAuthentication: false,
+              requiresExplicitConfirmation: true,
+            },
+            onConfirmDebtSettlement,
+          },
+        ),
+      );
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'No device code or biometric check is used',
+    );
+    const settleButton = renderer.root.find(
+      node =>
+        node.props.accessibilityRole === 'button' &&
+        node
+          .findAllByType(Text)
+          .some(text => text.props.children === 'Settle now'),
+    );
+    ReactTestRenderer.act(() => settleButton.props.onPress());
+    expect(onConfirmDebtSettlement).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });

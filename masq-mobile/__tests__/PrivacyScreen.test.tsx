@@ -35,6 +35,12 @@ describe('PrivacyScreen', () => {
       'MASQ hops and exit-country settings do not apply',
     );
     expect(content).toContain('Wallet secret stays on this device');
+    expect(content).toContain(
+      'Debt settlement is an explicit blockchain action',
+    );
+    expect(content).toContain('tapping Settle now is the final confirmation');
+    expect(content).toContain('public on Base');
+    expect(content).toContain('never retried automatically');
     expect(content).toContain('Browser sessions are temporary by default');
     expect(content).toContain('Remember sign-in');
     expect(content).toContain('ENS preview uses an HTTPS gateway');
@@ -93,11 +99,12 @@ describe('PrivacyScreen', () => {
         );
       });
       const content = JSON.stringify(renderer.toJSON());
-      expect(content).toContain('Android dogfood system routing is limited');
+      expect(content).toContain('Android community system routing is limited');
       expect(content).toContain('IPv4 TCP/443 and virtual DNS');
       expect(content).toContain('All other captured IP traffic');
       expect(content).toContain('ICMP and unknown transports');
-      expect(content).toContain('example.com:443');
+      expect(content).toContain('encrypted HEAD request to example.com');
+      expect(content).toContain('no page body is downloaded');
       expect(content).toContain('Selected package IDs and the consent timestamp');
       expect(content).toContain('shared-UID apps can share routing');
       expect(content).toContain('attached restricted profiles');

@@ -16,6 +16,15 @@ export interface Spec extends TurboModule {
   resetNetworkProfile(): Promise<string>;
   removeWallet(): Promise<string>;
   preflightBrowserProxy(): Promise<string>;
+  getDebtSummary(): Promise<string>;
+  prepareDebtSettlement(): Promise<string>;
+  confirmDebtSettlement(
+    quoteId: string,
+    maximumMasqWei: string,
+    maximumEstimatedL2FeeWei: string,
+  ): Promise<string>;
+  retryDebtSettlement(): Promise<string>;
+  getDebtSettlementStatus(): Promise<string>;
   getSystemTunnelStatus(): Promise<string>;
   getRoutableApps(): Promise<string>;
   setSystemTunnel(mode: string, appIdsJson: string): Promise<string>;

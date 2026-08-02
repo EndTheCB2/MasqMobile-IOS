@@ -14,7 +14,6 @@ if [ "${MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD:-NO}" = "YES" ]; then
   exit 1
 fi
 unset MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD
-
 : "${MASQ_NODE_FINDER_URL:?Set MASQ_NODE_FINDER_URL to the reviewed HTTPS node-finder endpoint.}"
 : "${MASQ_ANDROID_KEYSTORE:?Set MASQ_ANDROID_KEYSTORE to the private release-keystore path.}"
 : "${MASQ_ANDROID_KEYSTORE_PASSWORD:?Set MASQ_ANDROID_KEYSTORE_PASSWORD without writing it to source control.}"

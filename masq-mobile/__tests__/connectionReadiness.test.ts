@@ -1,4 +1,7 @@
-import { startAndAwaitMasqConnection } from '../src/core/connectionReadiness';
+import {
+  isCoreReadyForSystemRouting,
+  startAndAwaitMasqConnection,
+} from '../src/core/connectionReadiness';
 import { EMPTY_STATUS, type CoreStatus } from '../src/core/types';
 
 function status(overrides: Partial<CoreStatus>): CoreStatus {
@@ -6,6 +9,25 @@ function status(overrides: Partial<CoreStatus>): CoreStatus {
 }
 
 describe('MASQ connection readiness', () => {
+  it('requires a peer, route progress, and proxy port for system routing', () => {
+    const ready = status({
+      phase: 'connected',
+      connectedNeighbors: 1,
+      routeStage: 1,
+      proxyPort: 44_443,
+    });
+    expect(isCoreReadyForSystemRouting(ready)).toBe(true);
+    expect(
+      isCoreReadyForSystemRouting({ ...ready, connectedNeighbors: 0 }),
+    ).toBe(false);
+    expect(isCoreReadyForSystemRouting({ ...ready, routeStage: 0 })).toBe(
+      false,
+    );
+    expect(isCoreReadyForSystemRouting({ ...ready, proxyPort: null })).toBe(
+      false,
+    );
+  });
+
   it('waits for a confirmed neighbor instead of treating start as connected', async () => {
     const onStatus = jest.fn();
     const getStatus = jest

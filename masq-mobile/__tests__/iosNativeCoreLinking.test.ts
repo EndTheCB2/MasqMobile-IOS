@@ -87,7 +87,18 @@ describe('iOS native MASQ core linkage', () => {
     expect(bridgeSource).toContain('&masq_mobile_update_min_hops');
     expect(bridgeSource).toContain('&masq_mobile_start');
     expect(bridgeSource).toContain('&masq_mobile_shutdown');
+    expect(bridgeSource).toContain('&masq_mobile_confirm_debt_settlement');
     expect(bridgeSource).toContain('&masq_mobile_string_free');
+  });
+
+  it('returns a complete unavailable status when the native core is absent', () => {
+    const unavailableStatusBody = bridgeSource.slice(
+      bridgeSource.indexOf('NSString *unavailableStatus(NSString *reason)'),
+      bridgeSource.indexOf('bool coreAvailable()'),
+    );
+
+    expect(unavailableStatusBody).toContain('@"engineAvailable" : @NO');
+    expect(unavailableStatusBody).toContain('@"engineGeneration" : @0');
   });
 
   it('proves iOS wallet preservation before completing a network-profile-only reset', () => {

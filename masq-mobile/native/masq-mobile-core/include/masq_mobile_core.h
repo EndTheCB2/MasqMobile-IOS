@@ -20,6 +20,14 @@ char *masq_mobile_reset_network_profile(void);
 char *masq_mobile_remove_wallet(void);
 char *masq_mobile_preflight_proxy(void);
 char *masq_mobile_set_proxy_enabled(bool enabled);
+char *masq_mobile_get_debt_summary(void);
+char *masq_mobile_prepare_debt_settlement(void);
+char *masq_mobile_confirm_debt_settlement(
+    const char *quote_id,
+    const char *maximum_masq_wei,
+    const char *maximum_estimated_l2_fee_wei);
+char *masq_mobile_get_debt_settlement_status(void);
+char *masq_mobile_retry_debt_settlement(void);
 void masq_mobile_string_free(char *value);
 
 #ifdef __cplusplus

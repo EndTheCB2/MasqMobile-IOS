@@ -34,4 +34,18 @@ internal object MasqCoreJni {
   external fun nativePreflightProxy(): String
 
   external fun nativeSetProxyEnabled(enabled: Boolean): String
+
+  external fun nativeGetDebtSummary(): String
+
+  external fun nativePrepareDebtSettlement(): String
+
+  external fun nativeConfirmDebtSettlement(
+      quoteId: String,
+      maximumMasqWei: String,
+      maximumEstimatedL2FeeWei: String,
+  ): String
+
+  external fun nativeRetryDebtSettlement(): String
+
+  external fun nativeGetDebtSettlementStatus(): String
 }

@@ -645,7 +645,7 @@ describe('App browser routing modes', () => {
     });
 
     ReactTestRenderer.act(() =>
-      findButton(renderer, 'Whole-device dogfood route active').props.onPress(),
+      findButton(renderer, 'Whole-device HTTPS route ready').props.onPress(),
     );
     expect(JSON.stringify(renderer.toJSON())).toContain('Traffic routing');
     ReactTestRenderer.act(() => {

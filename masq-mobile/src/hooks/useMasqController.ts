@@ -40,6 +40,9 @@ import {
   DEFAULT_SETUP,
   EMPTY_STATUS,
   type CoreStatus,
+  type DebtSettlementQuote,
+  type DebtSettlementStatus,
+  type DebtSummary,
   type MasqConfig,
   type NetworkStatus,
   type SetupDraft,
@@ -51,6 +54,23 @@ const UNKNOWN_NETWORK: NetworkStatus = {
   expensive: false,
   constrained: false,
   generation: 0,
+};
+
+const EMPTY_DEBT_SUMMARY: DebtSummary = {
+  totalMasqWei: '0',
+  creditorCount: 0,
+  settlementInProgress: false,
+};
+
+const IDLE_DEBT_SETTLEMENT: DebtSettlementStatus = {
+  operationId: null,
+  phase: 'idle',
+  totalMasqWei: '0',
+  estimatedL2FeeWei: '0',
+  transactionCount: 0,
+  confirmedTransactionCount: 0,
+  transactionHashes: [],
+  errorCode: null,
 };
 
 export type ControllerInitializationState = 'loading' | 'ready' | 'error';
@@ -81,6 +101,16 @@ export function useMasqController() {
     useState<EntryNodeRefreshProgress | null>(null);
   const [walletBalance, setWalletBalance] =
     useState<WalletBalanceState>(EMPTY_WALLET_BALANCE);
+  const [debtSummary, setDebtSummary] =
+    useState<DebtSummary>(EMPTY_DEBT_SUMMARY);
+  const [debtSettlementQuote, setDebtSettlementQuote] =
+    useState<DebtSettlementQuote | null>(null);
+  const [debtSettlementStatus, setDebtSettlementStatus] =
+    useState<DebtSettlementStatus>(IDLE_DEBT_SETTLEMENT);
+  const [debtSettlementBusy, setDebtSettlementBusy] = useState(false);
+  const [debtSettlementError, setDebtSettlementError] = useState<string | null>(
+    null,
+  );
   const [systemTunnel, setSystemTunnel] = useState<SystemTunnelStatus>(
     UNSUPPORTED_SYSTEM_TUNNEL,
   );
@@ -269,6 +299,109 @@ export function useMasqController() {
     }
   }, [draft.rpcUrl, requireProfileReady, status.chain, status.walletAddress]);
 
+  const refreshDebtSummary = useCallback(async () => {
+    requireProfileReady();
+    if (!status.walletAddress || !status.chain) {
+      setDebtSummary(EMPTY_DEBT_SUMMARY);
+      return EMPTY_DEBT_SUMMARY;
+    }
+    const summary = await masqCore.getDebtSummary();
+    setDebtSummary(summary);
+    return summary;
+  }, [requireProfileReady, status.chain, status.walletAddress]);
+
+  const reviewDebtSettlement = useCallback(async () => {
+    requireProfileReady();
+    setDebtSettlementBusy(true);
+    setDebtSettlementError(null);
+    try {
+      const quote = await masqCore.prepareDebtSettlement();
+      setDebtSettlementQuote(quote);
+      return quote;
+    } catch (caught) {
+      const message =
+        caught instanceof Error
+          ? caught.message
+          : 'The MASQ debt settlement could not be prepared.';
+      setDebtSettlementError(message);
+      throw caught;
+    } finally {
+      setDebtSettlementBusy(false);
+    }
+  }, [requireProfileReady]);
+
+  const confirmDebtSettlement = useCallback(async () => {
+    requireProfileReady();
+    const quote = debtSettlementQuote;
+    if (!quote) {
+      throw new Error('Review the current MASQ debts before settling.');
+    }
+    setDebtSettlementBusy(true);
+    setDebtSettlementError(null);
+    try {
+      const settlement = await masqCore.confirmDebtSettlement(
+        quote.quoteId,
+        quote.totalMasqWei,
+        quote.estimatedL2FeeWei,
+      );
+      setDebtSettlementQuote(null);
+      setDebtSettlementStatus(settlement);
+      setDebtSummary(current => ({
+        ...current,
+        settlementInProgress:
+          settlement.phase === 'reserved' ||
+          settlement.phase === 'submitted' ||
+          settlement.phase === 'attention',
+      }));
+      await refresh().catch(() => undefined);
+      return settlement;
+    } catch (caught) {
+      const message =
+        caught instanceof Error
+          ? caught.message
+          : 'The reviewed MASQ debt settlement could not be submitted.';
+      setDebtSettlementError(message);
+      throw caught;
+    } finally {
+      setDebtSettlementBusy(false);
+    }
+  }, [debtSettlementQuote, refresh, requireProfileReady]);
+
+  const dismissDebtSettlement = useCallback(() => {
+    if (!debtSettlementBusy) {
+      setDebtSettlementQuote(null);
+      setDebtSettlementError(null);
+    }
+  }, [debtSettlementBusy]);
+
+  const retryDebtSettlement = useCallback(async () => {
+    requireProfileReady();
+    setDebtSettlementBusy(true);
+    setDebtSettlementError(null);
+    try {
+      const settlement = await masqCore.retryDebtSettlement();
+      setDebtSettlementStatus(settlement);
+      setDebtSummary(current => ({
+        ...current,
+        settlementInProgress:
+          settlement.phase === 'reserved' ||
+          settlement.phase === 'submitted' ||
+          settlement.phase === 'attention',
+      }));
+      await refresh().catch(() => undefined);
+      return settlement;
+    } catch (caught) {
+      const message =
+        caught instanceof Error
+          ? caught.message
+          : 'The exact saved MASQ settlement could not be retried.';
+      setDebtSettlementError(message);
+      throw caught;
+    } finally {
+      setDebtSettlementBusy(false);
+    }
+  }, [refresh, requireProfileReady]);
+
   const updateSystemTunnel = useCallback(
     async (mode: SystemTunnelMode, selectedApps: string[]) => {
       requireProfileReady();
@@ -281,6 +414,21 @@ export function useMasqController() {
           setSystemTunnel(next);
         }
         return next;
+      } catch (caught) {
+        // Permission denial, activity recreation, or native start failure can
+        // change the persisted desired/captured scopes before the bridge
+        // rejects. Reconcile that authoritative state without replacing the
+        // user's draft with a transient applied-scope poll.
+        const reconciled = await masqCore
+          .getSystemTunnelStatus()
+          .catch(() => null);
+        if (
+          reconciled &&
+          operation === systemTunnelOperationEpoch.current
+        ) {
+          setSystemTunnel(reconciled);
+        }
+        throw caught;
       } finally {
         if (operation === systemTunnelOperationEpoch.current) {
           // Invalidate any poll that began while the native mutation was in
@@ -624,6 +772,54 @@ export function useMasqController() {
     status.walletAddress,
   ]);
 
+  useEffect(() => {
+    if (
+      initializationState !== 'ready' ||
+      !status.walletAddress ||
+      !status.chain
+    ) {
+      setDebtSummary(EMPTY_DEBT_SUMMARY);
+      setDebtSettlementQuote(null);
+      setDebtSettlementStatus(IDLE_DEBT_SETTLEMENT);
+      setDebtSettlementError(null);
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const [summary, settlement] = await Promise.all([
+          masqCore.getDebtSummary(),
+          masqCore.getDebtSettlementStatus(),
+        ]);
+        if (!cancelled) {
+          setDebtSummary(summary);
+          setDebtSettlementStatus(settlement);
+        }
+      } catch {
+        // Debt monitoring is optional and must not interfere with route status.
+      } finally {
+        if (!cancelled) {
+          const active =
+            debtSettlementStatus.phase === 'reserved' ||
+            debtSettlementStatus.phase === 'submitted' ||
+            debtSettlementStatus.phase === 'attention';
+          timer = setTimeout(poll, active ? 15_000 : 60_000);
+        }
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [
+    debtSettlementStatus.phase,
+    initializationState,
+    status.chain,
+    status.walletAddress,
+  ]);
+
   // The next poll is scheduled only after the previous native call settles.
   // The epoch prevents an old poll from overwriting a newer user operation.
   useEffect(() => {
@@ -822,6 +1018,11 @@ export function useMasqController() {
     issue,
     entryNodeRefresh,
     walletBalance,
+    debtSummary,
+    debtSettlementQuote,
+    debtSettlementStatus,
+    debtSettlementBusy,
+    debtSettlementError,
     systemTunnel,
     routableApps,
     systemTunnelBusy,
@@ -836,6 +1037,11 @@ export function useMasqController() {
     removeWallet,
     refresh,
     refreshWalletBalance,
+    refreshDebtSummary,
+    reviewDebtSettlement,
+    confirmDebtSettlement,
+    retryDebtSettlement,
+    dismissDebtSettlement,
     updateSystemTunnel,
   };
 }

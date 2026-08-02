@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -123,6 +124,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                   SystemRoutingPolicyStore.PREFERENCES_NAME,
                   Context.MODE_PRIVATE,
               )))
+  private val pendingSystemRoutingConsentStore =
+      SystemRoutingPendingConsentStore(
+          SharedPreferencesPendingSystemRoutingConsentStorage(
+              reactContext.getSharedPreferences(
+                  SystemRoutingPendingConsentStore.PREFERENCES_NAME,
+                  Context.MODE_PRIVATE,
+              )))
   private val walletStore = SecureWalletStore(reactContext)
   private val entryNodeDiscovery = EntryNodeDiscovery(reactContext)
   private val lastCoreDiagnostic = AtomicReference<String?>(null)
@@ -133,6 +141,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   private val pendingTunnelResets = mutableMapOf<Long, PendingTunnelReset>()
   @Volatile private var restoreAttempted = false
   @Volatile private var moduleInvalidated = false
+  private val pendingConsentContinuationInFlight = AtomicBoolean(false)
   private var pendingTunnelRequest: PendingTunnelRequest? = null
   private val tunnelActivityListener =
       object : BaseActivityEventListener() {
@@ -150,12 +159,31 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                 } else {
                   pendingTunnelRequest.also { pendingTunnelRequest = null }
                 }
-              } ?: return
+              }
+          if (moduleInvalidated) return
+          val persisted = pendingSystemRoutingConsentStore.load(System.currentTimeMillis())
           if (resultCode != Activity.RESULT_OK) {
-            request.promise.reject("E_VPN_PERMISSION", "Android VPN permission was not granted.")
+            val consentId = request?.consentId ?: persisted?.consentId
+            if (consentId != null) pendingSystemRoutingConsentStore.clear(consentId)
+            request?.promise?.reject(
+                "E_VPN_PERMISSION",
+                "Android VPN permission was not granted.",
+            )
             return
           }
-          persistAndStartSystemTunnel(request)
+          if (persisted == null ||
+              (request != null && !request.matchesPersistedConsent(persisted))) {
+            request?.promise?.reject(
+                "E_VPN_PERMISSION_STATE",
+                "Android could not verify the pending MASQ routing scope after VPN permission.",
+            )
+            return
+          }
+          if (request != null) {
+            continueApprovedSystemTunnelConsent(request)
+          } else {
+            continueApprovedSystemTunnelConsent(persisted)
+          }
         }
       }
 
@@ -777,7 +805,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
-  private fun invalidatePendingStarts() {
+  private fun invalidatePendingStarts(preservePendingConsent: Boolean = false) {
+    if (!preservePendingConsent && !cancelPendingSystemTunnelConsent()) {
+      logPendingConsentResume("cancel_clear_failed")
+    }
     synchronized(MasqCoreLifecycle.lock) {
       MasqCoreLifecycle.startGeneration.incrementAndGet()
     }
@@ -833,6 +864,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   override fun reset(promise: Promise) {
     invalidatePendingStarts()
     MasqSessionService.stop(reactApplicationContext)
+    if (!cancelPendingSystemTunnelConsent()) {
+      promise.reject(
+          "E_VPN_PERMISSION_STATE",
+          "Android could not clear the pending MASQ routing permission during reset.",
+      )
+      return
+    }
     if (!MasqCoreJni.isAvailable) {
       promise.reject(
           "E_CORE_UNAVAILABLE",
@@ -1199,7 +1237,124 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
+  override fun getDebtSummary(promise: Promise) {
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
+      }
+      try {
+        restoreCoreIfNeeded()
+        resolveFinancialResult(MasqCoreJni.nativeGetDebtSummary(), promise)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_DEBT_SUMMARY",
+            "Android could not read the MASQ debt summary.",
+            error,
+        )
+      }
+    }
+  }
+
+  override fun prepareDebtSettlement(promise: Promise) {
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
+      }
+      try {
+        restoreCoreIfNeeded()
+        resolveFinancialResult(MasqCoreJni.nativePrepareDebtSettlement(), promise)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_DEBT_SETTLEMENT_PREPARE",
+            "Android could not prepare the MASQ debt settlement.",
+            error,
+        )
+      }
+    }
+  }
+
+  override fun confirmDebtSettlement(
+      quoteId: String,
+      maximumMasqWei: String,
+      maximumEstimatedL2FeeWei: String,
+      promise: Promise,
+  ) {
+    if (!quoteId.matches(Regex("[0-9a-f]{32}")) ||
+        !isSafeWeiString(maximumMasqWei) ||
+        !isSafeWeiString(maximumEstimatedL2FeeWei)) {
+      promise.reject(
+          "E_DEBT_SETTLEMENT_INPUT",
+          "The reviewed MASQ settlement values are invalid.",
+      )
+      return
+    }
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
+      }
+      try {
+        restoreCoreIfNeeded()
+        resolveFinancialResult(
+            MasqCoreJni.nativeConfirmDebtSettlement(
+                quoteId,
+                maximumMasqWei,
+                maximumEstimatedL2FeeWei,
+            ),
+            promise,
+        )
+      } catch (error: Exception) {
+        promise.reject(
+            "E_DEBT_SETTLEMENT_CONFIRM",
+            "Android could not submit the reviewed MASQ debt settlement.",
+            error,
+        )
+      }
+    }
+  }
+
+  override fun getDebtSettlementStatus(promise: Promise) {
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
+      }
+      try {
+        restoreCoreIfNeeded()
+        resolveFinancialResult(MasqCoreJni.nativeGetDebtSettlementStatus(), promise)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_DEBT_SETTLEMENT_STATUS",
+            "Android could not refresh the MASQ debt settlement status.",
+            error,
+        )
+      }
+    }
+  }
+
+  override fun retryDebtSettlement(promise: Promise) {
+    MasqCoreLifecycle.executor.execute {
+      if (!MasqCoreJni.isAvailable) {
+        promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+        return@execute
+      }
+      try {
+        restoreCoreIfNeeded()
+        resolveFinancialResult(MasqCoreJni.nativeRetryDebtSettlement(), promise)
+      } catch (error: Exception) {
+        promise.reject(
+            "E_DEBT_SETTLEMENT_RETRY",
+            "Android could not retry the exact saved MASQ settlement.",
+            error,
+        )
+      }
+    }
+  }
+
   override fun getSystemTunnelStatus(promise: Promise) {
+    resumeApprovedSystemTunnelConsentIfNeeded()
     MasqCoreLifecycle.executor.execute {
       val load = systemRoutingPolicyStore.loadForServiceStart()
       val coreStatus =
@@ -1211,11 +1366,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
           } else {
             null
           }
+      val coreReadiness = coreStatus?.let(::systemRoutingCoreReadiness)
       promise.resolve(
           MasqVpnService.publishCoreRouteHealth(
               load = load,
-              coreConnected = coreStatus?.optString("phase") == "connected",
-              proxyPort = coreStatus?.optInt("proxyPort", 0) ?: 0,
+              coreRouteAvailable = coreReadiness?.ready == true,
+              proxyPort = coreReadiness?.proxyPort ?: 0,
+              engineGeneration = coreReadiness?.engineGeneration ?: 0L,
           ))
     }
   }
@@ -1250,6 +1407,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun setSystemTunnel(mode: String, appIdsJson: String, promise: Promise) {
     if (mode == "off") {
+      if (!cancelPendingSystemTunnelConsent()) {
+        promise.reject(
+            "E_VPN_PERMISSION_STATE",
+            "Android could not clear the pending MASQ routing permission safely.",
+        )
+        return
+      }
       stopSystemTunnel(promise)
       return
     }
@@ -1367,11 +1531,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       try {
         restoreCoreIfNeeded()
         val coreStatus = JSONObject(MasqCoreJni.nativeGetStatus())
-        val proxyPort = coreStatus.optInt("proxyPort", 0)
-        if (
-            coreStatus.optString("phase") != "connected" ||
-                proxyPort !in 1..65535
-        ) {
+        val coreReadiness = systemRoutingCoreReadiness(coreStatus)
+        val proxyPort = coreReadiness.proxyPort
+        if (!coreReadiness.ready) {
           promise.reject(
               "E_NOT_CONNECTED",
               "Connect a valid MASQ route before enabling system traffic.",
@@ -1386,6 +1548,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               expectedRevision,
               reuseRevision,
               coreGeneration,
+              coreReadiness.engineGeneration,
               promise,
           )
         }
@@ -1407,6 +1570,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       expectedRevision: Long?,
       reuseRevision: Long?,
       coreGeneration: Long,
+      engineGeneration: Long,
       promise: Promise,
   ) {
     synchronized(MasqCoreLifecycle.lock) {
@@ -1419,17 +1583,25 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       }
     }
     val permissionIntent = VpnService.prepare(reactApplicationContext)
-    val request =
-        PendingTunnelRequest(
-            mode = mode,
-            apps = apps,
-            expectedRevision = expectedRevision,
-            reuseRevision = reuseRevision,
-            coreGeneration = coreGeneration,
-            promise = promise,
-        )
     if (permissionIntent == null) {
-      persistAndStartSystemTunnel(request)
+      if (!pendingSystemRoutingConsentStore.clearAll()) {
+        promise.reject(
+            "E_VPN_PERMISSION_STATE",
+            "Android could not clear an obsolete MASQ routing permission request.",
+        )
+        return
+      }
+      persistAndStartSystemTunnel(
+          PendingTunnelRequest(
+              consentId = null,
+              mode = mode,
+              apps = apps,
+              expectedRevision = expectedRevision,
+              reuseRevision = reuseRevision,
+              coreGeneration = coreGeneration,
+              engineGeneration = engineGeneration,
+              promise = promise,
+          ))
       return
     }
     val activity = reactApplicationContext.getCurrentActivity()
@@ -1437,6 +1609,26 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.reject("E_VPN_ACTIVITY", "Open MASQ before approving Android VPN access.")
       return
     }
+    val persistedConsent =
+        PendingSystemRoutingConsent(
+            consentId = UUID.randomUUID().toString(),
+            mode = mode,
+            selectedApps = apps,
+            expectedRevision = expectedRevision,
+            reuseRevision = reuseRevision,
+            createdAtEpochMs = System.currentTimeMillis(),
+        )
+    val request =
+        PendingTunnelRequest(
+            consentId = persistedConsent.consentId,
+            mode = mode,
+            apps = apps,
+            expectedRevision = expectedRevision,
+            reuseRevision = reuseRevision,
+            coreGeneration = coreGeneration,
+            engineGeneration = engineGeneration,
+            promise = promise,
+        )
     val requestRegistered =
         synchronized(lifecycleLock) {
           if (moduleInvalidated || pendingTunnelRequest != null) {
@@ -1448,6 +1640,24 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         }
     if (!requestRegistered) {
       promise.reject("E_VPN_ACTIVITY", "Open MASQ before approving Android VPN access.")
+      return
+    }
+    if (!pendingSystemRoutingConsentStore.persist(persistedConsent)) {
+      synchronized(lifecycleLock) {
+        if (pendingTunnelRequest === request) pendingTunnelRequest = null
+      }
+      promise.reject(
+          "E_VPN_PERMISSION_STATE",
+          "Android could not preserve the pending MASQ routing scope safely.",
+      )
+      return
+    }
+    val stillRegistered =
+        synchronized(lifecycleLock) {
+          !moduleInvalidated && pendingTunnelRequest === request
+        }
+    if (!stillRegistered) {
+      pendingSystemRoutingConsentStore.clear(persistedConsent.consentId)
       return
     }
     try {
@@ -1462,6 +1672,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               false
             }
           }
+      pendingSystemRoutingConsentStore.clear(persistedConsent.consentId)
       if (shouldReject) {
         promise.reject(
             "E_VPN_PERMISSION",
@@ -1646,7 +1857,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       }
 
   override fun invalidate() {
-    invalidatePendingStarts()
+    invalidatePendingStarts(preservePendingConsent = true)
     val abandoned =
         synchronized(lifecycleLock) {
           val starts = mutableListOf<PendingTunnelStart>()
@@ -2263,98 +2474,287 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       val promise: Promise,
   )
 
-  private fun persistAndStartSystemTunnel(request: PendingTunnelRequest) {
+  private fun continueApprovedSystemTunnelConsent(request: PendingTunnelRequest) {
+    if (!pendingConsentContinuationInFlight.compareAndSet(false, true)) {
+      request.promise.reject(
+          "E_VPN_PERMISSION_STATE",
+          "Android is already continuing a MASQ routing permission request.",
+      )
+      return
+    }
+    persistAndStartSystemTunnel(request) {
+      pendingConsentContinuationInFlight.set(false)
+    }
+  }
+
+  private fun persistAndStartSystemTunnel(
+      request: PendingTunnelRequest,
+      continuationFinished: () -> Unit = {},
+  ) {
     MasqCoreLifecycle.executor.execute {
-      synchronized(MasqCoreLifecycle.lock) {
-        if (request.coreGeneration != MasqCoreLifecycle.startGeneration.get()) {
-          request.promise.reject(
-              "E_VPN_STALE_CORE",
-              "The MASQ core changed before system routing could start.",
-          )
-          return@synchronized
-        }
-        if (moduleInvalidated) {
-          request.promise.reject(
-              "E_MODULE_INVALIDATED",
-              "The MASQ native module is shutting down.",
-          )
-          return@synchronized
-        }
-        val coreStatus =
-            try {
-              restoreCoreIfNeeded()
-              JSONObject(MasqCoreJni.nativeGetStatus())
-            } catch (error: SecureWalletStore.UnreadableException) {
+      try {
+        synchronized(MasqCoreLifecycle.lock) {
+          if (request.coreGeneration != MasqCoreLifecycle.startGeneration.get()) {
+            rejectPendingTunnelRequest(
+                request,
+                "E_VPN_STALE_CORE",
+                "The MASQ core changed before system routing could start.",
+            )
+            return@synchronized
+          }
+          if (moduleInvalidated) {
+            request.promise.reject(
+                "E_MODULE_INVALIDATED",
+                "The MASQ native module is shutting down.",
+            )
+            return@synchronized
+          }
+          if (request.consentId != null) {
+            val persisted = pendingSystemRoutingConsentStore.load(System.currentTimeMillis())
+            if (persisted == null || !request.matchesPersistedConsent(persisted)) {
               request.promise.reject(
-                  "E_WALLET_STORAGE_UNREADABLE",
-                  "The encrypted consumer wallet could not be read safely. Unlock the device and retry.",
-                  error,
-              )
-              return@synchronized
-            } catch (error: Exception) {
-              request.promise.reject(
-                  "E_CORE_STATUS",
-                  "The MASQ core status is unavailable.",
-                  error,
+                  "E_VPN_PERMISSION_STATE",
+                  "Android could not verify the approved MASQ routing scope.",
               )
               return@synchronized
             }
-        val proxyPort = coreStatus.optInt("proxyPort", 0)
-        if (coreStatus.optString("phase") != "connected" || proxyPort !in 1..65535) {
-          request.promise.reject(
-              "E_NOT_CONNECTED",
-              "Connect a valid MASQ route before enabling system traffic.",
+          }
+          val coreStatus =
+              try {
+                restoreCoreIfNeeded()
+                JSONObject(MasqCoreJni.nativeGetStatus())
+              } catch (error: SecureWalletStore.UnreadableException) {
+                rejectPendingTunnelRequest(
+                    request,
+                    "E_WALLET_STORAGE_UNREADABLE",
+                    "The encrypted consumer wallet could not be read safely. Unlock the device and retry.",
+                    error,
+                )
+                return@synchronized
+              } catch (error: Exception) {
+                rejectPendingTunnelRequest(
+                    request,
+                    "E_CORE_STATUS",
+                    "The MASQ core status is unavailable.",
+                    error,
+                )
+                return@synchronized
+              }
+          val coreReadiness = systemRoutingCoreReadiness(coreStatus)
+          val proxyPort = coreReadiness.proxyPort
+          if (!coreReadiness.ready ||
+              coreReadiness.engineGeneration != request.engineGeneration) {
+            rejectPendingTunnelRequest(
+                request,
+                "E_NOT_CONNECTED",
+                "Connect a valid MASQ route before enabling system traffic.",
+            )
+            return@synchronized
+          }
+
+          val policy =
+              if (request.reuseRevision != null) {
+                val load = systemRoutingPolicyStore.loadForServiceStart()
+                val stored = (load as? SystemRoutingPolicyLoadResult.Ready)?.policy
+                if (stored == null ||
+                    stored.revision != request.reuseRevision ||
+                    stored.desiredMode != request.mode ||
+                    stored.selectedApps != request.apps ||
+                    stored.failClosedDesired) {
+                  rejectPendingTunnelRequest(
+                      request,
+                      "E_VPN_POLICY_CONFLICT",
+                      "The saved MASQ routing policy changed while permission was pending.",
+                  )
+                  return@synchronized
+                }
+                stored
+              } else {
+                when (
+                    val write =
+                        systemRoutingPolicyStore.persistBeforeStart(
+                            expectedRevision = request.expectedRevision,
+                            desiredMode = request.mode,
+                            packageIds = request.apps,
+                            explicitConsentTimestampMs = System.currentTimeMillis(),
+                            failClosedDesired = false,
+                        )) {
+                  is SystemRoutingPolicyWriteResult.Stored -> write.policy
+                  else -> {
+                    clearPendingConsent(request.consentId)
+                    rejectPolicyWrite(request.promise, write, "start")
+                    return@synchronized
+                  }
+                }
+              }
+          if (!clearPendingConsent(request.consentId)) {
+            request.promise.reject(
+                "E_VPN_PERMISSION_STATE",
+                "Android could not finish the approved MASQ routing permission safely.",
+            )
+            return@synchronized
+          }
+          startSystemTunnel(
+              policy,
+              proxyPort,
+              request.coreGeneration,
+              request.engineGeneration,
+              request.promise,
           )
-          return@synchronized
+        }
+      } finally {
+        continuationFinished()
+      }
+    }
+  }
+
+  private fun rejectPendingTunnelRequest(
+      request: PendingTunnelRequest,
+      code: String,
+      message: String,
+      error: Throwable? = null,
+  ) {
+    clearPendingConsent(request.consentId)
+    if (error == null) {
+      request.promise.reject(code, message)
+    } else {
+      request.promise.reject(code, message, error)
+    }
+  }
+
+  private fun clearPendingConsent(consentId: String?): Boolean =
+      consentId == null || pendingSystemRoutingConsentStore.clear(consentId)
+
+  private fun PendingTunnelRequest.matchesPersistedConsent(
+      persisted: PendingSystemRoutingConsent,
+  ): Boolean =
+      consentId == persisted.consentId &&
+          mode == persisted.mode &&
+          apps == persisted.selectedApps &&
+          expectedRevision == persisted.expectedRevision &&
+          reuseRevision == persisted.reuseRevision
+
+  private fun continueApprovedSystemTunnelConsent(
+      persisted: PendingSystemRoutingConsent,
+  ) {
+    if (!pendingConsentContinuationInFlight.compareAndSet(false, true)) return
+    MasqCoreLifecycle.executor.execute {
+      try {
+        if (moduleInvalidated) return@execute
+        val current = pendingSystemRoutingConsentStore.load(System.currentTimeMillis())
+        if (current != persisted) return@execute
+        if (persisted.selectedApps.any(::isMasqControlPlanePackage) ||
+            persisted.selectedApps.any { !isInstalledPackage(it) }) {
+          pendingSystemRoutingConsentStore.clear(persisted.consentId)
+          logPendingConsentResume("invalid_apps")
+          return@execute
         }
 
         val policy =
-            if (request.reuseRevision != null) {
+            if (persisted.reuseRevision != null) {
               val load = systemRoutingPolicyStore.loadForServiceStart()
               val stored = (load as? SystemRoutingPolicyLoadResult.Ready)?.policy
               if (stored == null ||
-                  stored.revision != request.reuseRevision ||
-                  stored.desiredMode != request.mode ||
-                  stored.selectedApps != request.apps ||
+                  stored.revision != persisted.reuseRevision ||
+                  stored.desiredMode != persisted.mode ||
+                  stored.selectedApps != persisted.selectedApps ||
                   stored.failClosedDesired) {
-                request.promise.reject(
-                    "E_VPN_POLICY_CONFLICT",
-                    "The saved MASQ routing policy changed while permission was pending.",
-                )
-                return@synchronized
+                pendingSystemRoutingConsentStore.clear(persisted.consentId)
+                logPendingConsentResume("policy_conflict")
+                return@execute
               }
               stored
             } else {
               when (
                   val write =
                       systemRoutingPolicyStore.persistBeforeStart(
-                          expectedRevision = request.expectedRevision,
-                          desiredMode = request.mode,
-                          packageIds = request.apps,
-                          explicitConsentTimestampMs = System.currentTimeMillis(),
+                          expectedRevision = persisted.expectedRevision,
+                          desiredMode = persisted.mode,
+                          packageIds = persisted.selectedApps,
+                          explicitConsentTimestampMs = persisted.createdAtEpochMs,
                           failClosedDesired = false,
                       )) {
                 is SystemRoutingPolicyWriteResult.Stored -> write.policy
                 else -> {
-                  rejectPolicyWrite(request.promise, write, "start")
-                  return@synchronized
+                  pendingSystemRoutingConsentStore.clear(persisted.consentId)
+                  logPendingConsentResume("policy_rejected")
+                  return@execute
                 }
               }
             }
-        startSystemTunnel(
-            policy,
-            proxyPort,
-            request.coreGeneration,
-            request.promise,
+        if (!pendingSystemRoutingConsentStore.clear(persisted.consentId)) {
+          logPendingConsentResume("clear_failed")
+          return@execute
+        }
+
+        val readyLoad = SystemRoutingPolicyLoadResult.Ready(policy)
+        MasqVpnService.publishDesiredPolicy(
+            readyLoad,
+            SystemRoutingTransition.STARTING_BLOCKING,
         )
+        val readiness =
+            runCatching {
+                  restoreCoreIfNeeded()
+                  systemRoutingCoreReadiness(JSONObject(MasqCoreJni.nativeGetStatus()))
+                }
+                .getOrNull()
+        val coreGeneration = MasqCoreLifecycle.startGeneration.get()
+        if (readiness?.ready == true && coreGeneration > 0) {
+          MasqVpnService.recoverCoreRouteIfNeeded(
+              reactApplicationContext,
+              readiness.proxyPort,
+              coreGeneration,
+              readiness.engineGeneration,
+          )
+        } else {
+          MasqVpnService.publishDesiredPolicy(
+              readyLoad,
+              SystemRoutingTransition.BLOCKED,
+          )
+        }
+      } finally {
+        pendingConsentContinuationInFlight.set(false)
       }
     }
+  }
+
+  private fun resumeApprovedSystemTunnelConsentIfNeeded() {
+    if (moduleInvalidated ||
+        pendingConsentContinuationInFlight.get() ||
+        synchronized(lifecycleLock) { pendingTunnelRequest != null }) {
+      return
+    }
+    val persisted = pendingSystemRoutingConsentStore.load(System.currentTimeMillis()) ?: return
+    if (VpnService.prepare(reactApplicationContext) != null) return
+    continueApprovedSystemTunnelConsent(persisted)
+  }
+
+  private fun cancelPendingSystemTunnelConsent(): Boolean {
+    val request =
+        synchronized(lifecycleLock) {
+          pendingTunnelRequest.also { pendingTunnelRequest = null }
+        }
+    val cleared =
+        request?.consentId?.let(pendingSystemRoutingConsentStore::clear)
+            ?: pendingSystemRoutingConsentStore.clearAll()
+    if (cleared) {
+      request?.promise?.reject(
+          "E_VPN_PERMISSION",
+          "The pending MASQ routing permission was cancelled.",
+      )
+    }
+    return cleared
+  }
+
+  private fun logPendingConsentResume(reason: String) {
+    Log.w(CORE_DIAGNOSTIC_TAG, "SYSTEM_TUNNEL_CONSENT_RESUME result=$reason")
   }
 
   private fun startSystemTunnel(
       policy: DesiredSystemRoutingPolicy,
       proxyPort: Int,
       coreGeneration: Long,
+      engineGeneration: Long,
       promise: Promise,
   ) {
     val requestId = TUNNEL_REQUEST_COUNTER.getAndIncrement()
@@ -2363,6 +2763,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             requestId = requestId,
             policyRevision = policy.revision,
             coreGeneration = coreGeneration,
+            engineGeneration = engineGeneration,
             promise = promise,
         )
     val readyLoad = SystemRoutingPolicyLoadResult.Ready(policy)
@@ -2483,6 +2884,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               .putExtra(MasqVpnService.EXTRA_POLICY_REVISION, policy.revision)
               .putExtra(MasqVpnService.EXTRA_PROXY_PORT, proxyPort)
               .putExtra(MasqVpnService.EXTRA_CORE_GENERATION, coreGeneration)
+              .putExtra(MasqVpnService.EXTRA_ENGINE_GENERATION, engineGeneration)
       try {
         ContextCompat.startForegroundService(reactApplicationContext, intent)
       } catch (error: Exception) {
@@ -2536,6 +2938,23 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise.reject("E_CORE", "The MASQ core rejected the request.", error)
     }
   }
+
+  private fun resolveFinancialResult(value: String, promise: Promise) {
+    if (!MasqCoreJni.isAvailable) {
+      promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
+      return
+    }
+    val decoded = JSONObject(value)
+    val error = decoded.opt("error")
+    if (error is String && error.isNotBlank()) {
+      promise.reject("E_DEBT_SETTLEMENT", error)
+      return
+    }
+    promise.resolve(value)
+  }
+
+  private fun isSafeWeiString(value: String): Boolean =
+      value.isNotEmpty() && value.length <= 39 && value.all(Char::isDigit)
 
   private fun restoreCoreIfNeeded() {
     if (restoreAttempted || !MasqCoreJni.isAvailable) return
@@ -2713,6 +3132,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       JSONObject()
           .put("phase", "blocked")
           .put("engineAvailable", false)
+          .put("engineGeneration", 0)
           .put("proxyEnabled", false)
           .put("proxyPort", JSONObject.NULL)
           .put("chain", JSONObject.NULL)
@@ -2722,8 +3142,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
           .put("routeHops", 0)
           .put("minHops", 1)
           .put("exitCountry", JSONObject.NULL)
-            .put("exitCountryFallback", true)
-            .put("availableExitCountries", JSONArray())
+          .put("exitCountryFallback", true)
+          .put("availableExitCountries", JSONArray())
           .put("bytesUp", 0)
           .put("bytesDown", 0)
           .put("lastError", reason)
@@ -2762,10 +3182,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()
     private var browserRoutingInFlight = false
     // Strictly exceeds translator readiness (3s) plus the serialized native
-    // CONNECT preflight (up to 15s) and normal executor/FGS dispatch overhead.
+    // end-to-end route preflight (up to 40s) and normal executor/FGS overhead.
     // Covers a 10s terminal translator recovery, 3s replacement readiness,
-    // 15s real CONNECT preflight, and service/executor scheduling margin.
-    private const val START_TUNNEL_TIMEOUT_MS = 40_000L
+    // 40s TLS/HEAD preflight, and service/executor scheduling margin.
+    private const val START_TUNNEL_TIMEOUT_MS = 70_000L
     private const val STOP_TUNNEL_TIMEOUT_MS = 15_000L
     private const val RESET_TUNNEL_TIMEOUT_MS = 15_000L
     private val TUNNEL_REQUEST_COUNTER = AtomicLong(1L)
@@ -2788,11 +3208,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   )
 
   private data class PendingTunnelRequest(
+      val consentId: String?,
       val mode: SystemRoutingMode,
       val apps: List<String>,
       val expectedRevision: Long?,
       val reuseRevision: Long?,
       val coreGeneration: Long,
+      val engineGeneration: Long,
       val promise: Promise,
   )
 
@@ -2800,6 +3222,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       val requestId: Long,
       val policyRevision: Long,
       val coreGeneration: Long,
+      val engineGeneration: Long,
       val promise: Promise,
       val completed: AtomicBoolean = AtomicBoolean(false),
       val timeoutFuture: AtomicReference<ScheduledFuture<*>?> = AtomicReference(),

@@ -32,6 +32,9 @@ describe('Android native MASQ core integration', () => {
   const vpnService = read(
     'android/app/src/main/java/com/masqmobile/MasqVpnService.kt',
   );
+  const pendingConsentStore = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingPendingConsentStore.kt',
+  );
   const sessionService = read(
     'android/app/src/main/java/com/masqmobile/MasqSessionService.kt',
   );
@@ -82,6 +85,9 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('-ffile-prefix-map=');
     expect(gradle).not.toContain('signingConfig signingConfigs.debug');
     expect(buildScript).toContain('--features node-engine');
+    expect(coreJni).toContain('nativeConfirmDebtSettlement');
+    expect(rustAndroid).toContain('nativeConfirmDebtSettlement');
+    expect(moduleSource).not.toContain('BiometricPrompt');
     expect(buildScript).toContain('--remap-path-prefix=$HOME=/build/source');
     expect(buildScript).toContain(
       'MASQ_ANDROID_CARGO_TARGET_DIR must use a privacy-neutral temporary path',
@@ -218,7 +224,7 @@ describe('Android native MASQ core integration', () => {
     );
     expect(vpnService).toContain('SystemRoutingDiagnostic.TRANSLATOR_RETURNED');
     expect(vpnService).toContain(
-      '"Captured traffic is blocked because the dogfood translator returned."',
+      '"Captured traffic is blocked because the community-route translator returned."',
     );
     expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(false)');
     expect(moduleSource).toContain('MasqCoreJni.nativeSetProxyEnabled(true)');
@@ -349,7 +355,7 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
     expect(gradle).toContain('applicationIdSuffix ".dogfood"');
     expect(gradle).toContain('versionNameSuffix "-dogfood"');
-    expect(gradle).toContain('versionCode 6006');
+    expect(gradle).toContain('versionCode 6007');
     expect(gradle).toContain(
       'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
     );
@@ -357,10 +363,10 @@ describe('Android native MASQ core integration', () => {
       2,
     );
     expect(strings).toContain(
-      '<string name="app_name_dogfood">MASQ Dogfood (Unsafe)</string>',
+      '<string name="app_name_dogfood">Masq Mobile community version</string>',
     );
     expect(strings).toContain(
-      '<string name="app_name">Masq Community Mobile version</string>',
+      '<string name="app_name">Masq Mobile community version</string>',
     );
     expect(gradle).toContain(
       '"MASQ_SYSTEM_TUNNEL_ENABLED",\n            unsafeSystemRoutingDogfoodEnabled.toString()',
@@ -451,6 +457,26 @@ describe('Android native MASQ core integration', () => {
     expect(packetTranslator).toContain(
       'snapshot.generation == run.expectedNativeGeneration',
     );
+  });
+
+  it('persists only a short-lived exact VPN-consent continuation', () => {
+    expect(pendingConsentStore).toContain(
+      'const val MAX_AGE_MS = 10 * 60 * 1000L',
+    );
+    expect(pendingConsentStore).toContain(
+      'const val PREFERENCES_NAME = "masq-system-routing-pending-consent"',
+    );
+    expect(pendingConsentStore).toContain('KEY_SELECTED_APPS');
+    expect(pendingConsentStore).not.toContain('KEY_WALLET');
+    expect(pendingConsentStore).not.toContain('KEY_SEED');
+    expect(pendingConsentStore).not.toContain('KEY_RPC');
+    expect(moduleSource).toContain(
+      'continueApprovedSystemTunnelConsent(persisted)',
+    );
+    expect(moduleSource).toContain(
+      'pendingSystemRoutingConsentStore.load(System.currentTimeMillis())',
+    );
+    expect(moduleSource).toContain('.put("engineGeneration", 0)');
   });
 
   it('persists exact revisions and waits for native return before closing the VPN', () => {
@@ -665,7 +691,7 @@ describe('Android native MASQ core integration', () => {
       'tunnelStartAcknowledgementIsSemanticallyAccepted(',
     );
     expect(moduleSource).toContain(
-      'private const val START_TUNNEL_TIMEOUT_MS = 40_000L',
+      'private const val START_TUNNEL_TIMEOUT_MS = 70_000L',
     );
     expect(startDispatch).toContain(
       'currentCoreGeneration = currentCoreGeneration',
@@ -686,7 +712,7 @@ describe('Android native MASQ core integration', () => {
     );
     expect(activation).toContain('acknowledgementAccepted &&');
     const acknowledgement = activation.indexOf(
-      'settleStart(requestId, candidateStatus, null)',
+      'settleStart(it, candidateStatus, null)',
     );
     expect(acknowledgement).toBeGreaterThan(-1);
     expect(activation.indexOf('coreGeneration ==', acknowledgement))
@@ -799,7 +825,7 @@ describe('Android native MASQ core integration', () => {
       'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
     );
     expect(start).toContain(
-      'handleStart(revision, proxyPort, coreGeneration, requestId)',
+      'handleStart(\n              revision,\n              proxyPort,\n              coreGeneration,\n              engineGeneration,\n              requestId,',
     );
     expect(vpnService).toContain(
       'terminalCoordinator.snapshot()?.captureValid == true',
@@ -872,7 +898,18 @@ describe('Android native MASQ core integration', () => {
     expect(vpnService).toContain(
       'work profiles are separate.',
     );
-    expect(vpnService).toContain('real CONNECT to example.com:443');
+    expect(vpnService).toContain(
+      'TLS handshake and encrypted HEAD request to example.com',
+    );
+    expect(vpnService).toContain(
+      'translator.hasOwnedRun() &&\n            translatorEngineGeneration != engineGeneration',
+    );
+    expect(rustCore).toContain(
+      'write_all(b"CONNECT example.com:443 HTTP/1.1\\r\\nHost: example.com:443\\r\\n\\r\\n")',
+    );
+    expect(rustCore).toContain(
+      'tls.write_all(b"HEAD / HTTP/1.1\\r\\nHost: example.com\\r\\nConnection: close\\r\\n\\r\\n")',
+    );
     expect(vpnService).toContain('temporary loopback proxy');
     expect(packetTunnelRust).toContain('args.ipv6_enabled = false');
     expect(vpnService).toContain(
@@ -991,8 +1028,11 @@ describe('Android native MASQ core integration', () => {
       'screenOff && networkAvailable && cpuRequired',
     );
     expect(sessionService).toContain(
-      'phase == "connected" && connectedNeighbors > 0 && routeStage > 0',
+      'phase == "connected" &&',
     );
+    expect(sessionService).toContain('connectedNeighbors > 0 &&');
+    expect(sessionService).toContain('routeStage > 0 &&');
+    expect(sessionService).toContain('proxyPort in 1..65535');
     expect(sessionService).toContain(
       'NetworkCapabilities.NET_CAPABILITY_VALIDATED',
     );
@@ -1290,7 +1330,9 @@ describe('Android native MASQ core integration', () => {
     );
     const shutdown = moduleSource.slice(
       moduleSource.indexOf('override fun shutdown(promise: Promise)'),
-      moduleSource.indexOf('private fun invalidatePendingStarts()'),
+      moduleSource.indexOf(
+        'private fun invalidatePendingStarts(preservePendingConsent: Boolean = false)',
+      ),
     );
     const resolution = moduleSource.slice(
       moduleSource.indexOf('private fun resolveStart('),
