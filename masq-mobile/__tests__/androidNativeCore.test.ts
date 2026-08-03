@@ -74,6 +74,10 @@ describe('Android native MASQ core integration', () => {
   );
   const rustAndroid = read('native/masq-mobile-core/src/android.rs');
   const rustCore = read('native/masq-mobile-core/src/core.rs');
+  const nodeMobileRuntime = read('../masq-node-mobile/node/src/mobile_runtime.rs');
+  const actorSystemFactory = read(
+    '../masq-node-mobile/node/src/actor_system_factory.rs',
+  );
   const webViewPatch = read('patches/react-native-webview+14.0.1.patch');
   const webViewClientSource = read(
     'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java',
@@ -408,7 +412,7 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
     expect(gradle).toContain('applicationIdSuffix ".dogfood"');
     expect(gradle).toContain('versionNameSuffix "-dogfood"');
-    expect(gradle).toContain('versionCode 6017');
+    expect(gradle).toContain('versionCode 6021');
     expect(gradle).toContain(
       'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
     );
@@ -1140,6 +1144,7 @@ describe('Android native MASQ core integration', () => {
       'requestRecovery(nextRecoveryDelayMillis())',
     );
     expect(sessionService).toContain('MasqCoreJni.nativeRefreshRouteProof()');
+    expect(sessionService).toContain('ROUTE_PROOF_REFRESH result=');
     expect(sessionService).toContain('shouldApplyMasqSessionSnapshot(');
     expect(sessionService).toContain(
       'recoveryBackoff = recoveryBackoff.afterStarted(now)',
@@ -1158,6 +1163,16 @@ describe('Android native MASQ core integration', () => {
     expect(backgroundRecovery).toContain('MasqCoreJni.nativePreflightProxy()');
     expect(backgroundRecovery).toContain('MasqRecoveryRouteVerificationGate()');
     expect(backgroundRecovery).toContain('isEntryConnectedAwaitingRoute()');
+    expect(backgroundRecovery).toContain('skipExistingRouteVerification');
+    expect(sessionService).toContain(
+      'shouldFastRebuildPreviouslyHealthyRoute(',
+    );
+    expect(sessionService).toContain(
+      'skipExistingRouteVerification = true',
+    );
+    expect(sessionService).toContain(
+      'activeRouteSource = null\n        val rebuildScope =',
+    );
     expect(backgroundRecovery).toContain(
       'entryNodeDiscovery.recordConnectionFailure(chain, preferredNodes)',
     );
@@ -1180,7 +1195,7 @@ describe('Android native MASQ core integration', () => {
     expect(sessionService).toContain('MasqCoreJni.nativeShutdown()');
   });
 
-  it('restores only durable consumer intent after this APK is replaced', () => {
+  it('restores package-replaced sessions only for durable system routing', () => {
     expect(manifest).toContain(
       'android:name=".MasqPackageReplacementReceiver"',
     );
@@ -1191,7 +1206,13 @@ describe('Android native MASQ core integration', () => {
       'intent?.action != Intent.ACTION_MY_PACKAGE_REPLACED',
     );
     expect(packageReplacementReceiver).toContain(
-      'MasqSessionService.ensureRunningIfDesired(context.applicationContext)',
+      'shouldRestoreMasqSessionAfterPackageReplacement(policyLoad)',
+    );
+    expect(packageReplacementReceiver).toContain(
+      'SystemRoutingPolicyStore.PREFERENCES_NAME',
+    );
+    expect(packageReplacementReceiver).toContain(
+      'MasqSessionService.ensureRunningIfDesired(applicationContext)',
     );
     expect(packageReplacementReceiver).not.toContain('setDesired(');
   });
@@ -1299,6 +1320,18 @@ describe('Android native MASQ core integration', () => {
     expect(rustCore).toContain('begin_route_proof_refresh');
     expect(rustCore).toContain('complete_route_proof_refresh');
     expect(rustCore).toContain('route_proof_refresh_ticket_is_current');
+    expect(rustCore).toContain('RouteProbePolicy::SingleAttempt');
+    expect(rustCore).toContain('probe_private_route_with_retry');
+    expect(rustCore).toContain('request_route_readiness_lease_renewal');
+    expect(nodeMobileRuntime).toContain(
+      'register_neighborhood_route_readiness_renewal',
+    );
+    expect(nodeMobileRuntime).toContain(
+      'request_route_readiness_lease_renewal',
+    );
+    expect(actorSystemFactory).toContain(
+      '.renew_route_readiness_lease',
+    );
     expect(rustCore).not.toContain('restore_healthy_route_state');
     expect(rustCore).toContain('E_PRIVATE_ROUTE_REFRESH_FAILED');
     expect(rustCore).toContain('E_PRIVATE_ROUTE_REFRESH_NOT_READY');
@@ -1530,7 +1563,10 @@ describe('Android native MASQ core integration', () => {
       'entryNodeDiscovery.recordRouteProofFailure(chain, preferredNodes)',
     );
     expect(backgroundRecovery).toContain(
-      'var routeProofFailed =\n        shouldDeprioritizeAttemptedEntryNodes(',
+      'var routeProofFailed =\n        skipExistingRouteVerification ||',
+    );
+    expect(backgroundRecovery).toContain(
+      'shouldDeprioritizeAttemptedEntryNodes(',
     );
     expect(moduleSource).toContain(
       'recordEntrySelectionFeedbackFromSavedConfig(currentStatus)',

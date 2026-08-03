@@ -39,7 +39,9 @@ use crate::sub_lib::neighborhood::RouteQueryResponse;
 use crate::sub_lib::neighborhood::UpdateNodeRecordMetadataMessage;
 use crate::sub_lib::neighborhood::{ConfigChangeMsg, ConnectionProgressMessage};
 use crate::sub_lib::neighborhood::{DispatcherNodeQueryMessage, GossipFailure_0v1};
-use crate::sub_lib::neighborhood::{RouteUseFailedMessage, RouteUseSucceededMessage};
+use crate::sub_lib::neighborhood::{
+    RenewRouteReadinessLeaseMessage, RouteUseFailedMessage, RouteUseSucceededMessage,
+};
 use crate::sub_lib::peer_actors::PeerActors;
 use crate::sub_lib::peer_actors::{BindMessage, NewPublicIp, StartMessage};
 use crate::sub_lib::proxy_client::{
@@ -175,6 +177,7 @@ recorder_message_handler_t_m_p!(ReportRoutingServicesConsumedMessage);
 recorder_message_handler_t_m_p!(ReportServicesConsumedMessage);
 recorder_message_handler_t_m_p!(RecordExitRequestForReceipt);
 recorder_message_handler_t_m_p!(RouteUseSucceededMessage);
+recorder_message_handler_t_p!(RenewRouteReadinessLeaseMessage);
 recorder_message_handler_t_m_p!(RouteUseFailedMessage);
 recorder_message_handler_t_m_p!(RetryReceiptAcknowledgements);
 recorder_message_handler_t_m_p!(TxReceiptsMessage);
@@ -537,6 +540,7 @@ pub fn make_neighborhood_subs_from_recorder(addr: &Addr<Recorder>) -> Neighborho
         route_query: recipient!(addr, RouteQueryMessage),
         route_use_failed: recipient!(addr, RouteUseFailedMessage),
         route_use_succeeded: recipient!(addr, RouteUseSucceededMessage),
+        renew_route_readiness_lease: recipient!(addr, RenewRouteReadinessLeaseMessage),
         update_node_record_metadata: recipient!(addr, UpdateNodeRecordMetadataMessage),
         from_hopper: recipient!(addr, ExpiredCoresPackage<Gossip_0v1>),
         gossip_failure: recipient!(addr, ExpiredCoresPackage<GossipFailure_0v1>),

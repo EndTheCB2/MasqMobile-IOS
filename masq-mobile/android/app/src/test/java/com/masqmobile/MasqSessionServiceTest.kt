@@ -254,6 +254,87 @@ class MasqSessionServiceTest {
   }
 
   @Test
+  fun exactPreviouslyHealthyRouteOnTheSameNetworkUsesFastRebuild() {
+    val degradedRoute =
+        MasqSessionCoreSnapshot(
+            phase = "connecting",
+            connectedNeighbors = 1,
+            routeStage = 1,
+            proxyPort = 44_443,
+            engineGeneration = 3,
+        )
+    val source = MasqSessionActiveRouteSource(networkId = 41L, engineGeneration = 3L)
+
+    assertTrue(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute,
+            activeRouteSource = source,
+            currentNetworkId = 41L,
+        ))
+    assertTrue(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute.copy(connectedNeighbors = 0, routeStage = 0),
+            activeRouteSource = source,
+            currentNetworkId = 41L,
+        ))
+    assertFalse(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute.copy(engineGeneration = 4L),
+            activeRouteSource = source,
+            currentNetworkId = 41L,
+        ))
+    assertFalse(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute,
+            activeRouteSource = source,
+            currentNetworkId = 42L,
+        ))
+    assertFalse(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute.copy(phase = "connected", routeStage = 2),
+            activeRouteSource = source,
+            currentNetworkId = 41L,
+        ))
+    assertFalse(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute.copy(lastError = "E_PRIVATE_ROUTE_FAILED: redacted"),
+            activeRouteSource = source,
+            currentNetworkId = 41L,
+        ))
+    assertFalse(
+        shouldFastRebuildPreviouslyHealthyRoute(
+            snapshot = degradedRoute,
+            activeRouteSource = null,
+            currentNetworkId = 41L,
+        ))
+  }
+
+  @Test
+  fun packageReplacementRestoresOnlyDurableSystemRoutingSessions() {
+    assertTrue(
+        shouldRestoreMasqSessionAfterPackageReplacement(
+            SystemRoutingPolicyLoadResult.Ready(
+                DesiredSystemRoutingPolicy(
+                    schemaVersion = SystemRoutingPolicyStore.CURRENT_SCHEMA_VERSION,
+                    revision = 1L,
+                    desiredMode = SystemRoutingMode.WHOLE_DEVICE,
+                    selectedApps = emptyList(),
+                    explicitConsentTimestampMs = 1L,
+                    failClosedDesired = true,
+                ))))
+    assertFalse(
+        shouldRestoreMasqSessionAfterPackageReplacement(
+            SystemRoutingPolicyLoadResult.Missing))
+    assertFalse(
+        shouldRestoreMasqSessionAfterPackageReplacement(
+            SystemRoutingPolicyLoadResult.ExplicitOff(DesiredSystemRoutingPolicy.off(2L))))
+    assertFalse(
+        shouldRestoreMasqSessionAfterPackageReplacement(
+            SystemRoutingPolicyLoadResult.BlockRequired(
+                SystemRoutingDiagnostic.CORRUPT_OR_PARTIAL_POLICY)))
+  }
+
+  @Test
   fun notificationCopyIsEnglishAndContainsNoConnectionIdentifiers() {
     MasqSessionNotificationState.values().forEach { state ->
       val text = masqSessionNotificationText(state)
@@ -300,6 +381,23 @@ class MasqSessionServiceTest {
             currentStartGeneration = 8L,
         ))
     assertTrue(ROUTE_PROOF_REFRESH_INTERVAL_MILLIS < 5 * 60_000L)
+  }
+
+  @Test
+  fun allScheduledProofAttemptsFitInsideTheNativeReadinessLease() {
+    val nativeReadinessLeaseMillis = 5 * 60_000L
+    // One native probe deadline plus the bounded actor acknowledgement.
+    val nativeSingleAttemptBudgetMillis = 12_750L
+    val monitorJitterBudgetMillis = 5_000L
+    val threeAttemptEscalationBudget =
+        ROUTE_PROOF_REFRESH_INTERVAL_MILLIS +
+            (3 * nativeSingleAttemptBudgetMillis) +
+            ROUTE_PROOF_REFRESH_RETRY_INITIAL_MILLIS +
+            (2 * ROUTE_PROOF_REFRESH_RETRY_INITIAL_MILLIS) +
+            (4 * monitorJitterBudgetMillis)
+
+    assertEquals(3 * 60_000L, ROUTE_PROOF_REFRESH_INTERVAL_MILLIS)
+    assertTrue(threeAttemptEscalationBudget < nativeReadinessLeaseMillis)
   }
 
   @Test
@@ -719,6 +817,10 @@ class MasqSessionServiceTest {
     assertTrue(scope.applies(currentStartGeneration = 7L, currentNetworkEpoch = 11L))
     assertFalse(scope.applies(currentStartGeneration = 8L, currentNetworkEpoch = 11L))
     assertFalse(scope.applies(currentStartGeneration = 7L, currentNetworkEpoch = 12L))
+    // Once BackgroundRecovery has atomically claimed the next start generation,
+    // only the Android underlay epoch remains external to its own generation fence.
+    assertTrue(scope.appliesToNetwork(currentNetworkEpoch = 11L))
+    assertFalse(scope.appliesToNetwork(currentNetworkEpoch = 12L))
   }
 
   @Test

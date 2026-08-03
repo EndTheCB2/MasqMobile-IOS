@@ -4,7 +4,9 @@
 // application. It deliberately exposes no serving controls: the mobile launcher is accepted only
 // together with `--neighborhood-mode consume-only` by the configurator.
 
-use crate::sub_lib::neighborhood::{ConfigChange, ConfigChangeMsg, Hops};
+use crate::sub_lib::neighborhood::{
+    ConfigChange, ConfigChangeMsg, Hops, RenewRouteReadinessLeaseMessage,
+};
 use crate::sub_lib::peer_actors::StartMessage;
 use actix::msgs::StopArbiter;
 use actix::{Addr, Arbiter, Recipient, System};
@@ -16,11 +18,12 @@ use std::str::FromStr;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use std::sync::{Condvar, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const NO_EXIT_CODE: i32 = i32::MIN;
+const ROUTE_READINESS_RENEWAL_ACK_TIMEOUT: Duration = Duration::from_millis(750);
 
 static EMBEDDED: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -29,6 +32,8 @@ static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
 static ROUTE_STAGE: AtomicU8 = AtomicU8::new(0);
 static ROUTE_HOPS: AtomicU8 = AtomicU8::new(0);
 static ROUTE_PROOF_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_LIFECYCLE: Mutex<()> = Mutex::new(());
 static BYTES_UP: AtomicU64 = AtomicU64::new(0);
 static BYTES_DOWN: AtomicU64 = AtomicU64::new(0);
 static ENTRY_HANDSHAKE_PROGRESS: Mutex<EntryHandshakeProgress> =
@@ -52,6 +57,8 @@ static NEIGHBORHOOD_UI: Mutex<Option<Recipient<NodeFromUiMessage>>> = Mutex::new
 static MIN_HOPS_PREFERENCE: AtomicU8 = AtomicU8::new(0);
 static NEIGHBORHOOD_CONFIG: Mutex<Option<Recipient<ConfigChangeMsg>>> = Mutex::new(None);
 static NEIGHBORHOOD_RETRY: Mutex<Option<Recipient<StartMessage>>> = Mutex::new(None);
+static NEIGHBORHOOD_ROUTE_READINESS_RENEWAL: Mutex<Option<RouteReadinessRenewalTarget>> =
+    Mutex::new(None);
 static PENDING_ENTRY_NODES: Mutex<Option<Vec<String>>> = Mutex::new(None);
 static STREAM_CONNECT_JOBS: Mutex<usize> = Mutex::new(0);
 static STREAM_CONNECT_JOBS_FINISHED: Condvar = Condvar::new();
@@ -160,6 +167,12 @@ struct MobileExitPreference {
     fallback_routing: bool,
 }
 
+#[derive(Clone)]
+struct RouteReadinessRenewalTarget {
+    mobile_runtime_epoch: u64,
+    recipient: Recipient<RenewRouteReadinessLeaseMessage>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MobileRuntimeSnapshot {
     pub started: bool,
@@ -202,9 +215,13 @@ fn install_early_panic_location_hook() {
 }
 
 pub fn prepare(proxy_port: u16) {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // A previous embedded actor system may have exited in this same app process. Its UI Gateway
     // recipient is no longer valid and must not receive startup logs from the next system.
     masq_lib::logger::clear_log_recipient();
+    advance_runtime_epoch();
     EMBEDDED.store(true, Ordering::SeqCst);
     STARTED.store(false, Ordering::SeqCst);
     STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -244,6 +261,9 @@ pub fn prepare(proxy_port: u16) {
     *NEIGHBORHOOD_RETRY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *NEIGHBORHOOD_ROUTE_READINESS_RENEWAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     *PENDING_ENTRY_NODES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -251,6 +271,41 @@ pub fn prepare(proxy_port: u16) {
 
 pub fn is_embedded() -> bool {
     EMBEDDED.load(Ordering::SeqCst)
+}
+
+fn advance_runtime_epoch() -> u64 {
+    RUNTIME_EPOCH
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .expect("the mobile runtime epoch is exhausted")
+}
+
+fn prepared_runtime_epoch_unlocked() -> Option<u64> {
+    let epoch = RUNTIME_EPOCH.load(Ordering::SeqCst);
+    (is_embedded() && !STOP_REQUESTED.load(Ordering::SeqCst) && epoch > 0).then_some(epoch)
+}
+
+/// Confirms only the anonymous lifecycle generation of the currently running embedded Node.
+pub(crate) fn runtime_epoch_is_current(epoch: u64) -> bool {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime_epoch_is_current_unlocked(epoch)
+}
+
+fn runtime_epoch_is_current_unlocked(epoch: u64) -> bool {
+    epoch > 0
+        && prepared_runtime_epoch_unlocked() == Some(epoch)
+        && STARTED.load(Ordering::SeqCst)
+        && !ACTOR_ARBITER_SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn current_runtime_epoch_for_test() -> Option<u64> {
+    let epoch = RUNTIME_EPOCH.load(Ordering::SeqCst);
+    runtime_epoch_is_current(epoch).then_some(epoch)
 }
 
 pub fn is_stop_requested() -> bool {
@@ -336,6 +391,9 @@ pub fn wait_for_actor_arbiters(timeout: Duration) -> bool {
 }
 
 pub fn mark_started() {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if is_embedded() {
         STARTED.store(true, Ordering::SeqCst);
     }
@@ -365,6 +423,21 @@ pub fn report_route_use_succeeded() {
     if is_embedded() {
         advance_route_proof_generation(&ROUTE_PROOF_GENERATION);
     }
+}
+
+/// Advances proof only while `prepare`/`finish` cannot replace the validated runtime epoch.
+///
+/// This is reserved for acknowledged synthetic renewal. Genuine correlated route-use telemetry
+/// continues to use [report_route_use_succeeded] and keeps its existing semantics.
+pub(crate) fn report_route_use_succeeded_for_epoch(mobile_runtime_epoch: u64) -> bool {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !runtime_epoch_is_current_unlocked(mobile_runtime_epoch) {
+        return false;
+    }
+    advance_route_proof_generation(&ROUTE_PROOF_GENERATION);
+    true
 }
 
 fn advance_route_proof_generation(counter: &AtomicU64) {
@@ -486,6 +559,61 @@ pub fn register_neighborhood_retry(recipient: Recipient<StartMessage>) {
     *NEIGHBORHOOD_RETRY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(recipient);
+}
+
+/// Registers the current embedded Neighborhood actor's acknowledged readiness-renewal mailbox.
+///
+/// The recipient is process-local and carries no route, peer, destination, stream, or wallet
+/// identity. [prepare] and [finish] clear it so a later engine can never renew an older actor's
+/// route-readiness lease.
+pub fn register_neighborhood_route_readiness_renewal(
+    recipient: Recipient<RenewRouteReadinessLeaseMessage>,
+) {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mobile_runtime_epoch) = prepared_runtime_epoch_unlocked() else {
+        return;
+    };
+    *NEIGHBORHOOD_ROUTE_READINESS_RENEWAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RouteReadinessRenewalTarget {
+        mobile_runtime_epoch,
+        recipient,
+    });
+}
+
+/// Requests one bounded, privacy-safe renewal of the live Neighborhood route-readiness lease.
+///
+/// `true` requires both an affirmative actor acknowledgement and the same current runtime epoch
+/// after that acknowledgement. A missing, stopped, full, timed-out, demoted, stale, or otherwise
+/// unavailable actor fails closed and leaves periodic refresh to report failure.
+pub fn request_route_readiness_lease_renewal() -> bool {
+    let target = NEIGHBORHOOD_ROUTE_READINESS_RENEWAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(target) = target else {
+        return false;
+    };
+    if !runtime_epoch_is_current(target.mobile_runtime_epoch) {
+        return false;
+    }
+    let (acknowledgement, receiver) = mpsc::sync_channel(1);
+    if target
+        .recipient
+        .try_send(RenewRouteReadinessLeaseMessage {
+            mobile_runtime_epoch: target.mobile_runtime_epoch,
+            acknowledgement,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        receiver.recv_timeout(ROUTE_READINESS_RENEWAL_ACK_TIMEOUT),
+        Ok(true)
+    ) && runtime_epoch_is_current(target.mobile_runtime_epoch)
 }
 
 /// Re-runs the initial-neighbor handshake without recreating Actix's
@@ -762,6 +890,9 @@ pub fn snapshot() -> MobileRuntimeSnapshot {
 }
 
 pub(crate) fn finish(exit_code: i32) {
+    let _lifecycle = RUNTIME_LIFECYCLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     masq_lib::logger::clear_log_recipient();
     STARTED.store(false, Ordering::SeqCst);
     STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -784,6 +915,9 @@ pub(crate) fn finish(exit_code: i32) {
     *NEIGHBORHOOD_RETRY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *NEIGHBORHOOD_ROUTE_READINESS_RENEWAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     *PENDING_ENTRY_NODES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -800,6 +934,32 @@ pub(crate) fn finish(exit_code: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix::{Actor, Context, Handler};
+    use std::sync::Arc;
+
+    struct RouteReadinessRenewalRecorder {
+        deliveries: Arc<AtomicUsize>,
+    }
+
+    impl Actor for RouteReadinessRenewalRecorder {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<RenewRouteReadinessLeaseMessage> for RouteReadinessRenewalRecorder {
+        type Result = ();
+
+        fn handle(
+            &mut self,
+            message: RenewRouteReadinessLeaseMessage,
+            _context: &mut Self::Context,
+        ) -> Self::Result {
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            let _ = message
+                .acknowledgement
+                .try_send(runtime_epoch_is_current(message.mobile_runtime_epoch));
+            System::current().stop();
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -866,6 +1026,53 @@ mod tests {
         counter.store(u64::MAX, Ordering::SeqCst);
         advance_route_proof_generation(&counter);
         assert_eq!(counter.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn epoch_fenced_route_proof_never_mutates_a_reprepared_runtime() {
+        prepare(44_443);
+        mark_started();
+        let old_epoch = current_runtime_epoch_for_test().unwrap();
+
+        prepare(44_444);
+        mark_started();
+        let current_epoch = current_runtime_epoch_for_test().unwrap();
+        assert_ne!(old_epoch, current_epoch);
+        assert!(!report_route_use_succeeded_for_epoch(old_epoch));
+        assert_eq!(snapshot().route_proof_generation, 0);
+        assert!(report_route_use_succeeded_for_epoch(current_epoch));
+        assert_eq!(snapshot().route_proof_generation, 1);
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn route_readiness_renewal_requires_the_current_live_neighborhood_mailbox() {
+        let system = System::new("route_readiness_renewal_mailbox");
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let recipient = RouteReadinessRenewalRecorder {
+            deliveries: deliveries.clone(),
+        }
+        .start()
+        .recipient::<RenewRouteReadinessLeaseMessage>();
+
+        prepare(44_443);
+        mark_started();
+        assert!(!request_route_readiness_lease_renewal());
+        register_neighborhood_route_readiness_renewal(recipient.clone());
+
+        // A new runtime preparation fences the older actor recipient.
+        prepare(44_444);
+        mark_started();
+        assert!(!request_route_readiness_lease_renewal());
+        register_neighborhood_route_readiness_renewal(recipient);
+        let renewal = thread::spawn(request_route_readiness_lease_renewal);
+        system.run();
+        assert!(renewal.join().unwrap());
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        finish(0);
+        assert!(!request_route_readiness_lease_renewal());
     }
 
     #[test]

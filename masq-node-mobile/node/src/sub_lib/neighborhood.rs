@@ -32,6 +32,7 @@ use std::convert::TryFrom;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 const ASK_ABOUT_GOSSIP_INTERVAL: Duration = Duration::from_secs(10);
@@ -554,6 +555,7 @@ pub struct NeighborhoodSubs {
     pub route_query: Recipient<RouteQueryMessage>,
     pub route_use_failed: Recipient<RouteUseFailedMessage>,
     pub route_use_succeeded: Recipient<RouteUseSucceededMessage>,
+    pub renew_route_readiness_lease: Recipient<RenewRouteReadinessLeaseMessage>,
     pub update_node_record_metadata: Recipient<UpdateNodeRecordMetadataMessage>,
     pub from_hopper: Recipient<ExpiredCoresPackage<Gossip_0v1>>,
     pub gossip_failure: Recipient<ExpiredCoresPackage<GossipFailure_0v1>>,
@@ -729,6 +731,18 @@ pub struct RouteQueryResponse {
 #[derive(Clone, Debug, Message, PartialEq, Eq)]
 pub struct RouteUseSucceededMessage;
 
+/// Requests one acknowledged renewal of an already-live mobile route-readiness lease.
+///
+/// Unlike [RouteUseSucceededMessage], this does not assert ordinary application traffic. The
+/// Neighborhood actor validates its current route state and process-local mobile runtime epoch
+/// before applying the same lease renewal. Neither the request nor its acknowledgement contains a
+/// route, peer, destination, stream, payload, or wallet identity.
+#[derive(Debug, Message)]
+pub struct RenewRouteReadinessLeaseMessage {
+    pub mobile_runtime_epoch: u64,
+    pub acknowledgement: SyncSender<bool>,
+}
+
 /// Emitted when a new client stream cannot obtain a MASQ route.
 /// It intentionally carries no destination or stream identity.
 #[derive(Clone, Debug, Message, PartialEq, Eq)]
@@ -898,6 +912,7 @@ mod tests {
             route_query: recipient!(recorder, RouteQueryMessage),
             route_use_failed: recipient!(recorder, RouteUseFailedMessage),
             route_use_succeeded: recipient!(recorder, RouteUseSucceededMessage),
+            renew_route_readiness_lease: recipient!(recorder, RenewRouteReadinessLeaseMessage),
             update_node_record_metadata: recipient!(recorder, UpdateNodeRecordMetadataMessage),
             from_hopper: recipient!(recorder, ExpiredCoresPackage<Gossip_0v1>),
             gossip_failure: recipient!(recorder, ExpiredCoresPackage<GossipFailure_0v1>),

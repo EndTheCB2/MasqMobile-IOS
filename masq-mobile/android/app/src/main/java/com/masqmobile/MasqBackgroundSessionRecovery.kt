@@ -121,7 +121,11 @@ internal class MasqBackgroundSessionRecovery(
   fun recover(
       isRecoveryCurrent: () -> Boolean,
       expectedRouteVerificationIdentity: MasqRecoveryAttemptIdentity? = null,
+      skipExistingRouteVerification: Boolean = false,
   ): MasqBackgroundRecoveryResult {
+    require(!skipExistingRouteVerification || expectedRouteVerificationIdentity != null) {
+      "A fast route rebuild must be fenced to an exact native identity."
+    }
     fun canContinue(): Boolean = isSessionDesired() && isRecoveryCurrent()
 
     if (!canContinue() || !MasqCoreJni.isAvailable) {
@@ -154,6 +158,7 @@ internal class MasqBackgroundSessionRecovery(
     }
     if (
         expectedRouteVerificationIdentity != null &&
+            !skipExistingRouteVerification &&
             !initialSnapshot.isEntryConnectedAwaitingRoute()
     ) {
       // A stage-one proof request is observational for one exact native
@@ -162,7 +167,8 @@ internal class MasqBackgroundSessionRecovery(
       return MasqBackgroundRecoveryResult.CANCELLED
     }
     var routeProofFailed =
-        shouldDeprioritizeAttemptedEntryNodes(
+        skipExistingRouteVerification ||
+            shouldDeprioritizeAttemptedEntryNodes(
             phase = initialSnapshot.phase,
             engineGeneration = initialSnapshot.engineGeneration,
             routeStage = initialSnapshot.routeStage,
@@ -175,7 +181,13 @@ internal class MasqBackgroundSessionRecovery(
               startGeneration = initialStartGeneration,
               engineGeneration = initialSnapshot.engineGeneration,
           )
-      if (routeVerificationGate.claim(identity)) {
+      if (skipExistingRouteVerification) {
+        // This exact engine previously reached stage two on the current
+        // underlay and has since fallen back to stage zero or one. Its trust
+        // lease is already revoked, so rebuild immediately instead of spending
+        // another full proxy deadline proving the known-degraded route.
+        routeProofFailed = true
+      } else if (routeVerificationGate.claim(identity)) {
         val verification = verifyExistingRoute(::canContinue, identity)
         when (verification.result) {
           MasqBackgroundRecoveryResult.ACTIVE,

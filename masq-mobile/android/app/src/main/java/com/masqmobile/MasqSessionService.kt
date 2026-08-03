@@ -183,7 +183,11 @@ internal fun shouldApplyMasqSessionSnapshot(
         (!refreshRouteProof || networkAvailable) &&
         (snapshot?.isHealthyConnectedSession() != true || networkAvailable)
 
-internal const val ROUTE_PROOF_REFRESH_INTERVAL_MILLIS = 4 * 60_000L
+// The native Neighborhood revokes an idle route-readiness lease after five
+// minutes. Start the advisory proof early enough that all three bounded
+// attempts (including their 12-second socket deadlines and retry delays) can
+// finish before that lease expires.
+internal const val ROUTE_PROOF_REFRESH_INTERVAL_MILLIS = 3 * 60_000L
 internal const val ROUTE_PROOF_REFRESH_RETRY_INITIAL_MILLIS = 15_000L
 internal const val ROUTE_PROOF_REFRESH_RETRY_MAX_MILLIS = 60_000L
 internal const val ROUTE_PROOF_REFRESH_FAILURES_BEFORE_RESTART = 3
@@ -504,6 +508,9 @@ internal data class MasqStageOneProofScope(
   ): Boolean =
       identity.startGeneration == currentStartGeneration &&
           networkEpoch == currentNetworkEpoch
+
+  fun appliesToNetwork(currentNetworkEpoch: Long): Boolean =
+      networkEpoch == currentNetworkEpoch
 }
 
 internal const val SESSION_RESTORE_DISPATCH_RETRY_MILLIS = 5_000L
@@ -769,6 +776,28 @@ internal fun shouldRestartAfterActiveRouteSourceLoss(
         activeRouteSource != null &&
         activeRouteSource.engineGeneration > 0L &&
         lostNetworkId == activeRouteSource.networkId
+
+/**
+ * A stage-two route source is recorded only after correlated exit bytes were
+ * observed. If that exact engine falls back to stage zero or one on the same
+ * Android network, another full preflight of the already-degraded route only
+ * extends the outage. Fence a fast rebuild to that proven engine and underlay.
+ */
+internal fun shouldFastRebuildPreviouslyHealthyRoute(
+    snapshot: MasqSessionCoreSnapshot?,
+    activeRouteSource: MasqSessionActiveRouteSource?,
+    currentNetworkId: Long?,
+): Boolean =
+    snapshot != null &&
+        snapshot.phase == "connecting" &&
+        snapshot.routeStage in 0..1 &&
+        snapshot.proxyPort in 1..65535 &&
+        snapshot.engineGeneration > 0L &&
+        snapshot.lastError == null &&
+        activeRouteSource != null &&
+        activeRouteSource.engineGeneration == snapshot.engineGeneration &&
+        currentNetworkId != null &&
+        activeRouteSource.networkId == currentNetworkId
 
 internal fun shouldDeferRecoveryToModuleOwnedConnectionAttempt(
     moduleOwnsAttempt: Boolean,
@@ -1570,6 +1599,12 @@ class MasqSessionService : Service() {
             now,
             routeProofRefreshAttempted,
         )
+    if (routeProofRefreshAttempted) {
+      logMasqRecovery(
+          "ROUTE_PROOF_REFRESH result=${if (refreshSucceeded) "success" else "failed"} " +
+              "failure_count=${routeProofRefreshSchedule.consecutiveFailures}",
+      )
+    }
     val periodicFailureAction =
         masqPeriodicRouteProofFailureAction(
             routeProofRefreshAttempted = routeProofRefreshAttempted,
@@ -1797,6 +1832,35 @@ class MasqSessionService : Service() {
             snapshot.engineGeneration,
         )
       }
+      shouldFastRebuildPreviouslyHealthyRoute(
+          snapshot = snapshot,
+          activeRouteSource = activeRouteSource,
+          currentNetworkId = validatedNetwork?.networkHandle,
+      ) -> {
+        terminalObservations = 0
+        cpuRequired = true
+        updateNotification(MasqSessionNotificationState.CONNECTING)
+        refreshWakeLock()
+        // Consume the proven route source before scheduling this exact rebuild.
+        // An in-place native retry can retain its engine generation; keeping
+        // this source would then claim another fast rebuild on every monitor
+        // sample and bypass the normal startup/backoff window indefinitely.
+        activeRouteSource = null
+        val rebuildScope =
+            MasqStageOneProofScope(
+                identity =
+                    MasqRecoveryAttemptIdentity(
+                        startGeneration = coreGeneration,
+                        engineGeneration = snapshot!!.engineGeneration,
+                    ),
+                networkEpoch = networkEpoch.get(),
+            )
+        requestRecovery(
+            delayMillis = STAGE_ONE_ROUTE_PROOF_SETTLE_MILLIS,
+            stageOneProofScope = rebuildScope,
+            skipExistingRouteVerification = true,
+        )
+      }
       snapshot?.hasTerminalEntryRecoverySignal() == true -> {
         // Do not let the generic 90-second startup grace hide a native entry
         // handshake that has already produced a structured terminal result.
@@ -1883,13 +1947,16 @@ class MasqSessionService : Service() {
       delayMillis: Long,
       stageOneProofScope: MasqStageOneProofScope? = null,
       routeRebuildRetry: Boolean = false,
+      skipExistingRouteVerification: Boolean = false,
   ) {
     val now = SystemClock.elapsedRealtime()
     val exactStageOneProof =
         stageOneProofScope?.applies(
             currentStartGeneration = MasqCoreLifecycle.startGeneration.get(),
             currentNetworkEpoch = networkEpoch.get(),
-        ) == true && recoveryBackoff.hasStageOneProofOpportunity()
+        ) == true &&
+            (skipExistingRouteVerification ||
+                recoveryBackoff.hasStageOneProofOpportunity())
     if (
         destroyed ||
             !isSessionDesired() ||
@@ -1915,6 +1982,7 @@ class MasqSessionService : Service() {
     logMasqRecovery(
         "RECOVERY_SCHEDULED delay_ms=$delayMillis token=$token " +
             "kind=${when {
+              skipExistingRouteVerification -> "degraded_route_rebuild"
               stageOneProofScope != null -> "stage_one_proof"
               routeRebuildRetry -> "route_rebuild"
               else -> "general"
@@ -1946,13 +2014,10 @@ class MasqSessionService : Service() {
                     isRecoveryCurrent = {
                       isRecoveryCurrent(token) &&
                           (stageOneProofScope == null ||
-                              stageOneProofScope.applies(
-                                  currentStartGeneration =
-                                      MasqCoreLifecycle.startGeneration.get(),
-                                  currentNetworkEpoch = networkEpoch.get(),
-                              ))
+                              stageOneProofScope.appliesToNetwork(networkEpoch.get()))
                     },
                     expectedRouteVerificationIdentity = stageOneProofScope?.identity,
+                    skipExistingRouteVerification = skipExistingRouteVerification,
                 )
             mainHandler.post {
               if (recoveryRunningToken == token) {

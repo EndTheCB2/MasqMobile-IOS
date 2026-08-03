@@ -534,7 +534,11 @@ impl MobileCore {
     ) -> String {
         self.complete_route_proof_refresh_with(ticket, probe_result, |_| {
             #[cfg(feature = "node-engine")]
-            node_lib::mobile_runtime::report_route_stage(2);
+            {
+                return node_lib::mobile_runtime::request_route_readiness_lease_renewal();
+            }
+            #[cfg(not(feature = "node-engine"))]
+            false
         })
     }
 
@@ -542,13 +546,13 @@ impl MobileCore {
         &mut self,
         ticket: RouteProofRefreshTicket,
         probe_result: Result<(), String>,
-        report_current_route: impl FnOnce(&mut MobileCore),
+        renew_current_route: impl FnOnce(&mut MobileCore) -> bool,
     ) -> String {
         self.complete_route_proof_refresh_with_hooks(
             ticket,
             probe_result,
             |core| core.refresh_engine_status(),
-            report_current_route,
+            renew_current_route,
         )
     }
 
@@ -557,7 +561,7 @@ impl MobileCore {
         ticket: RouteProofRefreshTicket,
         probe_result: Result<(), String>,
         mut refresh_current_engine: impl FnMut(&mut MobileCore),
-        report_current_route: impl FnOnce(&mut MobileCore),
+        renew_current_route: impl FnOnce(&mut MobileCore) -> bool,
     ) -> String {
         // The socket probe ran without CORE locked. Import the live engine
         // snapshot before trusting the cached ticket on both the success and
@@ -577,19 +581,22 @@ impl MobileCore {
                 RouteProofRefreshOutcome::failed()
             }
             Ok(()) => {
-                // A correlated proxy response normally advances the actor runtime's
-                // route-use heartbeat before this point. First import and validate
-                // that state. Only then preserve the old explicit stage report for
-                // this exact engine; a stale probe must never report into a newer
-                // process-global runtime. Re-import and revalidate once more before
-                // publishing success.
-                report_current_route(self);
+                // A correlated proxy response can advance normal actor telemetry before this
+                // point. First import and validate that state. Only then queue an explicit,
+                // privacy-safe renewal for this exact engine; a stale probe must never renew a
+                // newer process-global runtime. Re-import and revalidate once more, and publish
+                // success only if the live Neighborhood mailbox accepted that renewal.
+                let renewal_accepted = renew_current_route(self);
                 refresh_current_engine(self);
                 if !self.route_proof_refresh_ticket_is_current(ticket) {
                     return self.route_proof_refresh_not_ready_json();
                 }
-                self.last_error = None;
-                RouteProofRefreshOutcome::succeeded()
+                if renewal_accepted {
+                    self.last_error = None;
+                    RouteProofRefreshOutcome::succeeded()
+                } else {
+                    RouteProofRefreshOutcome::failed()
+                }
             }
         };
         self.status_json_with_route_proof_refresh(outcome)
@@ -668,7 +675,7 @@ impl MobileCore {
         let port = self
             .proxy_port
             .ok_or_else(|| "The local MASQ proxy has no port.".to_owned())?;
-        Self::probe_private_route_for_refresh(port)?;
+        Self::probe_private_route_with_retry(port)?;
 
         node_lib::mobile_runtime::report_route_stage(2);
         self.refresh_engine_status();
@@ -683,24 +690,24 @@ impl MobileCore {
     /// normal actor telemetry, which is imported only after ticket validation.
     #[cfg(feature = "node-engine")]
     pub(crate) fn probe_private_route_for_refresh(port: u16) -> Result<(), String> {
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(ROUTE_PROBE_TIMEOUT_SECONDS))
-            .ok_or_else(|| "The MASQ route-test deadline could not be created.".to_owned())?;
-        loop {
-            let last_error = match Self::probe_private_route_once(port, deadline) {
-                Ok(()) => break,
-                Err(error) => error,
-            };
-            let remaining = match remaining_probe_time(deadline) {
-                Ok(remaining) => remaining,
-                Err(_) => return Err(last_error),
-            };
-            if remaining <= ROUTE_PROBE_RETRY_DELAY {
-                return Err(last_error);
-            }
-            thread::sleep(ROUTE_PROBE_RETRY_DELAY);
-        }
-        Ok(())
+        let deadline = route_probe_deadline()?;
+        run_route_probe_policy(
+            deadline,
+            RouteProbePolicy::SingleAttempt,
+            |deadline| Self::probe_private_route_once(port, deadline),
+            thread::sleep,
+        )
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn probe_private_route_with_retry(port: u16) -> Result<(), String> {
+        let deadline = route_probe_deadline()?;
+        run_route_probe_policy(
+            deadline,
+            RouteProbePolicy::RetryUntilDeadline,
+            |deadline| Self::probe_private_route_once(port, deadline),
+            thread::sleep,
+        )
     }
 
     #[cfg(feature = "node-engine")]
@@ -1227,6 +1234,46 @@ const ROUTE_PROBE_TIMEOUT_SECONDS: u64 = 12;
 const ROUTE_PROBE_RETRY_DELAY: Duration = Duration::from_millis(400);
 
 #[cfg(feature = "node-engine")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteProbePolicy {
+    SingleAttempt,
+    RetryUntilDeadline,
+}
+
+#[cfg(feature = "node-engine")]
+fn route_probe_deadline() -> Result<Instant, String> {
+    Instant::now()
+        .checked_add(Duration::from_secs(ROUTE_PROBE_TIMEOUT_SECONDS))
+        .ok_or_else(|| "The MASQ route-test deadline could not be created.".to_owned())
+}
+
+#[cfg(feature = "node-engine")]
+fn run_route_probe_policy(
+    deadline: Instant,
+    policy: RouteProbePolicy,
+    mut probe_once: impl FnMut(Instant) -> Result<(), String>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), String> {
+    loop {
+        let last_error = match probe_once(deadline) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if policy == RouteProbePolicy::SingleAttempt {
+            return Err(last_error);
+        }
+        let remaining = match remaining_probe_time(deadline) {
+            Ok(remaining) => remaining,
+            Err(_) => return Err(last_error),
+        };
+        if remaining <= ROUTE_PROBE_RETRY_DELAY {
+            return Err(last_error);
+        }
+        sleep(ROUTE_PROBE_RETRY_DELAY);
+    }
+}
+
+#[cfg(feature = "node-engine")]
 struct DeadlineStream {
     stream: TcpStream,
     deadline: Instant,
@@ -1408,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_route_refresh_reports_stage_only_for_the_current_ticket() {
+    fn scheduled_route_refresh_renews_only_for_the_current_ticket() {
         use std::cell::Cell;
 
         let mut core = healthy_core_for_route_refresh();
@@ -1417,6 +1464,7 @@ mod tests {
 
         let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |_| {
             report_calls.set(report_calls.get() + 1);
+            true
         });
 
         assert_eq!(report_calls.get(), 1);
@@ -1439,6 +1487,7 @@ mod tests {
 
         let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |_| {
             report_calls.set(report_calls.get() + 1);
+            true
         });
 
         assert_eq!(report_calls.get(), 0);
@@ -1456,6 +1505,7 @@ mod tests {
         let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |core| {
             core.route_stage = 1;
             core.proxy_enabled = false;
+            true
         });
 
         let status: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1463,6 +1513,32 @@ mod tests {
         assert_eq!(status["proxyEnabled"], false);
         assert_eq!(status["routeProofRefresh"]["attempted"], false);
         assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+    }
+
+    #[test]
+    fn route_refresh_fails_closed_when_the_live_actor_rejects_lease_renewal() {
+        use std::cell::Cell;
+
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+        let renewal_calls = Cell::new(0);
+
+        let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |_| {
+            renewal_calls.set(renewal_calls.get() + 1);
+            false
+        });
+
+        assert_eq!(renewal_calls.get(), 1);
+        assert_eq!(core.phase, Phase::Connected);
+        assert!(core.proxy_enabled);
+        assert_eq!(core.route_stage, 2);
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["routeProofRefresh"]["attempted"], true);
+        assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+        assert_eq!(
+            status["routeProofRefresh"]["errorCode"],
+            "E_PRIVATE_ROUTE_REFRESH_FAILED"
+        );
     }
 
     #[cfg(feature = "node-engine")]
@@ -1612,6 +1688,49 @@ mod tests {
             status["routeProofRefresh"]["errorCode"],
             "E_PRIVATE_ROUTE_REFRESH_UNAVAILABLE"
         );
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn scheduled_route_probe_attempts_once_while_interactive_policy_can_retry() {
+        use std::cell::Cell;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let scheduled_attempts = Cell::new(0);
+        let scheduled_result = run_route_probe_policy(
+            deadline,
+            RouteProbePolicy::SingleAttempt,
+            |_| {
+                scheduled_attempts.set(scheduled_attempts.get() + 1);
+                Err("scheduled failure".to_owned())
+            },
+            |_| panic!("a single scheduled attempt must never sleep for a retry"),
+        );
+        assert_eq!(scheduled_result.unwrap_err(), "scheduled failure");
+        assert_eq!(scheduled_attempts.get(), 1);
+
+        let interactive_attempts = Cell::new(0);
+        let interactive_sleeps = Cell::new(0);
+        run_route_probe_policy(
+            deadline,
+            RouteProbePolicy::RetryUntilDeadline,
+            |_| {
+                let next = interactive_attempts.get() + 1;
+                interactive_attempts.set(next);
+                if next == 1 {
+                    Err("first interactive attempt failed".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| {
+                assert_eq!(delay, ROUTE_PROBE_RETRY_DELAY);
+                interactive_sleeps.set(interactive_sleeps.get() + 1);
+            },
+        )
+        .unwrap();
+        assert_eq!(interactive_attempts.get(), 2);
+        assert_eq!(interactive_sleeps.get(), 1);
     }
 
     #[cfg(feature = "node-engine")]

@@ -250,6 +250,9 @@ impl ActorSystemFactoryTools for ActorSystemFactoryToolsReal {
             crate::mobile_runtime::register_neighborhood_retry(
                 peer_actors.neighborhood.start.clone(),
             );
+            crate::mobile_runtime::register_neighborhood_route_readiness_renewal(
+                peer_actors.neighborhood.renew_route_readiness_lease.clone(),
+            );
         }
 
         self.start_automap(
