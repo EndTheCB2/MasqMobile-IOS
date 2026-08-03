@@ -117,11 +117,11 @@ android {
         }
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 7
-        versionName "1.0.0-preview.7"
+        versionCode 16
+        versionName "1.0.0-preview.16"
         if (unsafeSystemRoutingDogfoodEnabled) {
-            // Keep internal dogfood artifacts visibly distinct from public preview.7.
-            versionCode 6007
+            // Keep internal dogfood artifacts visibly distinct from public preview.16.
+            versionCode 6016
         }
         manifestPlaceholders = [masqAppLabel: applicationLabelResource]
         buildConfigField(
@@ -199,6 +199,9 @@ dependencies {
     implementation("androidx.webkit:webkit:1.16.0")
     implementation("androidx.core:core-ktx:1.17.0")
     testImplementation("junit:junit:4.13.2")
+    // Local JVM tests otherwise receive android.jar's no-op JSONObject stub,
+    // which silently returns defaults and can hide status-parser regressions.
+    testImplementation("org.json:json:20251224")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

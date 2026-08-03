@@ -116,6 +116,63 @@ function homeScreen(
 }
 
 describe('HomeScreen connection controls', () => {
+  it('shows an entry-only stage as route building instead of connected', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          {
+            connectedNeighbors: 1,
+            phase: 'connecting',
+            proxyPort: 44_443,
+            routeStage: 1,
+          },
+          {
+            connectionProgress: {
+              step: 4,
+              total: 5,
+              label: 'Preparing a private exit route',
+            },
+            entryNodeRefresh: null,
+          },
+        ),
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('Building private route');
+    expect(rendered).toContain('Preparing a private exit route');
+    expect(rendered).toContain('Cancel connection');
+    expect(rendered).not.toContain('Open private browser');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('shows private browsing only after stage two route proof', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        homeScreen(
+          jest.fn(),
+          {
+            connectedNeighbors: 1,
+            phase: 'connected',
+            proxyPort: 44_443,
+            routeHops: 3,
+            routeStage: 2,
+          },
+          { busy: false },
+        ),
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('MASQ route ready');
+    expect(rendered).toContain('Open private browser');
+    expect(rendered).not.toContain('Entry nodes connected');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it.each([
     [
       'discovery' as const,

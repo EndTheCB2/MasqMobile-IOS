@@ -28,6 +28,7 @@ pub struct EngineSnapshot {
     pub proxy_port: Option<u16>,
     pub route_stage: u8,
     pub route_hops: usize,
+    pub route_proof_generation: u64,
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub last_exit_code: Option<i32>,
@@ -103,6 +104,7 @@ impl EngineHandle {
             proxy_port: snapshot.proxy_port.or(Some(self.proxy_port)),
             route_stage: snapshot.route_stage,
             route_hops: usize::from(snapshot.route_hops),
+            route_proof_generation: snapshot.route_proof_generation,
             bytes_up: snapshot.bytes_up,
             bytes_down: snapshot.bytes_down,
             last_exit_code: snapshot.last_exit_code,
@@ -212,6 +214,24 @@ impl EngineHandle {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl EngineHandle {
+    /// Supplies a fully reappable handle for state-transition tests without
+    /// opening a socket or starting the process-global embedded actor system.
+    pub(crate) fn finished_for_state_transition_test() -> Self {
+        let thread = thread::spawn(|| 0);
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        Self {
+            thread: Some(thread),
+            proxy_port: 0,
+            min_hops: 1,
+            started_at: Instant::now(),
         }
     }
 }

@@ -914,8 +914,6 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ipstack"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e889a45c1ce3e97268ad2249951528563ec1d02a120fecbd4db690beac34f7fd"
 dependencies = [
  "ahash",
  "etherparse",
@@ -1893,8 +1891,6 @@ dependencies = [
 [[package]]
 name = "tun2proxy"
 version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "058486886fa3987ca284673b467f52f7c60e22ac6cf5d1e91f2d63b8f024bad4"
 dependencies = [
  "android_logger",
  "async-trait",

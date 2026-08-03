@@ -33,6 +33,8 @@ internal object MasqCoreJni {
 
   external fun nativePreflightProxy(): String
 
+  external fun nativeRefreshRouteProof(): String
+
   external fun nativeSetProxyEnabled(enabled: Boolean): String
 
   external fun nativeGetDebtSummary(): String

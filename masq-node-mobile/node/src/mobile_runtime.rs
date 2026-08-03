@@ -28,9 +28,15 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
 static ROUTE_STAGE: AtomicU8 = AtomicU8::new(0);
 static ROUTE_HOPS: AtomicU8 = AtomicU8::new(0);
+static ROUTE_PROOF_GENERATION: AtomicU64 = AtomicU64::new(0);
 static BYTES_UP: AtomicU64 = AtomicU64::new(0);
 static BYTES_DOWN: AtomicU64 = AtomicU64::new(0);
-static ENTRY_HANDSHAKE_MILESTONE: AtomicU8 = AtomicU8::new(EntryHandshakeMilestone::None as u8);
+static ENTRY_HANDSHAKE_PROGRESS: Mutex<EntryHandshakeProgress> =
+    Mutex::new(EntryHandshakeProgress {
+        milestone: EntryHandshakeMilestone::None,
+        attempt_started_at: None,
+        last_activity_at: None,
+    });
 static LAST_EXIT_CODE: AtomicI32 = AtomicI32::new(NO_EXIT_CODE);
 static SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 static ACTOR_ARBITERS: Mutex<Vec<Addr<Arbiter>>> = Mutex::new(Vec::new());
@@ -54,6 +60,7 @@ static STREAM_CONNECT_JOBS_FINISHED: Condvar = Condvar::new();
 pub enum MobileConnectionError {
     StreamConnectionFailed,
     PassLoopFound,
+    NoEntryProgress,
     RouteLengthPreferenceFailed,
     ExitCountryPreferenceFailed,
 }
@@ -65,6 +72,9 @@ impl MobileConnectionError {
             Self::PassLoopFound => {
                 "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop"
             }
+            Self::NoEntryProgress => {
+                "E_ENTRY_NO_PROGRESS: All selected entry peers exhausted the initial handshake"
+            }
             Self::RouteLengthPreferenceFailed => "Route length could not be applied",
             Self::ExitCountryPreferenceFailed => "Exit-country preference could not be applied",
         }
@@ -74,10 +84,28 @@ impl MobileConnectionError {
         !current
             .map(|message| message.starts_with(CORE_PANIC_LOCATION_PREFIX))
             .unwrap_or(false)
-            && (self == Self::PassLoopFound
-                || !current
-                    .map(|message| message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
-                    .unwrap_or(false))
+            && match self {
+                // Neighborhood emits NoEntryProgress only after every
+                // parallel entry attempt is terminal. That aggregate signal
+                // is stronger than a pass loop from one attempt and must
+                // remain stable when late per-peer events arrive.
+                Self::NoEntryProgress => true,
+                Self::PassLoopFound => !current
+                    .map(|message| message.starts_with("E_ENTRY_NO_PROGRESS:"))
+                    .unwrap_or(false),
+                Self::StreamConnectionFailed => !current
+                    .map(|message| {
+                        message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:")
+                            || message.starts_with("E_ENTRY_NO_PROGRESS:")
+                    })
+                    .unwrap_or(false),
+                Self::RouteLengthPreferenceFailed | Self::ExitCountryPreferenceFailed => !current
+                    .map(|message| {
+                        message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:")
+                            || message.starts_with("E_ENTRY_NO_PROGRESS:")
+                    })
+                    .unwrap_or(false),
+            }
     }
 }
 
@@ -96,16 +124,11 @@ pub enum EntryHandshakeMilestone {
     GossipAccepted = 4,
 }
 
-impl EntryHandshakeMilestone {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::TcpConnected,
-            2 => Self::DebutBytesWritten,
-            3 => Self::InboundBytesReceived,
-            4 => Self::GossipAccepted,
-            _ => Self::None,
-        }
-    }
+#[derive(Debug)]
+struct EntryHandshakeProgress {
+    milestone: EntryHandshakeMilestone,
+    attempt_started_at: Option<Instant>,
+    last_activity_at: Option<Instant>,
 }
 
 /// Keeps an embedded connector job visible until its blocking socket attempt
@@ -146,6 +169,8 @@ pub struct MobileRuntimeSnapshot {
     pub route_stage: u8,
     /// Actual outward MASQ hops in the most recently selected route.
     pub route_hops: u8,
+    /// Monotone proof-of-use counter. It contains no route, peer, or traffic identity.
+    pub route_proof_generation: u64,
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub last_exit_code: Option<i32>,
@@ -186,6 +211,7 @@ pub fn prepare(proxy_port: u16) {
     PROXY_PORT.store(proxy_port, Ordering::SeqCst);
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    ROUTE_PROOF_GENERATION.store(0, Ordering::SeqCst);
     BYTES_UP.store(0, Ordering::SeqCst);
     BYTES_DOWN.store(0, Ordering::SeqCst);
     reset_entry_handshake_milestone();
@@ -326,23 +352,94 @@ pub fn report_route_stage(stage: u8) {
             }
         }
         if stage >= 1 {
+            clear_terminal_entry_handshake_error();
             apply_exit_preference();
         }
     }
 }
 
-pub fn report_entry_handshake_milestone(milestone: EntryHandshakeMilestone) {
+/// Records that correlated response data completed an end-to-end MASQ route.
+/// The counter lets mobile lifecycle code refresh an idle route before its
+/// readiness lease expires, without exposing peer or destination information.
+pub fn report_route_use_succeeded() {
     if is_embedded() {
-        ENTRY_HANDSHAKE_MILESTONE.fetch_max(milestone as u8, Ordering::SeqCst);
+        advance_route_proof_generation(&ROUTE_PROOF_GENERATION);
     }
 }
 
+fn advance_route_proof_generation(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_add(1).max(1))
+    });
+}
+
+pub fn report_entry_handshake_milestone(milestone: EntryHandshakeMilestone) {
+    if !is_embedded() {
+        return;
+    }
+    let mut progress = ENTRY_HANDSHAKE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if milestone > progress.milestone {
+        progress.milestone = milestone;
+    }
+    // Repeated positive reads/writes are real aggregate transport activity.
+    // Refreshing this monotonic clock prevents a slow partial frame from being
+    // mistaken for a silent peer without recording a byte count or identity.
+    progress.last_activity_at = Some(Instant::now());
+}
+
 pub fn entry_handshake_milestone() -> EntryHandshakeMilestone {
-    EntryHandshakeMilestone::from_u8(ENTRY_HANDSHAKE_MILESTONE.load(Ordering::SeqCst))
+    ENTRY_HANDSHAKE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .milestone
+}
+
+/// Returns only the current aggregate milestone, monotonic inactivity, and
+/// age of this aggregate attempt. None of these values contains a peer
+/// identity, address, descriptor, payload, or byte count.
+pub fn entry_handshake_progress() -> (EntryHandshakeMilestone, Duration, Duration) {
+    let progress = ENTRY_HANDSHAKE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (
+        progress.milestone,
+        progress
+            .last_activity_at
+            .map(|last_activity_at| last_activity_at.elapsed())
+            .unwrap_or_default(),
+        progress
+            .attempt_started_at
+            .map(|attempt_started_at| attempt_started_at.elapsed())
+            .unwrap_or_default(),
+    )
 }
 
 fn reset_entry_handshake_milestone() {
-    ENTRY_HANDSHAKE_MILESTONE.store(EntryHandshakeMilestone::None as u8, Ordering::SeqCst);
+    let mut progress = ENTRY_HANDSHAKE_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    progress.milestone = EntryHandshakeMilestone::None;
+    progress.attempt_started_at = Some(now);
+    progress.last_activity_at = Some(now);
+}
+
+fn clear_terminal_entry_handshake_error() {
+    let mut last_error = LAST_CONNECTION_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last_error
+        .as_deref()
+        .map(|message| {
+            message.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:")
+                || message.starts_with("E_ENTRY_NO_PROGRESS:")
+        })
+        .unwrap_or(false)
+    {
+        *last_error = None;
+    }
 }
 
 pub fn report_route_hops(hops: usize) {
@@ -645,6 +742,7 @@ pub fn snapshot() -> MobileRuntimeSnapshot {
         },
         route_stage: ROUTE_STAGE.load(Ordering::SeqCst),
         route_hops: ROUTE_HOPS.load(Ordering::SeqCst),
+        route_proof_generation: ROUTE_PROOF_GENERATION.load(Ordering::SeqCst),
         bytes_up: BYTES_UP.load(Ordering::SeqCst),
         bytes_down: BYTES_DOWN.load(Ordering::SeqCst),
         last_exit_code: if last_exit_code == NO_EXIT_CODE {
@@ -670,6 +768,7 @@ pub(crate) fn finish(exit_code: i32) {
     PROXY_PORT.store(0, Ordering::SeqCst);
     ROUTE_STAGE.store(0, Ordering::SeqCst);
     ROUTE_HOPS.store(0, Ordering::SeqCst);
+    ROUTE_PROOF_GENERATION.store(0, Ordering::SeqCst);
     reset_entry_handshake_milestone();
     LAST_EXIT_CODE.store(exit_code, Ordering::SeqCst);
     *SYSTEM
@@ -709,15 +808,24 @@ mod tests {
         mark_started();
         report_route_hops(3);
         report_route_stage(2);
+        report_route_use_succeeded();
 
+        let mut running_snapshot = snapshot();
+        // Neighborhood actor tests run on independent Actix systems and can
+        // report additional anonymous route-use heartbeats while this global
+        // embedded-runtime fixture is active. Verify the presence of proof,
+        // then normalize only that aggregate counter for the structural check.
+        assert!(running_snapshot.route_proof_generation >= 1);
+        running_snapshot.route_proof_generation = 1;
         assert_eq!(
-            snapshot(),
+            running_snapshot,
             MobileRuntimeSnapshot {
                 started: true,
                 stop_requested: false,
                 proxy_port: Some(44_443),
                 route_stage: 2,
                 route_hops: 3,
+                route_proof_generation: 1,
                 bytes_up: 0,
                 bytes_down: 0,
                 last_exit_code: None,
@@ -737,6 +845,7 @@ mod tests {
                 proxy_port: None,
                 route_stage: 0,
                 route_hops: 0,
+                route_proof_generation: 0,
                 bytes_up: 0,
                 bytes_down: 0,
                 last_exit_code: Some(0),
@@ -744,6 +853,19 @@ mod tests {
                 available_exit_countries: vec![],
             }
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn route_proof_generation_is_monotone_and_saturates() {
+        let counter = AtomicU64::new(0);
+        advance_route_proof_generation(&counter);
+        advance_route_proof_generation(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        counter.store(u64::MAX, Ordering::SeqCst);
+        advance_route_proof_generation(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), u64::MAX);
     }
 
     #[test]
@@ -848,6 +970,10 @@ mod tests {
             entry_handshake_milestone(),
             EntryHandshakeMilestone::DebutBytesWritten
         );
+        let (milestone, age, attempt_age) = entry_handshake_progress();
+        assert_eq!(milestone, EntryHandshakeMilestone::DebutBytesWritten);
+        assert!(age < Duration::from_secs(1));
+        assert!(attempt_age < Duration::from_secs(1));
 
         retry_connection(&[]).expect_err("retry recipient is intentionally absent");
         assert_eq!(entry_handshake_milestone(), EntryHandshakeMilestone::None);
@@ -894,6 +1020,78 @@ mod tests {
             snapshot().last_connection_error.as_deref(),
             Some("E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop")
         );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminal_entry_progress_is_not_overwritten_by_a_later_transport_failure() {
+        prepare(44_443);
+        report_connection_error(MobileConnectionError::NoEntryProgress);
+        report_connection_error(MobileConnectionError::StreamConnectionFailed);
+
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("E_ENTRY_NO_PROGRESS: All selected entry peers exhausted the initial handshake")
+        );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aggregate_terminal_progress_replaces_and_survives_per_peer_pass_loop_events() {
+        prepare(44_443);
+        report_connection_error(MobileConnectionError::PassLoopFound);
+        report_connection_error(MobileConnectionError::NoEntryProgress);
+        report_connection_error(MobileConnectionError::PassLoopFound);
+
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("E_ENTRY_NO_PROGRESS: All selected entry peers exhausted the initial handshake")
+        );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_proven_entry_peer_clears_only_stale_terminal_entry_errors() {
+        prepare(44_443);
+        report_connection_error(MobileConnectionError::NoEntryProgress);
+
+        report_route_stage(1);
+
+        assert_eq!(snapshot().last_connection_error, None);
+        report_connection_error(MobileConnectionError::RouteLengthPreferenceFailed);
+        report_route_stage(2);
+        assert_eq!(
+            snapshot().last_connection_error.as_deref(),
+            Some("Route length could not be applied")
+        );
+        finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn entry_attempt_age_is_independent_from_runtime_age_and_resets() {
+        prepare(44_443);
+        {
+            let now = Instant::now();
+            let mut progress = ENTRY_HANDSHAKE_PROGRESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            progress.attempt_started_at = Some(now - Duration::from_secs(40));
+            progress.last_activity_at = Some(now - Duration::from_secs(3));
+        }
+        let (_, inactivity, attempt_age) = entry_handshake_progress();
+        assert!(inactivity >= Duration::from_secs(3));
+        assert!(inactivity < Duration::from_secs(4));
+        assert!(attempt_age >= Duration::from_secs(40));
+        assert!(attempt_age < Duration::from_secs(41));
+
+        reset_entry_handshake_milestone();
+        let (_, inactivity, attempt_age) = entry_handshake_progress();
+        assert!(inactivity < Duration::from_secs(1));
+        assert!(attempt_age < Duration::from_secs(1));
         finish(0);
     }
 

@@ -1,5 +1,105 @@
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+index 80c6803..3cf5824 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+@@ -44,11 +44,15 @@ import com.reactnativecommunity.webview.events.TopMessageEvent;
+ import org.json.JSONException;
+ import org.json.JSONObject;
+ 
++import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+ 
+ public class RNCWebView extends WebView implements LifecycleEventListener {
++    private static final int MAX_BLOCKED_RESOURCE_HOSTS = 64;
+     protected @Nullable
+     String injectedJS;
+     protected @Nullable
+@@ -78,6 +82,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+     protected boolean hasScrollEvent = false;
+     protected boolean nestedScrollEnabled = false;
+     protected ProgressChangedFilter progressChangedFilter;
++    private volatile Set<String> blockedResourceHosts = Collections.emptySet();
+ 
+     /**
+      * WebView must be created with an context of the current activity
+@@ -107,6 +112,53 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         this.nestedScrollEnabled = nestedScrollEnabled;
+     }
+ 
++    public void setBlockedResourceHosts(@Nullable List<String> hosts) {
++        if (hosts == null || hosts.isEmpty()) {
++            blockedResourceHosts = Collections.emptySet();
++            return;
++        }
++        final LinkedHashSet<String> validated = new LinkedHashSet<>();
++        for (String candidate : hosts) {
++            if (validated.size() >= MAX_BLOCKED_RESOURCE_HOSTS) {
++                break;
++            }
++            if (candidate == null || candidate.length() < 3 || candidate.length() > 253) {
++                continue;
++            }
++            final String host = candidate.toLowerCase(Locale.ROOT);
++            if (!candidate.equals(host)
++                    || !host.contains(".")
++                    || host.startsWith(".")
++                    || host.endsWith(".")
++                    || host.contains("..")
++                    || !host.matches("[a-z0-9.-]+")) {
++                continue;
++            }
++            validated.add(host);
++        }
++        blockedResourceHosts = Collections.unmodifiableSet(validated);
++    }
++
++    public boolean shouldBlockResource(@Nullable Uri uri) {
++        if (uri == null) {
++            return false;
++        }
++        final String scheme = uri.getScheme();
++        final String candidateHost = uri.getHost();
++        if (scheme == null
++                || candidateHost == null
++                || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
++            return false;
++        }
++        final String host = candidateHost.toLowerCase(Locale.ROOT);
++        for (String blockedHost : blockedResourceHosts) {
++            if (host.equals(blockedHost) || host.endsWith("." + blockedHost)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     @Override
+     public void onHostResume() {
+         // do nothing
+@@ -410,7 +462,17 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+     }
+ 
+     protected void cleanupCallbacksAndDestroy() {
++        // Destroying a WebView while it still owns a loaded HTTPS document can
++        // leave Chromium's proxy CONNECT sockets and CLOSE_WAIT streams alive
++        // in the shared renderer process.  Detach the document from the
++        // network first; about:blank is local and cannot bypass MASQ.  The
++        // browser screen has already switched to its fail-closed close state
++        // before React Native drops this view.
++        stopLoading();
+         setWebViewClient(null);
++        loadUrl("about:blank");
++        clearHistory();
++        removeAllViews();
+         destroy();
+     }
+ 
 diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
-index 209b855..7a1d27a 100644
+index 209b855..ae058ea 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
 +++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
 @@ -32,6 +32,9 @@ import com.reactnativecommunity.webview.events.TopRenderProcessGoneEvent;
@@ -53,7 +153,7 @@ index 209b855..7a1d27a 100644
              return true;
          }
      }
-@@ -135,7 +154,35 @@ public class RNCWebViewClient extends WebViewClient {
+@@ -135,7 +154,46 @@ public class RNCWebViewClient extends WebViewClient {
      @Override
      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
          final String url = request.getUrl().toString();
@@ -86,12 +186,23 @@ index 209b855..7a1d27a 100644
 +                    new ByteArrayInputStream(blockedBody));
 +        }
 +
++        if (!request.isForMainFrame()
++                && ((RNCWebView) view).shouldBlockResource(request.getUrl())) {
++            return new WebResourceResponse(
++                    "text/plain",
++                    StandardCharsets.UTF_8.name(),
++                    204,
++                    "No Content",
++                    Collections.singletonMap("Cache-Control", "no-store"),
++                    new ByteArrayInputStream(new byte[0]));
++        }
++
 +        return super.shouldInterceptRequest(view, request);
      }
  
      @Override
 diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
-index f83033b..eda24ed 100644
+index f83033b..9920c05 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
 +++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
 @@ -16,6 +16,7 @@ import android.webkit.DownloadListener
@@ -131,6 +242,18 @@ index f83033b..eda24ed 100644
          settings.setSupportMultipleWindows(true)
          settings.allowFileAccess = false
          settings.allowContentAccess = false
+@@ -466,6 +482,11 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+       view.settings.cacheMode = if (enabled) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_NO_CACHE
+     }
+ 
++    fun setAndroidBlockedResourceHosts(viewWrapper: RNCWebViewWrapper, value: ReadableArray?) {
++        val hosts = value?.toArrayList()?.filterIsInstance<String>()?.take(64) ?: emptyList()
++        viewWrapper.webView.setBlockedResourceHosts(hosts)
++    }
++
+     fun setIncognito(viewWrapper: RNCWebViewWrapper, enabled: Boolean) {
+         val view = viewWrapper.webView
+         // Don't do anything when incognito is disabled
 diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt
 index da4eb96..29ec849 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt
@@ -146,6 +269,39 @@ index da4eb96..29ec849 100644
      // Android does not raise shouldOverrideUrlLoading for inner frames
      mData.putBoolean("isTopFrame", true)
    }
+diff --git a/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java b/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+index fa8efb8..3fd21fa 100644
+--- a/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
++++ b/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+@@ -118,6 +118,12 @@ public class RNCWebViewManager extends ViewGroupManager<RNCWebViewWrapper>
+         mRNCWebViewManagerImpl.setCacheEnabled(view, value);
+     }
+ 
++    @Override
++    @ReactProp(name = "androidBlockedResourceHosts")
++    public void setAndroidBlockedResourceHosts(RNCWebViewWrapper view, @Nullable ReadableArray value) {
++        mRNCWebViewManagerImpl.setAndroidBlockedResourceHosts(view, value);
++    }
++
+     @Override
+     @ReactProp(name = "cacheMode")
+     public void setCacheMode(RNCWebViewWrapper view, @Nullable String value) {
+diff --git a/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java b/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+index 974337f..7c92b33 100644
+--- a/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
++++ b/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+@@ -92,6 +92,11 @@ public class RNCWebViewManager extends ViewGroupManager<RNCWebViewWrapper> {
+         mRNCWebViewManagerImpl.setCacheEnabled(view, value);
+     }
+ 
++    @ReactProp(name = "androidBlockedResourceHosts")
++    public void setAndroidBlockedResourceHosts(RNCWebViewWrapper view, @Nullable ReadableArray value) {
++        mRNCWebViewManagerImpl.setAndroidBlockedResourceHosts(view, value);
++    }
++
+     @ReactProp(name = "cacheMode")
+     public void setCacheMode(RNCWebViewWrapper view, @Nullable String value) {
+         mRNCWebViewManagerImpl.setCacheMode(view, value);
 diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
 index 3890426..8158aa2 100644
 --- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
@@ -201,3 +357,34 @@ index 3890426..8158aa2 100644
  
  #if defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 130000 /* iOS 13 */
    if (@available(iOS 13.0, *)) {
+diff --git a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+index ca3af15..89ea1ab 100644
+--- a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
++++ b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+@@ -132,6 +132,7 @@ type WebViewDownloadEvent = Readonly<{
+ 
+ export interface NativeProps extends ViewProps {
+   // Android only
++  androidBlockedResourceHosts?: ReadonlyArray<string>;
+   allowFileAccess?: boolean;
+   allowsProtectedMedia?: boolean;
+   allowsFullscreenVideo?: boolean;
+diff --git a/node_modules/react-native-webview/src/WebViewTypes.ts b/node_modules/react-native-webview/src/WebViewTypes.ts
+index 4e7247f..36dfb35 100644
+--- a/node_modules/react-native-webview/src/WebViewTypes.ts
++++ b/node_modules/react-native-webview/src/WebViewTypes.ts
+@@ -950,6 +950,14 @@ export interface AndroidWebViewProps extends WebViewSharedProps {
+   onNavigationStateChange?: (event: WebViewNavigation) => void;
+   onContentSizeChange?: (event: WebViewEvent) => void;
+ 
++  /**
++   * Exact host suffixes whose non-main-frame HTTP(S) requests are answered
++   * locally before they can reach the network. The Android implementation
++   * accepts at most 64 validated lowercase hosts.
++   * @platform android
++   */
++  androidBlockedResourceHosts?: readonly string[];
++
+   /**
+    * Function that is invoked when the `WebView` process crashes or is killed by the OS.
+    * Works only on Android (minimum API level 26).

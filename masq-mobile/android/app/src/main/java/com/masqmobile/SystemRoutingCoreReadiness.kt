@@ -29,7 +29,7 @@ internal fun systemRoutingCoreReadiness(
       ready =
           phase == "connected" &&
               connectedNeighbors > 0 &&
-              routeStage > 0 &&
+              routeStage >= 2 &&
               proxyPort in 1..65535 &&
               engineGeneration > 0,
       proxyPort = proxyPort,

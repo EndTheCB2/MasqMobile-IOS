@@ -1,5 +1,6 @@
 package com.masqmobile
 
+import android.util.Log
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
@@ -7,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 
 internal enum class PacketTunnelNativeState {
@@ -23,7 +25,167 @@ internal data class PacketTunnelSnapshot(
     val generation: Long?,
     val lastResult: String?,
     val trafficObserved: Boolean = false,
+    val sessionMetrics: PacketTunnelSessionMetrics = PacketTunnelSessionMetrics.EMPTY,
 )
+
+internal data class PacketTunnelSessionMetrics(
+    val sessionCapacity: Long,
+    val activeSessions: Long,
+    val peakSessions: Long,
+    val rejectedCapacity: Long,
+    val rejectedUdp: Long,
+    val rejectedIpv6: Long,
+    val rejectedNon443Tcp: Long,
+    val payloadTxBytes: Long,
+    val payloadRxBytes: Long,
+) {
+  companion object {
+    val EMPTY =
+        PacketTunnelSessionMetrics(
+            sessionCapacity = 0,
+            activeSessions = 0,
+            peakSessions = 0,
+            rejectedCapacity = 0,
+            rejectedUdp = 0,
+            rejectedIpv6 = 0,
+            rejectedNon443Tcp = 0,
+            payloadTxBytes = 0,
+            payloadRxBytes = 0,
+        )
+  }
+}
+
+internal fun parsePacketTunnelSnapshot(serialized: String): PacketTunnelSnapshot {
+  val value = JSONObject(serialized)
+  val state =
+      when (value.optString("state")) {
+        "idle" -> PacketTunnelNativeState.IDLE
+        "starting" -> PacketTunnelNativeState.STARTING
+        "running" -> PacketTunnelNativeState.RUNNING
+        "stopping" -> PacketTunnelNativeState.STOPPING
+        "failed" -> PacketTunnelNativeState.FAILED
+        else -> PacketTunnelNativeState.UNKNOWN
+      }
+  val generation = value.optLong("generation").takeIf { it > 0 }
+  // The native counters are reset inside the exact tun2proxy run before its
+  // lifecycle reaches RUNNING. Ignoring them in every other lifecycle state
+  // prevents a narrow STARTING/FAILED race from attributing the preceding
+  // generation's final counters to its successor.
+  val metrics =
+      if (state == PacketTunnelNativeState.RUNNING && generation != null) {
+        value.optJSONObject("sessionMetrics")?.let(::parsePacketTunnelSessionMetrics)
+            ?: PacketTunnelSessionMetrics.EMPTY
+      } else {
+        PacketTunnelSessionMetrics.EMPTY
+      }
+  return PacketTunnelSnapshot(
+      state = state,
+      generation = generation,
+      lastResult = value.optString("lastResult").takeIf(String::isNotBlank),
+      trafficObserved =
+          state == PacketTunnelNativeState.RUNNING &&
+              generation != null &&
+              value.optBoolean("trafficObserved", false),
+      sessionMetrics = metrics,
+  )
+}
+
+private fun parsePacketTunnelSessionMetrics(value: JSONObject) =
+    PacketTunnelSessionMetrics(
+        sessionCapacity = value.safeAggregateCounter("sessionCapacity"),
+        activeSessions = value.safeAggregateCounter("activeSessions"),
+        peakSessions = value.safeAggregateCounter("peakSessions"),
+        rejectedCapacity = value.safeAggregateCounter("rejectedCapacity"),
+        rejectedUdp = value.safeAggregateCounter("rejectedUdp"),
+        rejectedIpv6 = value.safeAggregateCounter("rejectedIpv6"),
+        rejectedNon443Tcp = value.safeAggregateCounter("rejectedNon443Tcp"),
+        payloadTxBytes = value.safeAggregateCounter("payloadTxBytes"),
+        payloadRxBytes = value.safeAggregateCounter("payloadRxBytes"),
+    )
+
+private fun JSONObject.safeAggregateCounter(name: String): Long =
+    runCatching { getLong(name) }.getOrDefault(0L).coerceAtLeast(0L)
+
+private fun Long.safeDiagnosticCountBucket(): String =
+    when (coerceAtLeast(0L)) {
+      0L -> "none"
+      1L -> "one"
+      in 2L..4L -> "few"
+      in 5L..16L -> "several"
+      in 17L..64L -> "many"
+      else -> "high"
+    }
+
+private fun Long.safeDiagnosticByteBucket(): String =
+    when (coerceAtLeast(0L)) {
+      0L -> "none"
+      in 1L..1_023L -> "under_1k"
+      in 1_024L..65_535L -> "under_64k"
+      in 65_536L..1_048_575L -> "under_1m"
+      in 1_048_576L..16_777_215L -> "under_16m"
+      else -> "high"
+    }
+
+internal fun formatSafePacketTunnelDiagnostic(snapshot: PacketTunnelSnapshot): String {
+  val metrics = snapshot.sessionMetrics
+  val state =
+      when (snapshot.state) {
+        PacketTunnelNativeState.IDLE -> "idle"
+        PacketTunnelNativeState.STARTING -> "starting"
+        PacketTunnelNativeState.RUNNING -> "running"
+        PacketTunnelNativeState.STOPPING -> "stopping"
+        PacketTunnelNativeState.FAILED -> "failed"
+        PacketTunnelNativeState.UNKNOWN -> "unknown"
+      }
+  val result =
+      when (snapshot.lastResult) {
+        null -> "none"
+        "stopped" -> "stopped"
+        "unexpectedCleanReturn" -> "unexpected_clean_return"
+        "failed" -> "failed"
+        else -> "unknown"
+      }
+  val signal =
+      when {
+        snapshot.state == PacketTunnelNativeState.FAILED -> "translator_failed"
+        snapshot.state == PacketTunnelNativeState.STOPPING -> "stopping"
+        snapshot.state == PacketTunnelNativeState.STARTING -> "starting"
+        snapshot.state != PacketTunnelNativeState.RUNNING -> "idle"
+        metrics.payloadRxBytes > 0 -> "payload_returned"
+        metrics.payloadTxBytes > 0 || snapshot.trafficObserved -> "payload_sent"
+        metrics.rejectedCapacity > 0 -> "capacity_pressure"
+        metrics.activeSessions > 0 -> "tcp443_active"
+        metrics.peakSessions > 0 -> "tcp443_seen"
+        metrics.rejectedUdp > 0 ||
+            metrics.rejectedIpv6 > 0 ||
+            metrics.rejectedNon443Tcp > 0 -> "policy_rejected"
+        else -> "ready"
+      }
+  return "TUN_STATUS generation=${snapshot.generation?.coerceIn(1L, MAX_SAFE_TUNNEL_COUNTER) ?: 0} " +
+      "state=$state result=$result signal=$signal traffic=${snapshot.trafficObserved} " +
+      "capacity=${metrics.sessionCapacity.safeDiagnosticCountBucket()} " +
+      "active=${metrics.activeSessions.safeDiagnosticCountBucket()} " +
+      "peak=${metrics.peakSessions.safeDiagnosticCountBucket()} " +
+      "rejected_capacity=${metrics.rejectedCapacity.safeDiagnosticCountBucket()} " +
+      "rejected_udp=${metrics.rejectedUdp.safeDiagnosticCountBucket()} " +
+      "rejected_ipv6=${metrics.rejectedIpv6.safeDiagnosticCountBucket()} " +
+      "rejected_non443_tcp=${metrics.rejectedNon443Tcp.safeDiagnosticCountBucket()} " +
+      "payload_tx=${metrics.payloadTxBytes.safeDiagnosticByteBucket()} " +
+      "payload_rx=${metrics.payloadRxBytes.safeDiagnosticByteBucket()}"
+}
+
+internal class SafePacketTunnelDiagnosticReporter(
+    private val emit: (String) -> Unit,
+) {
+  private val lastDiagnostic = AtomicReference<String?>()
+
+  fun record(snapshot: PacketTunnelSnapshot) {
+    val diagnostic = formatSafePacketTunnelDiagnostic(snapshot)
+    if (lastDiagnostic.getAndSet(diagnostic) != diagnostic) {
+      emit(diagnostic)
+    }
+  }
+}
 
 internal interface PacketTunnelNativeApi {
   fun start(tunFd: Int, proxyPort: Int, mtu: Int): Int
@@ -34,29 +196,25 @@ internal interface PacketTunnelNativeApi {
 }
 
 internal object JniPacketTunnelNativeApi : PacketTunnelNativeApi {
+  private val diagnosticReporter =
+      SafePacketTunnelDiagnosticReporter { diagnostic ->
+        Log.i(PACKET_TUNNEL_DIAGNOSTIC_TAG, diagnostic)
+      }
+
   override fun start(tunFd: Int, proxyPort: Int, mtu: Int): Int =
       MasqPacketTunnelJni.nativeStart(tunFd, proxyPort, mtu)
 
   override fun requestStop(): Boolean = MasqPacketTunnelJni.nativeStop()
 
   override fun snapshot(): PacketTunnelSnapshot {
-    val value = JSONObject(MasqPacketTunnelJni.nativeStateJson())
-    return PacketTunnelSnapshot(
-        state =
-            when (value.optString("state")) {
-              "idle" -> PacketTunnelNativeState.IDLE
-              "starting" -> PacketTunnelNativeState.STARTING
-              "running" -> PacketTunnelNativeState.RUNNING
-              "stopping" -> PacketTunnelNativeState.STOPPING
-              "failed" -> PacketTunnelNativeState.FAILED
-              else -> PacketTunnelNativeState.UNKNOWN
-            },
-        generation = value.optLong("generation").takeIf { it > 0 },
-        lastResult = value.optString("lastResult").takeIf(String::isNotBlank),
-        trafficObserved = value.optBoolean("trafficObserved", false),
-    )
+    val snapshot = parsePacketTunnelSnapshot(MasqPacketTunnelJni.nativeStateJson())
+    diagnosticReporter.record(snapshot)
+    return snapshot
   }
 }
+
+private const val PACKET_TUNNEL_DIAGNOSTIC_TAG = "MasqTunnelStatus"
+private const val MAX_SAFE_TUNNEL_COUNTER = 999_999_999L
 
 internal sealed interface TranslatorStartResult {
   data object Started : TranslatorStartResult
@@ -390,18 +548,34 @@ internal class SystemRoutingTranslator(
     return TranslatorStopResult.SafeToClose
   }
 
-  fun isRunning(revision: Long): Boolean {
+  /**
+   * Returns a snapshot only when the exact Future, policy revision, and native
+   * lifecycle generation still agree. Callers must use this proof instead of a
+   * bare native RUNNING bit before publishing translator readiness or traffic.
+   */
+  fun exactRunningSnapshot(revision: Long): PacketTunnelSnapshot? {
     val run =
         synchronized(lock) {
           ownedRun
         }
-    return run?.revision == revision &&
-        !run.future.isDone &&
-        runCatching { nativeApi.snapshot() }.getOrNull()?.let { snapshot ->
-          snapshot.state == PacketTunnelNativeState.RUNNING &&
-              snapshot.generation == run.expectedNativeGeneration
-        } == true
+    if (run == null || run.revision != revision || run.future.isDone) return null
+    val snapshot = runCatching { nativeApi.snapshot() }.getOrNull() ?: return null
+    if (snapshot.state != PacketTunnelNativeState.RUNNING ||
+        snapshot.generation != run.expectedNativeGeneration) {
+      return null
+    }
+    return synchronized(lock) {
+      val current = ownedRun
+      snapshot.takeIf {
+        current?.future === run.future &&
+            current.revision == revision &&
+            current.expectedNativeGeneration == snapshot.generation &&
+            !run.future.isDone
+      }
+    }
   }
+
+  fun isRunning(revision: Long): Boolean = exactRunningSnapshot(revision) != null
 
   fun hasOwnedRun(): Boolean = synchronized(lock) { ownedRun != null }
 

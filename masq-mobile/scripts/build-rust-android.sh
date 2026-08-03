@@ -124,7 +124,8 @@ rustup run "$TUNNEL_TOOLCHAIN" cargo ndk \
 # their Rust code statically and does not declare them in DT_NEEDED. Remove only
 # the two audited copies; any new or required shared dependency fails below.
 find "$OUTPUT_DIR" -type f \
-  \( -name 'libsysinfo-*.so' -o -name 'libtun2proxy-*.so' \) \
+  \( -name 'libsysinfo.so' -o -name 'libsysinfo-*.so' -o \
+     -name 'libtun2proxy.so' -o -name 'libtun2proxy-*.so' \) \
   -delete
 
 node "$ROOT_DIR/scripts/verify-android-native-elf.js" --jni-dir "$OUTPUT_DIR"

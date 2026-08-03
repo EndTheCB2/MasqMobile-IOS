@@ -17,6 +17,13 @@ describe('iOS native MASQ core linkage', () => {
     path.resolve(__dirname, '../specs/NativeMasqCore.ts'),
     'utf8',
   );
+  const coreHeaderSource = readFileSync(
+    path.resolve(
+      __dirname,
+      '../native/masq-mobile-core/include/masq_mobile_core.h',
+    ),
+    'utf8',
+  );
   const browserSource = readFileSync(
     path.resolve(
       __dirname,
@@ -89,6 +96,12 @@ describe('iOS native MASQ core linkage', () => {
     expect(bridgeSource).toContain('&masq_mobile_shutdown');
     expect(bridgeSource).toContain('&masq_mobile_confirm_debt_settlement');
     expect(bridgeSource).toContain('&masq_mobile_string_free');
+  });
+
+  it('publishes the periodic route-proof refresh in the shared C header', () => {
+    expect(coreHeaderSource).toContain(
+      'char *masq_mobile_refresh_route_proof(void);',
+    );
   });
 
   it('returns a complete unavailable status when the native core is absent', () => {
@@ -166,12 +179,8 @@ describe('iOS native MASQ core linkage', () => {
     expect(terminalStatusBody).toContain(
       '[status[@"connectedNeighbors"] isEqual:@0]',
     );
-    expect(terminalStatusBody).toContain(
-      '[status[@"routeStage"] isEqual:@0]',
-    );
-    expect(terminalStatusBody).toContain(
-      '[status[@"routeHops"] isEqual:@0]',
-    );
+    expect(terminalStatusBody).toContain('[status[@"routeStage"] isEqual:@0]');
+    expect(terminalStatusBody).toContain('[status[@"routeHops"] isEqual:@0]');
     expect(terminalStatusBody).toContain('[status[@"minHops"] isEqual:@1]');
     expect(terminalStatusBody).toContain(
       'status[@"exitCountry"] == [NSNull null]',
@@ -211,15 +220,11 @@ describe('iOS native MASQ core linkage', () => {
       bridgeSource.indexOf('- (void)resetNetworkProfile:'),
       bridgeSource.indexOf('- (void)removeWallet:'),
     );
-    const staleGuard = startBody.indexOf(
-      'generation != gCoreStartGeneration',
-    );
+    const staleGuard = startBody.indexOf('generation != gCoreStartGeneration');
     const nativeConfigure = startBody.indexOf(
       'symbol<StringArgumentFunction>("masq_mobile_configure")',
     );
-    const profileWrite = startBody.indexOf(
-      'setObject:refreshedConfig',
-    );
+    const profileWrite = startBody.indexOf('setObject:refreshedConfig');
     const nativeStart = startBody.indexOf(
       'symbol<NoArgumentFunction>("masq_mobile_start")',
     );
@@ -236,9 +241,7 @@ describe('iOS native MASQ core linkage', () => {
     expect(nativeStart).toBeGreaterThan(nativeConfigure);
     expect(profileWrite).toBeGreaterThan(nativeStart);
     expect(resetBody.indexOf('gCoreStartGeneration += 1')).toBeLessThan(
-      resetBody.indexOf(
-        '[defaults removeObjectForKey:MasqConfigDefaultsKey]',
-      ),
+      resetBody.indexOf('[defaults removeObjectForKey:MasqConfigDefaultsKey]'),
     );
   });
 
@@ -294,13 +297,11 @@ describe('iOS native MASQ core linkage', () => {
     expect(removeWalletBody.indexOf('if (!coreAvailable())')).toBeLessThan(
       removeWalletBody.indexOf('deleteWalletSecret()'),
     );
-    expect(removeWalletBody.indexOf('"masq_mobile_remove_wallet"')).toBeLessThan(
-      removeWalletBody.indexOf('deleteWalletSecret()'),
-    );
     expect(
-      removeWalletBody.indexOf(
-        'isWalletRemovalTerminalStatus(removalStatus)',
-      ),
+      removeWalletBody.indexOf('"masq_mobile_remove_wallet"'),
+    ).toBeLessThan(removeWalletBody.indexOf('deleteWalletSecret()'));
+    expect(
+      removeWalletBody.indexOf('isWalletRemovalTerminalStatus(removalStatus)'),
     ).toBeLessThan(removeWalletBody.indexOf('deleteWalletSecret()'));
     expect(
       removeWalletBody.lastIndexOf('"masq_mobile_get_status"'),
@@ -310,9 +311,7 @@ describe('iOS native MASQ core linkage', () => {
   it('fences stale iOS browser proxy callbacks behind the core lifecycle', () => {
     const browserRoutingBody = bridgeSource.slice(
       bridgeSource.indexOf('- (void)setBrowserRoutingMode:'),
-      bridgeSource.indexOf(
-        '- (std::shared_ptr<facebook::react::TurboModule>)',
-      ),
+      bridgeSource.indexOf('- (std::shared_ptr<facebook::react::TurboModule>)'),
     );
 
     expect(browserRoutingBody).toContain(
@@ -321,16 +320,12 @@ describe('iOS native MASQ core linkage', () => {
     expect(browserRoutingBody).toContain(
       'coreGeneration != gCoreStartGeneration',
     );
-    expect(browserRoutingBody).toContain(
-      '[mode isEqualToString:@"direct"]',
-    );
+    expect(browserRoutingBody).toContain('[mode isEqualToString:@"direct"]');
     expect(browserRoutingBody).toContain(
       'self.invalidated ||\n            coreGeneration != gCoreStartGeneration',
     );
     expect(browserRoutingBody).toContain('E_BROWSER_STALE_CORE');
-    expect(browserRoutingBody).toContain(
-      '@synchronized(coreLifecycleLock())',
-    );
+    expect(browserRoutingBody).toContain('@synchronized(coreLifecycleLock())');
   });
 
   it('restores iOS saved network configuration and wallet independently', () => {
@@ -343,9 +338,7 @@ describe('iOS native MASQ core linkage', () => {
     expect(restoreBody).toContain('if (savedWallet) {');
     expect(restoreBody).toContain('"masq_mobile_configure"');
     expect(restoreBody).toContain('"masq_mobile_import_wallet"');
-    expect(restoreBody).not.toContain(
-      'if (!savedConfig || !savedWallet)',
-    );
+    expect(restoreBody).not.toContain('if (!savedConfig || !savedWallet)');
   });
 
   it('invalidates every queued iOS core mutation when its bridge is torn down', () => {
@@ -385,11 +378,13 @@ describe('iOS native MASQ core linkage', () => {
       expect(operation).toContain(
         'self.invalidated || generation != gCoreStartGeneration',
       );
-      expect(operation.indexOf('generation = gCoreStartGeneration'))
-        .toBeLessThan(operation.indexOf('dispatch_async('));
+      expect(
+        operation.indexOf('generation = gCoreStartGeneration'),
+      ).toBeLessThan(operation.indexOf('dispatch_async('));
     }
-    expect(preflightBody.indexOf('generation != gCoreStartGeneration'))
-      .toBeLessThan(preflightBody.indexOf('"masq_mobile_preflight_proxy"'));
+    expect(
+      preflightBody.indexOf('generation != gCoreStartGeneration'),
+    ).toBeLessThan(preflightBody.indexOf('"masq_mobile_preflight_proxy"'));
   });
 
   it('rejects malformed iOS core operation status instead of treating it as success', () => {
@@ -466,9 +461,8 @@ describe('iOS native MASQ core linkage', () => {
     expect(browserSource).toContain('if (_incognito)');
     expect(browserSource).toContain('} else {');
     expect(browserScreen).toContain('incognito');
-    expect(browserScreen).toContain(
-      'cacheEnabled={Boolean(siteSettings?.rememberSignIn)}',
-    );
+    expect(browserScreen).toContain("Platform.OS === 'android' ||");
+    expect(browserScreen).toContain('Boolean(siteSettings?.rememberSignIn)');
   });
 
   it('switches exact ephemeral browser modes without ever opening the MASQ store directly', () => {
@@ -504,9 +498,7 @@ describe('iOS native MASQ core linkage', () => {
       'configurePrivateBrowserProxy(directBrowserDataStore()',
     );
     expect(blockedBody).toContain('MasqBlockedBrowserProxyPort');
-    expect(blockedBody).toContain(
-      '"masq_mobile_set_proxy_enabled"',
-    );
+    expect(blockedBody).toContain('"masq_mobile_set_proxy_enabled"');
     expect(blockedBody).toContain('false');
     expect(blockedBody).toContain('resolve(@"blocked")');
 
@@ -519,9 +511,7 @@ describe('iOS native MASQ core linkage', () => {
     expect(directBody).not.toContain(
       '[masqBrowserDataStore() setProxyConfigurations:@[]]',
     );
-    expect(directBody).toContain(
-      '"masq_mobile_set_proxy_enabled"',
-    );
+    expect(directBody).toContain('"masq_mobile_set_proxy_enabled"');
     expect(directBody).toContain('false');
     expect(directBody).toContain('resolve(@"direct")');
 
@@ -533,12 +523,12 @@ describe('iOS native MASQ core linkage', () => {
     );
     expect(masqBody).toContain('@"connected"');
     expect(masqBody).toContain('![status isKindOfClass:[NSDictionary class]]');
+    expect(masqBody).toContain('connectedNeighbors.integerValue < 1');
+    expect(masqBody).toContain('routeStage.integerValue < 2');
     expect(masqBody).toContain('port.integerValue < 1');
     expect(masqBody).toContain('port.integerValue > 65535');
     expect(masqBody).toContain('"masq_mobile_set_proxy_enabled"');
-    expect(masqBody).toMatch(
-      /"masq_mobile_set_proxy_enabled"\),\s+true\)/,
-    );
+    expect(masqBody).toMatch(/"masq_mobile_set_proxy_enabled"\),\s+true\)/);
     expect(masqBody).toContain('resolve(@"masq")');
 
     expect(bridgeSource.match(/setProxyConfigurations:@\[\]/g)).toHaveLength(2);

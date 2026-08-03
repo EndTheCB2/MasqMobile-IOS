@@ -343,6 +343,27 @@ class SystemRoutingTranslatorTest {
   }
 
   @Test
+  fun exactRunningSnapshotRejectsWrongRevisionOrNativeGeneration() {
+    val native = FakeNative()
+    val translator = translator(native)
+    translator.start(26, 3, 8080, 1500) { _, _, _, _ -> }
+    assertTrue(native.started.await(1, TimeUnit.SECONDS))
+
+    assertEquals(1L, translator.exactRunningSnapshot(26)?.generation)
+    assertEquals(null, translator.exactRunningSnapshot(27))
+
+    native.snapshotGenerationSkew = 1L
+    assertEquals(null, translator.exactRunningSnapshot(26))
+    assertFalse(translator.isRunning(26))
+
+    native.snapshotGenerationSkew = 0L
+    assertEquals(
+        TranslatorStopResult.SafeToClose,
+        translator.stopAndAwait(26, 1_000),
+    )
+  }
+
+  @Test
   fun stopRetriesWhenCalledBeforeNativeRunHasEntered() {
     val native = FakeNative()
     val executor = Executors.newSingleThreadExecutor()
@@ -479,6 +500,7 @@ class SystemRoutingTranslatorTest {
     @Volatile private var generation = 0L
     @Volatile private var stopRequested = false
     @Volatile var startCount = 0
+    @Volatile var snapshotGenerationSkew = 0L
 
     override fun start(tunFd: Int, proxyPort: Int, mtu: Int): Int {
       startCount += 1
@@ -507,7 +529,12 @@ class SystemRoutingTranslatorTest {
       return true
     }
 
-    override fun snapshot() = PacketTunnelSnapshot(state, generation.takeIf { it > 0 }, null)
+    override fun snapshot() =
+        PacketTunnelSnapshot(
+            state,
+            generation.takeIf { it > 0 }?.plus(snapshotGenerationSkew),
+            null,
+        )
 
     fun finishStop() {
       stopRequested = true

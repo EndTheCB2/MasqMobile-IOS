@@ -25,6 +25,7 @@ import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -38,8 +39,197 @@ import org.json.JSONObject
 internal fun shouldDiscoverEntryNodesBeforeStart(phase: String): Boolean =
     phase != "connected"
 
+internal fun shouldQuarantineAttemptedEntryNodes(
+    phase: String,
+    engineGeneration: Long,
+    routeStage: Int,
+    lastError: String?,
+): Boolean {
+  if (engineGeneration <= 0 || routeStage != 0 || phase !in setOf("connecting", "error")) {
+    return false
+  }
+  val errorCode = lastError?.let { error -> CORE_ERROR_CODE_PATTERN.find(error)?.value }
+  return errorCode in PERSISTENT_ENTRY_NODE_QUARANTINE_CODES
+}
+
+internal fun shouldDeprioritizeAttemptedEntryNodes(
+    phase: String,
+    engineGeneration: Long,
+    routeStage: Int,
+    lastError: String?,
+): Boolean {
+  if (engineGeneration <= 0) {
+    return false
+  }
+
+  if (routeStage == 0 && phase in setOf("connecting", "error")) {
+    // A superseded attempt or an ambiguous activity-watchdog result should rotate immediately in
+    // memory. Only aggregate/native transport evidence is strong enough for persistent quarantine.
+    if (lastError.isNullOrBlank()) return true
+    val errorCode = CORE_ERROR_CODE_PATTERN.find(lastError)?.value
+    if (errorCode in ENTRY_NODE_RETRY_CODES) return true
+  }
+
+  if (routeStage != 1 || phase != "error" || lastError.isNullOrBlank()) {
+    return false
+  }
+  val errorCode = CORE_ERROR_CODE_PATTERN.find(lastError)?.value
+  return errorCode == null || errorCode in PRIVATE_ROUTE_DEPRIORITIZATION_CODES
+}
+
 internal fun safeLastErrorValue(value: Any?): String? =
     (value as? String)?.takeIf(String::isNotBlank)
+
+/**
+ * A privacy-safe view of Android's active network. The opaque Android network handle is retained
+ * only in process memory so that handovers between two networks of the same transport can be
+ * detected; it is never included in the value returned to JavaScript or in diagnostics.
+ */
+internal data class AndroidNetworkObservation(
+    val opaqueNetworkIdentity: Long?,
+    val hasInternetCapability: Boolean,
+    val isValidated: Boolean,
+    val interfaceName: String,
+    val expensive: Boolean,
+    val constrained: Boolean = false,
+)
+
+internal data class AndroidNetworkStatusSnapshot(
+    val available: Boolean,
+    val interfaceName: String,
+    val expensive: Boolean,
+    val constrained: Boolean,
+    val generation: Long,
+)
+
+/**
+ * Assigns a stable, monotonically increasing process-local generation to each distinct network
+ * observation. Unlike a wall-clock bucket, repeated polls of an unchanged network retain the same
+ * generation while a validated-to-validated handover is still visible to the recovery layer.
+ */
+internal class AndroidNetworkStatusTracker {
+  private var previousObservation: AndroidNetworkObservation? = null
+  private var generation = 0L
+
+  @Synchronized
+  fun observe(observation: AndroidNetworkObservation): AndroidNetworkStatusSnapshot {
+    if (previousObservation != observation) {
+      generation = (generation + 1L).coerceAtMost(MAX_SAFE_NETWORK_GENERATION)
+      previousObservation = observation
+    }
+    return AndroidNetworkStatusSnapshot(
+        available = observation.hasInternetCapability && observation.isValidated,
+        interfaceName = observation.interfaceName,
+        expensive = observation.expensive,
+        constrained = observation.constrained,
+        generation = generation,
+    )
+  }
+
+  private companion object {
+    // JavaScript numbers are exact through 2^53 - 1. A process cannot realistically exhaust this.
+    const val MAX_SAFE_NETWORK_GENERATION = 9_007_199_254_740_991L
+  }
+}
+
+internal fun mayStopSessionSupervisorForCoreTermination(
+    policy: SystemRoutingPolicyLoadResult,
+): Boolean =
+    policy is SystemRoutingPolicyLoadResult.Missing ||
+        policy is SystemRoutingPolicyLoadResult.ExplicitOff
+
+internal fun isSystemRoutingConfirmedOff(
+    policy: SystemRoutingPolicyLoadResult,
+    active: Boolean,
+    tunPresent: Boolean,
+    routingPhase: String,
+): Boolean =
+    mayStopSessionSupervisorForCoreTermination(policy) &&
+        !active &&
+        !tunPresent &&
+        routingPhase == "off"
+
+/**
+ * Adds one browser-routing mutation to the pending FIFO.
+ *
+ * A blocked mutation is a safety barrier: pending mutations are superseded and the newest
+ * barrier is placed first. The active mutation is deliberately managed separately so callers can
+ * fail it closed before advancing the queue.
+ */
+internal fun <T> enqueueBrowserRoutingRequest(
+    queue: ArrayDeque<T>,
+    request: T,
+    prioritizeBlocked: Boolean,
+): List<T> {
+  if (!prioritizeBlocked) {
+    queue.addLast(request)
+    return emptyList()
+  }
+  val superseded = mutableListOf<T>()
+  while (queue.isNotEmpty()) {
+    superseded.add(queue.removeFirst())
+  }
+  queue.addFirst(request)
+  return superseded
+}
+
+internal enum class BrowserProxyCallbackCompletion {
+  CURRENT,
+  CURRENT_AFTER_TIMEOUT,
+  STALE,
+}
+
+/**
+ * Fences the callback-style AndroidX ProxyController API. A timeout marks the active ticket but
+ * deliberately does not release it: the next proxy mutation may start only after the matching
+ * callback arrives. This prevents a late callback from an older override from racing a newer one.
+ */
+internal class BrowserProxyCallbackFence {
+  private var activeTicket: Long? = null
+  private var activeTimedOut = false
+  private var nextTicket = 1L
+
+  fun begin(): Long? {
+    if (activeTicket != null) return null
+    val ticket = nextTicket++
+    activeTicket = ticket
+    activeTimedOut = false
+    return ticket
+  }
+
+  fun markTimedOut(ticket: Long): Boolean {
+    if (activeTicket != ticket) return false
+    activeTimedOut = true
+    return true
+  }
+
+  fun markActiveTimedOut(): Boolean {
+    val ticket = activeTicket ?: return false
+    return markTimedOut(ticket)
+  }
+
+  fun complete(ticket: Long): BrowserProxyCallbackCompletion {
+    if (activeTicket != ticket) return BrowserProxyCallbackCompletion.STALE
+    val completion =
+        if (activeTimedOut) {
+          BrowserProxyCallbackCompletion.CURRENT_AFTER_TIMEOUT
+        } else {
+          BrowserProxyCallbackCompletion.CURRENT
+        }
+    activeTicket = null
+    activeTimedOut = false
+    return completion
+  }
+
+  fun cancel(ticket: Long): Boolean {
+    if (activeTicket != ticket) return false
+    activeTicket = null
+    activeTimedOut = false
+    return true
+  }
+
+  fun hasActiveMutation(): Boolean = activeTicket != null
+}
 
 internal fun safeCoreStatusDiagnostic(statusJson: String): String? {
   val status = runCatching { JSONObject(statusJson) }.getOrNull() ?: return null
@@ -100,15 +290,60 @@ internal fun formatSafeCoreStatusDiagnostic(
 }
 
 private val CORE_ERROR_CODE_PATTERN = Regex("\\bE_[A-Z_]+\\b")
+private val ENTRY_NODE_RETRY_CODES =
+    setOf(
+        "E_ENTRY_TCP_FAILED",
+        "E_ENTRY_TCP_WAITING_GOSSIP",
+        "E_ENTRY_GOSSIP_TIMEOUT",
+        "E_ENTRY_GOSSIP_PASS_LOOP",
+        "E_ENTRY_NO_PROGRESS",
+        "E_ENTRY_DEBUT_NOT_WRITTEN",
+        "E_ENTRY_NO_INBOUND_BYTES",
+        "E_ENTRY_INBOUND_NOT_ACCEPTED",
+        "E_ENTRY_GOSSIP_NOT_PROMOTED",
+    )
+private val PERSISTENT_ENTRY_NODE_QUARANTINE_CODES =
+    setOf(
+        "E_ENTRY_TCP_FAILED",
+        "E_ENTRY_GOSSIP_PASS_LOOP",
+        "E_ENTRY_NO_PROGRESS",
+    )
+private val PRIVATE_ROUTE_DEPRIORITIZATION_CODES =
+    setOf("E_PRIVATE_ROUTE_FAILED", "E_PRIVATE_ROUTE_TIMEOUT")
 private val CORE_EXIT_CODE_PATTERN = Regex("\\bstopped with code (-?\\d+)\\b")
 private val CORE_PANIC_LOCATION_PATTERN =
     Regex("\\bE_CORE_PANIC_LOCATION: ([A-Za-z0-9_.-]{1,64}):(\\d{1,10})\\b")
 private val CORE_UNSAFE_TOKEN_PATTERN = Regex("[^A-Za-z0-9_]")
 
+internal enum class MasqStartInvalidationReason {
+  NETWORK_HANDOVER,
+}
+
 internal object MasqCoreLifecycle {
   val lock = Any()
   val startGeneration = AtomicLong(0L)
   val executor = Executors.newSingleThreadExecutor()
+  private val invalidationReasons =
+      ConcurrentHashMap<Long, MasqStartInvalidationReason>()
+
+  fun invalidateForNetworkHandover(expectedGeneration: Long): Boolean =
+      synchronized(lock) {
+        if (expectedGeneration <= 0L || startGeneration.get() != expectedGeneration) {
+          return@synchronized false
+        }
+        invalidationReasons[expectedGeneration] =
+            MasqStartInvalidationReason.NETWORK_HANDOVER
+        startGeneration.incrementAndGet()
+        true
+      }
+
+  fun consumeInvalidationReason(generation: Long): MasqStartInvalidationReason? =
+      invalidationReasons.remove(generation)
+}
+
+internal object MasqNetworkStatusLifecycle {
+  val tracker = AndroidNetworkStatusTracker()
+  val underlayNetworkId = AtomicReference<Long?>(null)
 }
 
 class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec(reactContext) {
@@ -196,6 +431,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       try {
         restoreCoreIfNeeded()
         val status = statusJson()
+        runCatching {
+          recordKnownGoodEntrySelectionFromSavedConfig(JSONObject(status))
+        }
         safeCoreStatusDiagnostic(status)?.let { diagnostic ->
           if (lastCoreDiagnostic.getAndSet(diagnostic) != diagnostic) {
             Log.i(CORE_DIAGNOSTIC_TAG, diagnostic)
@@ -221,7 +459,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   override fun getNetworkStatus(promise: Promise) {
     val manager = reactApplicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
         as ConnectivityManager
-    val capabilities = manager.getNetworkCapabilities(manager.activeNetwork)
+    val underlay =
+        resolveMasqValidatedUnderlayNetwork(
+            manager = manager,
+            previousNetworkId = MasqNetworkStatusLifecycle.underlayNetworkId.get(),
+        )
+    val capabilities = underlay?.capabilities
+    MasqNetworkStatusLifecycle.underlayNetworkId.set(underlay?.network?.networkHandle)
     val interfaceName = when {
       capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "wifi"
       capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "cellular"
@@ -229,13 +473,28 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       capabilities != null -> "other"
       else -> "unknown"
     }
+    val snapshot =
+        MasqNetworkStatusLifecycle.tracker.observe(
+            AndroidNetworkObservation(
+                opaqueNetworkIdentity = underlay?.network?.networkHandle,
+                hasInternetCapability =
+                    capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ==
+                        true,
+                isValidated =
+                    capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ==
+                        true,
+                interfaceName = interfaceName,
+                expensive =
+                    capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) !=
+                        true,
+            ))
     promise.resolve(
         JSONObject()
-            .put("available", capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
-            .put("interface", interfaceName)
-            .put("expensive", capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true)
-            .put("constrained", false)
-            .put("generation", System.currentTimeMillis() / 2000)
+            .put("available", snapshot.available)
+            .put("interface", snapshot.interfaceName)
+            .put("expensive", snapshot.expensive)
+            .put("constrained", snapshot.constrained)
+            .put("generation", snapshot.generation)
             .toString())
   }
 
@@ -606,6 +865,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         }
     MasqCoreLifecycle.executor.execute {
       try {
+        val admission = MasqSessionService.awaitModuleStartAdmission(generation)
+        if (!admission.allowsModuleDiscovery()) {
+          throw StaleStartException()
+        }
         requireCurrentStart(generation)
         restoreCoreIfNeeded()
         requireCurrentStart(generation)
@@ -634,6 +897,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                 nodes.optString(index).takeIf(String::isNotBlank)
               }
             } ?: emptyList()
+        recordEntrySelectionFeedback(currentStatus, chain, preferredNodes)
         requireCurrentStart(generation)
         discoveryExecutor.execute {
           completeStartAfterDiscovery(
@@ -674,7 +938,11 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       promise: Promise,
   ) {
     try {
-      val discoveryResult = entryNodeDiscovery.discover(chain, preferredNodes)
+      requireCurrentStart(generation)
+      val discoveryResult =
+          entryNodeDiscovery.discover(chain, preferredNodes) {
+            MasqCoreLifecycle.startGeneration.get() == generation
+          }
       requireCurrentStart(generation)
       val runtimeConfig =
           migrateConfig(
@@ -747,6 +1015,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun stop(promise: Promise) {
+    if (!authorizeSessionSupervisorStop(promise)) {
+      return
+    }
     invalidatePendingStarts()
     val backgroundIntentCleared = MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
@@ -767,6 +1038,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   override fun shutdown(promise: Promise) {
+    if (!authorizeSessionSupervisorStop(promise)) {
+      return
+    }
     invalidatePendingStarts()
     val backgroundIntentCleared = MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
@@ -775,6 +1049,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
     MasqCoreLifecycle.executor.execute {
       try {
+        runCatching {
+          val currentStatus = JSONObject(MasqCoreJni.nativeGetStatus())
+          recordEntrySelectionFeedbackFromSavedConfig(currentStatus)
+        }
         resolveBackgroundSessionStop(
             promise,
             backgroundIntentCleared,
@@ -787,6 +1065,102 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             error,
         )
       }
+    }
+  }
+
+  /**
+   * Core termination also clears the durable session-supervisor intent. Refuse that transition
+   * while a non-OFF or unreadable system-routing policy exists: the VPN can then remain captured
+   * and fail closed while its supervisor continues recovery. Explicit disconnect remains
+   * authoritative because it first persists and acknowledges an OFF policy.
+   */
+  private fun authorizeSessionSupervisorStop(promise: Promise): Boolean {
+    val policy: SystemRoutingPolicyLoadResult
+    val routingStatus: JSONObject
+    try {
+      policy = systemRoutingPolicyStore.loadForServiceStart()
+      routingStatus = JSONObject(MasqVpnService.publishDesiredPolicy(policy))
+    } catch (error: Exception) {
+      promise.reject(
+          "E_VPN_POLICY",
+          "Android could not verify that system routing is off before stopping MASQ.",
+          error,
+      )
+      return false
+    }
+    if (!isSystemRoutingConfirmedOff(
+        policy = policy,
+        active = routingStatus.optBoolean("active", true),
+        tunPresent = routingStatus.optBoolean("tunPresent", true),
+        routingPhase = routingStatus.optString("routingPhase"),
+    )) {
+      promise.reject(
+          "E_VPN_ACTIVE",
+          "Turn off MASQ system routing before stopping the MASQ connection.",
+      )
+      return false
+    }
+    return true
+  }
+
+  private fun recordEntrySelectionFeedbackFromSavedConfig(status: JSONObject) {
+    val saved = preferences.getString(SAVED_CONFIG_KEY, null) ?: return
+    val config = runCatching { JSONObject(saved) }.getOrNull() ?: return
+    val chain = config.optString("chain")
+    if (chain.isBlank()) return
+    val preferredNodes =
+        config.optJSONArray("neighbors")?.let { nodes ->
+          (0 until nodes.length()).mapNotNull { index ->
+            nodes.optString(index).takeIf(String::isNotBlank)
+          }
+        } ?: emptyList()
+    recordEntrySelectionFeedback(status, chain, preferredNodes)
+  }
+
+  private fun recordKnownGoodEntrySelectionFromSavedConfig(status: JSONObject) {
+    val snapshot = masqSessionCoreSnapshot(status.toString())
+    if (snapshot?.isHealthyConnectedSession() != true) return
+    val saved = preferences.getString(SAVED_CONFIG_KEY, null) ?: return
+    val config = runCatching { JSONObject(saved) }.getOrNull() ?: return
+    val chain = config.optString("chain")
+    if (chain.isBlank()) return
+    val preferredNodes =
+        config.optJSONArray("neighbors")?.let { nodes ->
+          (0 until nodes.length()).mapNotNull { index ->
+            nodes.optString(index).takeIf(String::isNotBlank)
+          }
+        } ?: emptyList()
+    entryNodeDiscovery.recordKnownGoodRoute(chain, preferredNodes, snapshot)
+  }
+
+  private fun recordEntrySelectionFeedback(
+      status: JSONObject,
+      chain: String,
+      preferredNodes: List<String>,
+  ) {
+    val phase = status.optString("phase")
+    val engineGeneration = status.optLong("engineGeneration", 0L)
+    val routeStage = status.optInt("routeStage", 0)
+    val lastError = safeLastErrorValue(status.opt("lastError"))
+    if (
+        shouldQuarantineAttemptedEntryNodes(
+            phase = phase,
+            engineGeneration = engineGeneration,
+            routeStage = routeStage,
+            lastError = lastError,
+        )
+    ) {
+      entryNodeDiscovery.recordConnectionFailure(chain, preferredNodes)
+    }
+    if (
+        shouldDeprioritizeAttemptedEntryNodes(
+            phase = phase,
+            engineGeneration = engineGeneration,
+            routeStage = routeStage,
+            lastError = lastError,
+        )
+    ) {
+      entryNodeDiscovery.recordRouteProofFailure(chain, preferredNodes)
     }
   }
 
@@ -828,7 +1202,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   ) {
     synchronized(MasqCoreLifecycle.lock) {
       if (MasqCoreLifecycle.startGeneration.get() != generation) {
-        promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
+        rejectStaleStart(generation, promise)
       } else {
         if (refreshedConfig != null) {
           val committed =
@@ -852,7 +1226,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   ) {
     synchronized(MasqCoreLifecycle.lock) {
       if (MasqCoreLifecycle.startGeneration.get() != generation) {
-        promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
+        rejectStaleStart(generation, promise)
       } else if (error == null) {
         promise.reject(code, message)
       } else {
@@ -861,9 +1235,19 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
+  private fun rejectStaleStart(generation: Long, promise: Promise) {
+    when (MasqCoreLifecycle.consumeInvalidationReason(generation)) {
+      MasqStartInvalidationReason.NETWORK_HANDOVER ->
+          promise.reject(
+              "E_NETWORK_HANDOVER_RETRY",
+              NETWORK_HANDOVER_RETRY_MESSAGE,
+          )
+      null -> promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)
+    }
+  }
+
   override fun reset(promise: Promise) {
     invalidatePendingStarts()
-    MasqSessionService.stop(reactApplicationContext)
     if (!cancelPendingSystemTunnelConsent()) {
       promise.reject(
           "E_VPN_PERMISSION_STATE",
@@ -970,7 +1354,14 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                     status.isNull("desiredRevision") &&
                     status.isNull("appliedRevision")
             if (resetConfirmed) {
-              finishFullReset(promise)
+              if (MasqSessionService.stop(reactApplicationContext)) {
+                finishFullReset(promise)
+              } else {
+                promise.reject(
+                    "E_BACKGROUND_SESSION_STOP",
+                    "Android could not persist the disconnected state before the full reset.",
+                )
+              }
             } else {
               promise.reject(
                   "E_VPN_RESET",
@@ -1028,12 +1419,14 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun resetNetworkProfile(promise: Promise) {
     invalidatePendingStarts()
-    MasqSessionService.stop(reactApplicationContext)
     if (!MasqCoreJni.isAvailable) {
       promise.reject("E_CORE_UNAVAILABLE", "The native MASQ core is missing from this build.")
       return
     }
     MasqCoreLifecycle.executor.execute {
+      if (!stopSessionSupervisorAfterConfirmedSystemRoutingOff(promise)) {
+        return@execute
+      }
       val statusBeforeReset =
           try {
             JSONObject(MasqCoreJni.nativeGetStatus())
@@ -1178,6 +1571,42 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
+  private fun stopSessionSupervisorAfterConfirmedSystemRoutingOff(promise: Promise): Boolean {
+    val policy: SystemRoutingPolicyLoadResult
+    val routingStatus: JSONObject
+    try {
+      policy = systemRoutingPolicyStore.loadForServiceStart()
+      routingStatus = JSONObject(MasqVpnService.publishDesiredPolicy(policy))
+    } catch (error: Exception) {
+      promise.reject(
+          "E_VPN_STATUS",
+          "Android could not verify that system routing is off before resetting the network profile.",
+          error,
+      )
+      return false
+    }
+    if (!isSystemRoutingConfirmedOff(
+        policy = policy,
+        active = routingStatus.optBoolean("active", true),
+        tunPresent = routingStatus.optBoolean("tunPresent", true),
+        routingPhase = routingStatus.optString("routingPhase"),
+    )) {
+      promise.reject(
+          "E_VPN_ACTIVE",
+          "Turn off MASQ system routing before resetting the network profile.",
+      )
+      return false
+    }
+    if (!MasqSessionService.stop(reactApplicationContext)) {
+      promise.reject(
+          "E_BACKGROUND_SESSION_STOP",
+          "Android could not persist the disconnected state before resetting the network profile.",
+      )
+      return false
+    }
+    return true
+  }
+
   override fun removeWallet(promise: Promise) {
     invalidatePendingStarts()
     MasqSessionService.stop(reactApplicationContext)
@@ -1233,7 +1662,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   override fun preflightBrowserProxy(promise: Promise) {
     MasqCoreLifecycle.executor.execute {
-      ifCoreAvailable(promise) { MasqCoreJni.nativePreflightProxy() }
+      ifCoreAvailable(promise) {
+        MasqCoreJni.nativePreflightProxy().also { status ->
+          runCatching {
+            recordKnownGoodEntrySelectionFromSavedConfig(JSONObject(status))
+          }
+        }
+      }
     }
   }
 
@@ -1372,6 +1807,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               load = load,
               coreRouteAvailable = coreReadiness?.ready == true,
               proxyPort = coreReadiness?.proxyPort ?: 0,
+              coreGeneration = MasqCoreLifecycle.startGeneration.get(),
               engineGeneration = coreReadiness?.engineGeneration ?: 0L,
           ))
     }
@@ -1894,6 +2330,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
           }
           AbandonedTunnelOperations(starts, stops, resets, permissionRequest)
         }
+    invalidateBrowserRoutingRequests()
     stopAcknowledgementExecutor.shutdownNow()
     discoveryExecutor.shutdownNow()
     reactApplicationContext.removeActivityEventListener(tunnelActivityListener)
@@ -1936,6 +2373,20 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       )
       return
     }
+    if (moduleInvalidated) {
+      promise.reject(
+          "E_MODULE_INVALIDATED",
+          "The MASQ native module is shutting down.",
+      )
+      return
+    }
+    if (synchronized(browserRoutingLock) { browserProxyFenceTimedOut }) {
+      promise.reject(
+          "E_BROWSER_ROUTING_TIMEOUT",
+          "Android has not confirmed the previous blocked browser-routing change.",
+      )
+      return
+    }
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
       promise.reject("E_PROXY_UNSUPPORTED", "This Android WebView does not support proxy override.")
       return
@@ -1960,26 +2411,118 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             MasqCoreLifecycle.startGeneration.get(),
             promise,
         )
+    var activeToSupersede: BrowserRoutingRequest? = null
+    var invalidatedBeforeEnqueue = false
+    var proxyFenceTimedOutBeforeEnqueue = false
+    val superseded = mutableListOf<BrowserRoutingRequest>()
     val next =
         synchronized(browserRoutingLock) {
-          browserRoutingQueue.addLast(request)
-          if (browserRoutingInFlight) {
+          if (moduleInvalidated) {
+            invalidatedBeforeEnqueue = true
+          } else if (browserProxyFenceTimedOut) {
+            proxyFenceTimedOutBeforeEnqueue = true
+          } else if (mode == "blocked") {
+            superseded.addAll(
+                enqueueBrowserRoutingRequest(
+                    browserRoutingQueue,
+                    request,
+                    prioritizeBlocked = true,
+                ),
+            )
+            activeToSupersede =
+                browserRoutingActive?.takeIf { active -> active.mode != "blocked" }
+          } else {
+            enqueueBrowserRoutingRequest(
+                browserRoutingQueue,
+                request,
+                prioritizeBlocked = false,
+            )
+          }
+          if (
+              invalidatedBeforeEnqueue ||
+                  proxyFenceTimedOutBeforeEnqueue ||
+                  browserRoutingActive != null
+          ) {
             null
           } else {
-            browserRoutingInFlight = true
-            browserRoutingQueue.removeFirst()
+            browserRoutingQueue.removeFirst().also { browserRoutingActive = it }
           }
         }
-    next?.owner?.applyBrowserRoutingMode(next)
+    if (invalidatedBeforeEnqueue) {
+      promise.reject(
+          "E_MODULE_INVALIDATED",
+          "The MASQ native module is shutting down.",
+      )
+      return
+    }
+    if (proxyFenceTimedOutBeforeEnqueue) {
+      promise.reject(
+          "E_BROWSER_ROUTING_TIMEOUT",
+          "Android has not confirmed the previous blocked browser-routing change.",
+      )
+      return
+    }
+    superseded.forEach { queued ->
+      queued.owner.rejectQueuedBrowserRoutingRequest(
+          queued,
+          "E_BROWSER_ROUTING_SUPERSEDED",
+          "A newer blocked browser-routing request superseded this pending request.",
+      )
+    }
+    activeToSupersede?.let { active ->
+      active.owner.abortBrowserRoutingRequestClosed(
+          active,
+          "E_BROWSER_ROUTING_SUPERSEDED",
+          "A blocked browser-routing request superseded this request.",
+      )
+    }
+    activateBrowserRoutingRequest(next)
+  }
+
+  private fun activateBrowserRoutingRequest(request: BrowserRoutingRequest?) {
+    request ?: return
+    val timeout =
+        runCatching {
+              browserRoutingTimeoutExecutor.schedule(
+                  { request.owner.timeoutBrowserRoutingRequest(request) },
+                  BROWSER_ROUTING_TIMEOUT_MS,
+                  TimeUnit.MILLISECONDS,
+              )
+            }
+            .getOrElse { error ->
+              request.owner.abortBrowserRoutingRequestClosed(
+                  request,
+                  "E_BROWSER_ROUTING_TIMEOUT",
+                  "Android could not monitor the browser-routing change.",
+                  error,
+              )
+              return
+            }
+    request.timeoutFuture.set(timeout)
+    if (request.completed.get()) {
+      request.timeoutFuture.getAndSet(null)?.cancel(false)
+      return
+    }
+    request.owner.callbackExecutor.execute {
+      if (!request.completed.get()) {
+        request.owner.applyBrowserRoutingMode(request)
+      }
+    }
   }
 
   private fun applyBrowserRoutingMode(request: BrowserRoutingRequest) {
     if (moduleInvalidated) {
-      finishBrowserRoutingWithError(
+      abortBrowserRoutingRequestClosed(
           request,
           "E_MODULE_INVALIDATED",
           "The MASQ native module is shutting down.",
       )
+      return
+    }
+    try {
+      requireCurrentBrowserCore(request)
+    } catch (_: StaleBrowserCoreException) {
+      rejectStaleBrowserRouting(request)
       return
     }
     when (request.mode) {
@@ -1997,6 +2540,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   private fun applyBlockedBrowserRouting(request: BrowserRoutingRequest) {
     installBlockedBrowserState(
+        request,
         onReady = { finishBrowserRouting(request, "blocked") },
         onError = { error ->
           finishBrowserRoutingWithError(
@@ -2010,6 +2554,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   private fun installBlockedBrowserState(
+      request: BrowserRoutingRequest,
       onReady: () -> Unit,
       onError: (Throwable) -> Unit,
   ) {
@@ -2019,10 +2564,20 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               .addProxyRule(BLOCKED_BROWSER_PROXY)
               // Intentionally no addDirect(): blocked must never fail open.
               .build()
-      ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
+      setBrowserProxyOverride(request, config) {
+        if (!isBrowserRoutingRequestLive(request)) return@setBrowserProxyOverride
         syncCoreBrowserProxy(false)
-        clearBrowserWebsiteData(onReady, onError)
+        clearBrowserWebsiteData(
+            onComplete = {
+              if (isBrowserRoutingRequestLive(request)) onReady()
+            },
+            onError = { error ->
+              if (isBrowserRoutingRequestLive(request)) onError(error)
+            },
+        )
       }
+    } catch (_: StaleBrowserCoreException) {
+      rejectStaleBrowserRouting(request)
     } catch (error: RuntimeException) {
       onError(error)
     }
@@ -2030,6 +2585,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
 
   private fun applyMasqBrowserRouting(request: BrowserRoutingRequest) {
     installBlockedBrowserState(
+        request,
         onReady = { applyMasqBrowserRoutingAfterBlock(request) },
         onError = { error ->
           finishBrowserRoutingWithError(
@@ -2057,12 +2613,16 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         requireCurrentBrowserCore(request)
         val status = JSONObject(MasqCoreJni.nativeGetStatus())
         requireCurrentBrowserCore(request)
-        if (status.optString("phase") != "connected") {
+        if (
+            status.optString("phase") != "connected" ||
+                status.optInt("connectedNeighbors", 0) < 1 ||
+                status.optInt("routeStage", 0) < 2
+        ) {
           callbackExecutor.execute {
             finishBrowserRoutingWithError(
                 request,
                 "E_NOT_CONNECTED",
-                "Build a MASQ route first.",
+                "Build a validated MASQ route first.",
             )
           }
           return@execute
@@ -2087,8 +2647,10 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
                     .addProxyRule("http://127.0.0.1:$proxyPort")
                     // Intentionally no addDirect(): failure must never bypass MASQ.
                     .build()
-            ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
-              confirmMasqBrowserRouting(request)
+            setBrowserProxyOverride(request, config) {
+              if (isBrowserRoutingRequestLive(request)) {
+                confirmMasqBrowserRouting(request)
+              }
             }
           } catch (_: StaleBrowserCoreException) {
             rejectStaleBrowserRouting(request)
@@ -2177,7 +2739,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
 
     try {
-      ProxyController.getInstance().clearProxyOverride(callbackExecutor) {
+      clearBrowserProxyOverride(request) {
+        if (!isBrowserRoutingRequestLive(request)) return@clearBrowserProxyOverride
         MasqCoreLifecycle.executor.execute {
           try {
             requireCurrentBrowserCore(request)
@@ -2228,7 +2791,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       message: String,
       cause: Throwable,
   ) {
+    if (request.completed.get()) return
+    if (!isBrowserRoutingRequestLive(request)) {
+      rejectStaleBrowserRouting(request)
+      return
+    }
     installBlockedBrowserState(
+        request,
         onReady = {
           finishBrowserRoutingWithError(request, code, message, cause)
         },
@@ -2421,13 +2990,24 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   private fun requireCurrentBrowserCore(request: BrowserRoutingRequest) {
-    if (request.coreGeneration != MasqCoreLifecycle.startGeneration.get()) {
+    if (
+        request.completed.get() ||
+            request.owner !== this ||
+            moduleInvalidated ||
+            request.coreGeneration != MasqCoreLifecycle.startGeneration.get()
+    ) {
       throw StaleBrowserCoreException()
     }
   }
 
+  private fun isBrowserRoutingRequestLive(request: BrowserRoutingRequest): Boolean =
+      !request.completed.get() &&
+          request.owner === this &&
+          !moduleInvalidated &&
+          request.coreGeneration == MasqCoreLifecycle.startGeneration.get()
+
   private fun rejectStaleBrowserRouting(request: BrowserRoutingRequest) {
-    failBrowserRoutingClosed(
+    abortBrowserRoutingRequestClosed(
         request,
         "E_BROWSER_STALE_CORE",
         "The MASQ core changed before browser routing could be enabled.",
@@ -2436,8 +3016,13 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
   }
 
   private fun finishBrowserRouting(request: BrowserRoutingRequest, mode: String) {
-    request.promise.resolve(mode)
-    startNextBrowserRoutingRequest()
+    if (!request.completed.compareAndSet(false, true)) return
+    request.timeoutFuture.getAndSet(null)?.cancel(false)
+    try {
+      request.promise.resolve(mode)
+    } finally {
+      startNextBrowserRoutingRequest(request)
+    }
   }
 
   private fun finishBrowserRoutingWithError(
@@ -2446,25 +3031,321 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       message: String,
       cause: Throwable? = null,
   ) {
-    if (cause == null) {
-      request.promise.reject(code, message)
-    } else {
-      request.promise.reject(code, message, cause)
+    if (!request.completed.compareAndSet(false, true)) return
+    request.timeoutFuture.getAndSet(null)?.cancel(false)
+    try {
+      if (cause == null) {
+        request.promise.reject(code, message)
+      } else {
+        request.promise.reject(code, message, cause)
+      }
+    } finally {
+      startNextBrowserRoutingRequest(request)
     }
-    startNextBrowserRoutingRequest()
   }
 
-  private fun startNextBrowserRoutingRequest() {
-    val next =
-        synchronized(browserRoutingLock) {
-          if (browserRoutingQueue.isEmpty()) {
-            browserRoutingInFlight = false
-            null
-          } else {
-            browserRoutingQueue.removeFirst()
+  private fun rejectQueuedBrowserRoutingRequest(
+      request: BrowserRoutingRequest,
+      code: String,
+      message: String,
+  ) {
+    if (!request.completed.compareAndSet(false, true)) return
+    request.timeoutFuture.getAndSet(null)?.cancel(false)
+    runCatching { request.promise.reject(code, message) }
+  }
+
+  private fun timeoutBrowserRoutingRequest(request: BrowserRoutingRequest) {
+    abortBrowserRoutingRequestClosed(
+        request,
+        "E_BROWSER_ROUTING_TIMEOUT",
+        "Android did not finish the browser-routing change in time. Browser traffic remains blocked.",
+    )
+  }
+
+  private fun abortBrowserRoutingRequestClosed(
+      request: BrowserRoutingRequest,
+      code: String,
+      message: String,
+      cause: Throwable? = null,
+  ) {
+    if (!request.completed.compareAndSet(false, true)) return
+    request.timeoutFuture.getAndSet(null)?.cancel(false)
+    syncCoreBrowserProxy(false)
+
+    val transition = BrowserFailClosedTransition(request)
+    var registered = false
+    var canStartBlockedMutation = false
+    synchronized(browserRoutingLock) {
+      if (browserRoutingActive === request && browserFailClosedTransition == null) {
+        browserFailClosedTransition = transition
+        registered = true
+        canStartBlockedMutation = !browserProxyCallbackFence.hasActiveMutation()
+      }
+    }
+    if (registered) {
+      armFailClosedBrowserTransitionTimeout(transition)
+    }
+
+    runCatching {
+      if (cause == null) {
+        request.promise.reject(code, message)
+      } else {
+        request.promise.reject(code, message, cause)
+      }
+    }
+
+    if (registered && canStartBlockedMutation) {
+      scheduleFailClosedBrowserTransition(transition)
+    }
+  }
+
+  private fun armFailClosedBrowserTransitionTimeout(
+      transition: BrowserFailClosedTransition,
+  ) {
+    val timeout =
+        runCatching {
+              browserRoutingTimeoutExecutor.schedule(
+                  { transition.request.owner.timeoutFailClosedBrowserTransition(transition) },
+                  BROWSER_FAIL_CLOSED_TIMEOUT_MS,
+                  TimeUnit.MILLISECONDS,
+              )
+            }
+            .getOrElse {
+              transition.request.owner.timeoutFailClosedBrowserTransition(transition)
+              return
+            }
+    transition.timeoutFuture.set(timeout)
+    val stillPending =
+        synchronized(browserRoutingLock) { browserFailClosedTransition === transition }
+    if (!stillPending) {
+      transition.timeoutFuture.getAndSet(null)?.cancel(false)
+    }
+  }
+
+  private fun scheduleFailClosedBrowserTransition(
+      transition: BrowserFailClosedTransition,
+  ) {
+    runCatching {
+          transition.request.owner.callbackExecutor.execute {
+            transition.request.owner.startFailClosedBrowserTransition(transition)
           }
         }
-    next?.owner?.applyBrowserRoutingMode(next)
+        .onFailure {
+          transition.request.owner.timeoutFailClosedBrowserTransition(transition)
+        }
+  }
+
+  private fun startFailClosedBrowserTransition(
+      transition: BrowserFailClosedTransition,
+  ) {
+    val ticket =
+        synchronized(browserRoutingLock) {
+          if (
+              browserFailClosedTransition !== transition ||
+                  browserProxyCallbackFence.hasActiveMutation() ||
+                  !transition.blockedMutationStarted.compareAndSet(false, true)
+          ) {
+            return@synchronized null
+          }
+          browserProxyCallbackFence.begin()?.also { mutationTicket ->
+            if (transition.timedOut.get()) {
+              browserProxyCallbackFence.markTimedOut(mutationTicket)
+            }
+          }
+        } ?: return
+
+    try {
+      val config =
+          ProxyConfig.Builder()
+              .addProxyRule(BLOCKED_BROWSER_PROXY)
+              // Never add a direct fallback on fail-closed recovery paths.
+              .build()
+      ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
+        transition.request.owner.completeFailClosedBrowserTransition(transition, ticket)
+      }
+    } catch (_: RuntimeException) {
+      synchronized(browserRoutingLock) {
+        browserProxyCallbackFence.cancel(ticket)
+        transition.blockedMutationStarted.set(false)
+      }
+      transition.request.owner.timeoutFailClosedBrowserTransition(transition)
+    }
+  }
+
+  private fun completeFailClosedBrowserTransition(
+      transition: BrowserFailClosedTransition,
+      ticket: Long,
+  ) {
+    val accepted =
+        synchronized(browserRoutingLock) {
+          if (
+              browserProxyCallbackFence.complete(ticket) ==
+                  BrowserProxyCallbackCompletion.STALE ||
+                  browserFailClosedTransition !== transition
+          ) {
+            false
+          } else {
+            browserFailClosedTransition = null
+            browserProxyFenceTimedOut = false
+            true
+          }
+        }
+    if (!accepted) return
+    transition.timeoutFuture.getAndSet(null)?.cancel(false)
+    syncCoreBrowserProxy(false)
+    startNextBrowserRoutingRequest(transition.request)
+  }
+
+  private fun timeoutFailClosedBrowserTransition(
+      transition: BrowserFailClosedTransition,
+  ) {
+    val queued = mutableListOf<BrowserRoutingRequest>()
+    val timedOut =
+        synchronized(browserRoutingLock) {
+          if (
+              browserFailClosedTransition !== transition ||
+                  !transition.timedOut.compareAndSet(false, true)
+          ) {
+            false
+          } else {
+            browserProxyFenceTimedOut = true
+            browserProxyCallbackFence.markActiveTimedOut()
+            while (browserRoutingQueue.isNotEmpty()) {
+              queued.add(browserRoutingQueue.removeFirst())
+            }
+            true
+          }
+        }
+    if (!timedOut) return
+    transition.timeoutFuture.set(null)
+    syncCoreBrowserProxy(false)
+    queued.forEach { request ->
+      request.owner.rejectQueuedBrowserRoutingRequest(
+          request,
+          "E_BROWSER_ROUTING_TIMEOUT",
+          "Android did not confirm the blocked browser-routing change in time.",
+      )
+    }
+  }
+
+  private fun invalidateBrowserRoutingRequests() {
+    val queued = mutableListOf<BrowserRoutingRequest>()
+    val active =
+        synchronized(browserRoutingLock) {
+          val iterator = browserRoutingQueue.iterator()
+          while (iterator.hasNext()) {
+            val request = iterator.next()
+            if (request.owner === this) {
+              iterator.remove()
+              queued.add(request)
+            }
+          }
+          browserRoutingActive?.takeIf { request -> request.owner === this }
+        }
+    queued.forEach { request ->
+      rejectQueuedBrowserRoutingRequest(
+          request,
+          "E_MODULE_INVALIDATED",
+          "The MASQ native module shut down before browser routing was configured.",
+      )
+    }
+    active?.let { request ->
+      abortBrowserRoutingRequestClosed(
+          request,
+          "E_MODULE_INVALIDATED",
+          "The MASQ native module shut down before browser routing was configured.",
+      )
+    }
+  }
+
+  private fun startNextBrowserRoutingRequest(completed: BrowserRoutingRequest) {
+    val next =
+        synchronized(browserRoutingLock) {
+          if (browserRoutingActive !== completed) return@synchronized null
+          browserRoutingActive =
+              if (browserRoutingQueue.isEmpty()) null else browserRoutingQueue.removeFirst()
+          browserRoutingActive
+        }
+    activateBrowserRoutingRequest(next)
+  }
+
+  private fun setBrowserProxyOverride(
+      request: BrowserRoutingRequest,
+      config: ProxyConfig,
+      onComplete: () -> Unit,
+  ) {
+    val ticket = beginBrowserProxyMutation(request)
+    try {
+      ProxyController.getInstance().setProxyOverride(config, callbackExecutor) {
+        request.owner.completeBrowserProxyMutation(request, ticket, onComplete)
+      }
+    } catch (error: RuntimeException) {
+      cancelBrowserProxyMutation(ticket)
+      throw error
+    }
+  }
+
+  private fun clearBrowserProxyOverride(
+      request: BrowserRoutingRequest,
+      onComplete: () -> Unit,
+  ) {
+    val ticket = beginBrowserProxyMutation(request)
+    try {
+      ProxyController.getInstance().clearProxyOverride(callbackExecutor) {
+        request.owner.completeBrowserProxyMutation(request, ticket, onComplete)
+      }
+    } catch (error: RuntimeException) {
+      cancelBrowserProxyMutation(ticket)
+      throw error
+    }
+  }
+
+  private fun beginBrowserProxyMutation(request: BrowserRoutingRequest): Long =
+      synchronized(browserRoutingLock) {
+        if (browserRoutingActive !== request || !isBrowserRoutingRequestLive(request)) {
+          throw StaleBrowserCoreException()
+        }
+        browserProxyCallbackFence.begin()
+            ?: throw IllegalStateException(
+                "Android is still applying the previous browser proxy mutation.",
+            )
+      }
+
+  private fun cancelBrowserProxyMutation(ticket: Long) {
+    val pendingTransition =
+        synchronized(browserRoutingLock) {
+          browserProxyCallbackFence.cancel(ticket)
+          browserFailClosedTransition
+        }
+    if (pendingTransition != null) {
+      scheduleFailClosedBrowserTransition(pendingTransition)
+    }
+  }
+
+  private fun completeBrowserProxyMutation(
+      request: BrowserRoutingRequest,
+      ticket: Long,
+      onComplete: () -> Unit,
+  ) {
+    var pendingTransition: BrowserFailClosedTransition? = null
+    val accepted =
+        synchronized(browserRoutingLock) {
+          if (
+              browserProxyCallbackFence.complete(ticket) ==
+                  BrowserProxyCallbackCompletion.STALE
+          ) {
+            false
+          } else {
+            pendingTransition = browserFailClosedTransition
+            true
+          }
+        }
+    if (!accepted) return
+    if (pendingTransition != null) {
+      scheduleFailClosedBrowserTransition(pendingTransition!!)
+    } else if (isBrowserRoutingRequestLive(request)) {
+      onComplete()
+    }
   }
 
   private data class BrowserRoutingRequest(
@@ -2472,6 +3353,15 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
       val mode: String,
       val coreGeneration: Long,
       val promise: Promise,
+      val completed: AtomicBoolean = AtomicBoolean(false),
+      val timeoutFuture: AtomicReference<ScheduledFuture<*>?> = AtomicReference(null),
+  )
+
+  private data class BrowserFailClosedTransition(
+      val request: BrowserRoutingRequest,
+      val blockedMutationStarted: AtomicBoolean = AtomicBoolean(false),
+      val timedOut: AtomicBoolean = AtomicBoolean(false),
+      val timeoutFuture: AtomicReference<ScheduledFuture<*>?> = AtomicReference(null),
   )
 
   private fun continueApprovedSystemTunnelConsent(request: PendingTunnelRequest) {
@@ -3172,6 +4062,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     private const val BLOCKED_BROWSER_PROXY = "http://127.0.0.1:1"
     private const val START_CANCELLED_MESSAGE =
         "The MASQ connection attempt was cancelled."
+    private const val NETWORK_HANDOVER_RETRY_MESSAGE =
+        "Android changed the active network while MASQ was connecting. Retry on the current network."
     private const val SAVED_CONFIG_INVALID_MESSAGE =
         "The saved MASQ network profile is invalid."
     private const val NETWORK_PROFILE_RESET_MESSAGE =
@@ -3180,12 +4072,20 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         "The saved consumer wallet could not be preserved during network-profile recovery."
     private val browserRoutingLock = Any()
     private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()
-    private var browserRoutingInFlight = false
-    // Strictly exceeds translator readiness (3s) plus the serialized native
-    // end-to-end route preflight (up to 40s) and normal executor/FGS overhead.
-    // Covers a 10s terminal translator recovery, 3s replacement readiness,
-    // 40s TLS/HEAD preflight, and service/executor scheduling margin.
-    private const val START_TUNNEL_TIMEOUT_MS = 70_000L
+    private var browserRoutingActive: BrowserRoutingRequest? = null
+    private val browserProxyCallbackFence = BrowserProxyCallbackFence()
+    private var browserFailClosedTransition: BrowserFailClosedTransition? = null
+    private var browserProxyFenceTimedOut = false
+    private val browserRoutingTimeoutExecutor =
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+          Thread(runnable, "MasqBrowserRoutingTimeout").apply { isDaemon = true }
+        }
+    private const val BROWSER_ROUTING_TIMEOUT_MS = 12_000L
+    private const val BROWSER_FAIL_CLOSED_TIMEOUT_MS = 12_000L
+    // Strictly exceeds the worst supported recovery path: a 10s translator
+    // release, 3s replacement readiness, the native 12s absolute TLS/HEAD
+    // route proof, and normal service/executor scheduling margin.
+    private const val START_TUNNEL_TIMEOUT_MS = 45_000L
     private const val STOP_TUNNEL_TIMEOUT_MS = 15_000L
     private const val RESET_TUNNEL_TIMEOUT_MS = 15_000L
     private val TUNNEL_REQUEST_COUNTER = AtomicLong(1L)

@@ -10,6 +10,8 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.CompletableFuture
@@ -25,12 +27,41 @@ internal const val DOGFOOD_MASQ_PACKAGE_ID = "com.endthecb2.masqmobile.dogfood"
 internal val MASQ_CONTROL_PLANE_PACKAGE_IDS =
     setOf(PUBLIC_MASQ_PACKAGE_ID, DOGFOOD_MASQ_PACKAGE_ID)
 
+private const val MASQ_RECOVERY_LOG_TAG = "MasqRecovery"
+
 internal fun isMasqControlPlanePackage(packageId: String): Boolean =
     packageId in MASQ_CONTROL_PLANE_PACKAGE_IDS
 
 internal fun installedMasqControlPlanePackages(
     isInstalled: (String) -> Boolean,
 ): List<String> = MASQ_CONTROL_PLANE_PACKAGE_IDS.filter(isInstalled)
+
+internal fun systemRoutingNetworkEpochMatches(
+    expectedNetworkEpoch: Long?,
+    explicitStartRequest: Boolean,
+    currentNetworkEpoch: Long?,
+): Boolean =
+    if (expectedNetworkEpoch == null) {
+      explicitStartRequest
+    } else {
+      expectedNetworkEpoch > 0L && currentNetworkEpoch == expectedNetworkEpoch
+    }
+
+internal data class MasqTunPrefix(val address: String, val prefixLength: Int)
+
+internal object MasqTunNetworkConfiguration {
+  val addresses =
+      listOf(
+          MasqTunPrefix("10.111.0.1", 32),
+          MasqTunPrefix("fd00:111::1", 128),
+      )
+  val routes =
+      listOf(
+          MasqTunPrefix("0.0.0.0", 0),
+          MasqTunPrefix("::", 0),
+      )
+  val dnsServers = listOf("10.111.0.2")
+}
 
 class MasqVpnService : VpnService() {
   private val serviceEpoch = nextServiceEpoch()
@@ -41,6 +72,8 @@ class MasqVpnService : VpnService() {
   private val translator =
       SystemRoutingTranslator(JniPacketTunnelNativeApi, translatorExecutor)
   private val runtimeLock = Any()
+  private val routeEventDispatchLock = Any()
+  private val routeRecoveryState = SystemRoutingRouteRecoveryState()
   private val acknowledgementOwnershipLock = Any()
   private val ownedStartRequests = mutableSetOf<Long>()
   private val ownedStopRequests = mutableSetOf<Long>()
@@ -75,6 +108,32 @@ class MasqVpnService : VpnService() {
                   NotificationManager.IMPORTANCE_LOW,
               ))
     }
+    scheduleCompanionSessionWatchdog()
+  }
+
+  private fun scheduleCompanionSessionWatchdog() {
+    runCatching {
+      handoffRetryExecutor.scheduleWithFixedDelay(
+          {
+            if (destroyed || revoked) return@scheduleWithFixedDelay
+            val load = runCatching { policyStore.loadForServiceStart() }.getOrNull()
+            ensureCompanionSessionForDesiredRouting(load)
+          },
+          0L,
+          COMPANION_SESSION_WATCHDOG_INTERVAL_MS,
+          TimeUnit.MILLISECONDS,
+      )
+    }
+  }
+
+  private fun ensureCompanionSessionForDesiredRouting(
+      load: SystemRoutingPolicyLoadResult?,
+  ) {
+    if (destroyed || revoked || load?.mayStart != true) return
+    // The session's durable user-intent bit remains authoritative. This can
+    // restore an Android-reclaimed companion service, but can never undo an
+    // explicit disconnect or shutdown, which clears that bit first.
+    MasqSessionService.ensureRunningIfDesired(this)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -112,6 +171,7 @@ class MasqVpnService : VpnService() {
               proxyPort = proxyPort,
               coreGeneration = coreGeneration.takeIf { it > 0 },
               engineGeneration = engineGeneration.takeIf { it > 0 },
+              expectedNetworkEpoch = null,
               requestId = requestId.takeIf { it != NO_REQUEST },
           )
         }
@@ -128,6 +188,8 @@ class MasqVpnService : VpnService() {
             intent.getLongExtra(EXTRA_CORE_GENERATION, NO_CORE_GENERATION)
         val engineGeneration =
             intent.getLongExtra(EXTRA_ENGINE_GENERATION, NO_ENGINE_GENERATION)
+        val networkEpoch =
+            intent.getLongExtra(EXTRA_NETWORK_EPOCH, NO_NETWORK_EPOCH)
         controlExecutor.execute {
           try {
             handleStart(
@@ -135,6 +197,11 @@ class MasqVpnService : VpnService() {
                 proxyPort = proxyPort,
                 coreGeneration = coreGeneration.takeIf { it > 0 },
                 engineGeneration = engineGeneration.takeIf { it > 0 },
+                // ACTION_RECOVER is never allowed to inherit the manual
+                // ACTION_START null bypass. A missing/invalid epoch remains a
+                // non-null sentinel and therefore fails closed in the exact
+                // authority checks below.
+                expectedNetworkEpoch = networkEpoch,
                 requestId = null,
             )
           } finally {
@@ -359,7 +426,9 @@ class MasqVpnService : VpnService() {
       proxyPort: Int,
       coreGeneration: Long?,
       engineGeneration: Long?,
+      expectedNetworkEpoch: Long?,
       requestId: Long?,
+      recoveryAction: SystemRoutingRouteRecoveryAction? = null,
   ) {
     if (destroyed) {
       requestId?.let {
@@ -391,7 +460,9 @@ class MasqVpnService : VpnService() {
               proxyPort,
               coreGeneration,
               engineGeneration,
+              expectedNetworkEpoch,
               requestId,
+              recoveryAction,
           )
           return
         }
@@ -434,7 +505,9 @@ class MasqVpnService : VpnService() {
           proxyPort,
           coreGeneration,
           engineGeneration,
+          expectedNetworkEpoch,
           requestId,
+          recoveryAction,
       )
     } finally {
       terminalCoordinator.finishStart(startEpoch)
@@ -485,7 +558,9 @@ class MasqVpnService : VpnService() {
       proxyPort: Int,
       coreGeneration: Long?,
       engineGeneration: Long?,
+      expectedNetworkEpoch: Long?,
       requestId: Long?,
+      recoveryAction: SystemRoutingRouteRecoveryAction?,
   ) {
     if (destroyed) {
       requestId?.let {
@@ -507,6 +582,18 @@ class MasqVpnService : VpnService() {
       return
     }
     val policy = load.policy
+    fun networkEpochIsCurrent(): Boolean {
+      if (expectedNetworkEpoch == null) {
+        return requestId != null
+      }
+      val currentEpoch =
+          coreGeneration?.let(MasqSessionService::currentNetworkEpochForCore)
+      return systemRoutingNetworkEpochMatches(
+          expectedNetworkEpoch = expectedNetworkEpoch,
+          explicitStartRequest = requestId != null,
+          currentNetworkEpoch = currentEpoch,
+      )
+    }
     if (refuseActivationWithoutNotification(load, requestId)) {
       return
     }
@@ -712,7 +799,9 @@ class MasqVpnService : VpnService() {
                 beforePreflightLoad.policy == policy &&
                 captureIsCurrent(policy, descriptor) &&
                 coreGeneration == MasqCoreLifecycle.startGeneration.get() &&
+                networkEpochIsCurrent() &&
                 (requestId == null || hasStartAcknowledgement(requestId))
+        val preflightStartedElapsed = SystemClock.elapsedRealtime()
         val preflightReady =
             beforePreflightCurrent &&
                 coreRoutePreflightReady(
@@ -720,14 +809,20 @@ class MasqVpnService : VpnService() {
                     coreGeneration,
                     engineGeneration,
                 )
+        Log.i(
+            MASQ_RECOVERY_LOG_TAG,
+            "VPN_PREFLIGHT_RESULT background=${requestId == null} ready=$preflightReady " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - preflightStartedElapsed}",
+        )
         // The end-to-end TLS/HEAD preflight can block for seconds. Re-read every
         // mutable authority after it returns before considering ACTIVE.
         val finalLoad = policyStore.loadForServiceStart()
         val finalPolicyCurrent =
             finalLoad is SystemRoutingPolicyLoadResult.Ready &&
                 finalLoad.policy == policy
+        val finalNetworkEpochCurrent = networkEpochIsCurrent()
         val activated =
-            if (!preflightReady || !finalPolicyCurrent) {
+            if (!preflightReady || !finalPolicyCurrent || !finalNetworkEpochCurrent) {
               false
             } else {
               synchronized(runtimeLock) {
@@ -750,7 +845,8 @@ class MasqVpnService : VpnService() {
                   synchronized(MasqCoreLifecycle.lock) {
                     val exactCoreGeneration =
                         coreGeneration ==
-                            MasqCoreLifecycle.startGeneration.get()
+                            MasqCoreLifecycle.startGeneration.get() &&
+                            networkEpochIsCurrent()
                     if (!exactCoreGeneration) {
                       false
                     } else {
@@ -763,6 +859,7 @@ class MasqVpnService : VpnService() {
                           acknowledgementAccepted &&
                               coreGeneration ==
                                   MasqCoreLifecycle.startGeneration.get() &&
+                              networkEpochIsCurrent() &&
                               !destroyed &&
                               !revoked &&
                               localTunCaptureValid &&
@@ -778,6 +875,7 @@ class MasqVpnService : VpnService() {
                             translatorReady = true,
                             coreRouteReady = true,
                             activeProxyPort = proxyPort,
+                            activeCoreGeneration = coreGeneration,
                             activeEngineGeneration = engineGeneration,
                         )
                         updateNotification(
@@ -814,6 +912,35 @@ class MasqVpnService : VpnService() {
                   },
               tunPresentOverride = if (permissionRevoked) false else null,
           )
+          if (
+              requestId == null &&
+                  expectedNetworkEpoch != null &&
+                  beforePreflightCurrent &&
+                  !preflightReady &&
+                  finalPolicyCurrent &&
+                  networkEpochIsCurrent() &&
+                  !permissionRevoked &&
+                  !destroyed &&
+                  captureIsCurrent(policy, descriptor) &&
+                  stopAfterFailedActivation == TranslatorStopResult.SafeToClose
+          ) {
+            Log.i(MASQ_RECOVERY_LOG_TAG, "VPN_PREFLIGHT_ESCALATE exact=true")
+            // The status snapshot can remain stage-two "connected" after its
+            // Android underlay sockets have died. An automatic tunnel recovery
+            // has now disproved that exact engine end to end, so ask the session
+            // supervisor to reap it once. The request remains scoped to this
+            // core generation, engine generation, and current network epoch.
+            recoveryAction?.let { failedRecovery ->
+              synchronized(routeEventDispatchLock) {
+                routeRecoveryState.recordFailedRecoveryPreflight(failedRecovery)
+              }
+            }
+            MasqSessionService.requestCoreRouteRestartIfCurrent(
+                expectedStartGeneration = coreGeneration,
+                expectedEngineGeneration = engineGeneration,
+                expectedNetworkEpoch = expectedNetworkEpoch,
+            )
+          }
           if (requestId != null) {
             settleStart(
                 requestId,
@@ -935,6 +1062,7 @@ class MasqVpnService : VpnService() {
     val load = policyStore.loadForServiceStart()
     val applied = appliedPolicy
     if (applied?.revision != revision) return
+    ensureCompanionSessionForDesiredRouting(load)
     publish(
         load,
         SystemRoutingTransition.BLOCKED,
@@ -947,6 +1075,45 @@ class MasqVpnService : VpnService() {
           "Captured traffic remains blocked while the community-route translator is stopped."
         } else {
           "Captured traffic is blocked because the community-route translator returned."
+        })
+  }
+
+  /**
+   * Stops only the packet translator after the embedded core loses its usable route. The exact
+   * Android TUN descriptor and applied package policy deliberately remain open, so the captured
+   * scope stays fail-closed until a separately proven core generation is rebound.
+   */
+  private fun handleCoreRouteLoss() {
+    if (destroyed) return
+    val capture =
+        synchronized(runtimeLock) {
+          Pair(
+              appliedPolicy,
+              tunnelDescriptor != null && localTunCaptureValid,
+          )
+        }
+    if (!capture.second && !translator.hasOwnedRun()) return
+    val stopResult = stopTranslatorSafely(capture.first?.revision)
+    if (destroyed) return
+    val load = policyStore.loadForServiceStart()
+    ensureCompanionSessionForDesiredRouting(load)
+    publish(
+        load,
+        SystemRoutingTransition.BLOCKED,
+        translatorReady = false,
+        coreRouteReady = false,
+        diagnostic =
+            if (stopResult == TranslatorStopResult.SafeToClose) {
+              SystemRoutingDiagnostic.CORE_ROUTE_NOT_READY
+            } else {
+              stopDiagnostic(stopResult)
+            },
+    )
+    updateNotification(
+        if (stopResult == TranslatorStopResult.SafeToClose) {
+          "Captured traffic is blocked while the MASQ core route recovers."
+        } else {
+          "Captured traffic remains blocked while the packet translator stops."
         })
   }
 
@@ -1206,12 +1373,17 @@ class MasqVpnService : VpnService() {
           Builder()
               .setSession("MASQ private route")
               .setMtu(TUNNEL_MTU)
-              .addAddress("10.111.0.1", 32)
-              .addAddress("fd00:111::1", 128)
-              .addRoute("0.0.0.0", 0)
-              .addRoute("::", 0)
-              .addDnsServer("10.111.0.2")
               .setBlocking(false)
+      // Capture both families fail closed. The native policy closes unsupported
+      // IPv6 flows before session accounting, prompting TCP Happy Eyeballs to
+      // fall back without allowing IPv6 to bypass the protected app scope.
+      MasqTunNetworkConfiguration.addresses.forEach { prefix ->
+        builder.addAddress(prefix.address, prefix.prefixLength)
+      }
+      MasqTunNetworkConfiguration.routes.forEach { prefix ->
+        builder.addRoute(prefix.address, prefix.prefixLength)
+      }
+      MasqTunNetworkConfiguration.dnsServers.forEach(builder::addDnsServer)
       when (policy.desiredMode) {
         SystemRoutingMode.WHOLE_DEVICE ->
             MASQ_CONTROL_PLANE_PACKAGE_IDS.forEach { packageId ->
@@ -1619,6 +1791,7 @@ class MasqVpnService : VpnService() {
       diagnostic: SystemRoutingDiagnostic? = null,
       tunPresentOverride: Boolean? = null,
       activeProxyPort: Int? = null,
+      activeCoreGeneration: Long? = null,
       activeEngineGeneration: Long? = null,
   ) {
     if (destroyed) return
@@ -1645,15 +1818,17 @@ class MasqVpnService : VpnService() {
         } else {
           null
         }
+    val exactTranslatorSnapshot =
+        if (translatorReady && applied?.revision != null) {
+          translator.exactRunningSnapshot(applied.revision)
+        } else {
+          null
+        }
+    val exactTranslatorReady = translatorReady && exactTranslatorSnapshot != null
     val trafficObserved =
-        translatorReady &&
+        exactTranslatorReady &&
             coreRouteReady &&
-            runCatching { JniPacketTunnelNativeApi.snapshot() }
-                .getOrNull()
-                ?.let { snapshot ->
-                  snapshot.state == PacketTunnelNativeState.RUNNING &&
-                      snapshot.trafficObserved
-                } == true
+            exactTranslatorSnapshot?.trafficObserved == true
     updateStatus(
         status =
             SystemRoutingStatus.derive(
@@ -1674,7 +1849,7 @@ class MasqVpnService : VpnService() {
                       transition
                     },
                 tunPresent = tunPresent,
-                translatorReady = translatorReady,
+                translatorReady = exactTranslatorReady,
                 coreRouteReady = coreRouteReady,
                 trafficObserved = trafficObserved,
                 alwaysOn = currentAlwaysOn(),
@@ -1688,6 +1863,7 @@ class MasqVpnService : VpnService() {
                     },
             ),
         activeProxyPort = activeProxyPort,
+        activeCoreGeneration = activeCoreGeneration,
         activeEngineGeneration = activeEngineGeneration,
         ownerEpoch = serviceEpoch,
     )
@@ -1969,6 +2145,7 @@ class MasqVpnService : VpnService() {
     const val EXTRA_PROXY_PORT = "proxyPort"
     const val EXTRA_CORE_GENERATION = "coreGeneration"
     const val EXTRA_ENGINE_GENERATION = "engineGeneration"
+    const val EXTRA_NETWORK_EPOCH = "networkEpoch"
     const val EXTRA_COMMAND_REQUEST_ID = "commandRequestId"
     private const val NOTIFICATION_CHANNEL = "masq-system-tunnel"
     private const val NOTIFICATION_ID = 4107
@@ -1977,15 +2154,17 @@ class MasqVpnService : VpnService() {
     private const val NO_REVISION = -1L
     private const val NO_CORE_GENERATION = -1L
     private const val NO_ENGINE_GENERATION = -1L
+    private const val NO_NETWORK_EPOCH = -1L
     private const val TRANSLATOR_READY_TIMEOUT_MS = 3_000L
     private const val TRANSLATOR_READY_POLL_MS = 20L
     private const val TRANSLATOR_STOP_TIMEOUT_MS = 10_000L
-    // The native probe enforces one absolute 30-second deadline across
+    // The native probe enforces one absolute 12-second deadline across
     // CONNECT, TLS, and the encrypted HEAD response. Keep the outer wait above
     // it so a slow but healthy multi-hop route is not reported as disconnected
     // while the serialized probe is still live.
-    private const val CORE_PREFLIGHT_TIMEOUT_MS = 40_000L
+    private const val CORE_PREFLIGHT_TIMEOUT_MS = 20_000L
     private const val HANDOFF_RETRY_DELAY_MS = 1_000L
+    private const val COMPANION_SESSION_WATCHDOG_INTERVAL_MS = 10_000L
     private const val DOGFOOD_ROUTING_LIMITS =
         "Community preview: only captured IPv4 TCP/443 and virtual DNS are translated through MASQ. " +
             "All other captured IP traffic, including other TCP ports, non-DNS UDP, IPv6, ICMP " +
@@ -2034,6 +2213,7 @@ class MasqVpnService : VpnService() {
             lockdown = false,
         )
     private var currentProxyPort: Int? = null
+    private var currentCoreGeneration: Long? = null
     private var currentCoreEngineGeneration: Long? = null
 
     fun statusJson(): String = synchronized(statusLock) { currentStatus.toJson() }
@@ -2051,6 +2231,9 @@ class MasqVpnService : VpnService() {
           engineGeneration <= 0) {
         return
       }
+      val networkEpoch =
+          MasqSessionService.currentNetworkEpochForCore(coreGeneration)
+              ?: return
       val store =
           SystemRoutingPolicyStore(
               SharedPreferencesSystemRoutingPolicyStorage(
@@ -2060,36 +2243,61 @@ class MasqVpnService : VpnService() {
                   )))
       val ready = store.loadForServiceStart() as? SystemRoutingPolicyLoadResult.Ready
           ?: return
+      val identity =
+          SystemRoutingCoreRouteIdentity(
+              proxyPort = proxyPort,
+              coreGeneration = coreGeneration,
+              engineGeneration = engineGeneration,
+              networkEpoch = networkEpoch,
+          )
       val alreadyExact =
           synchronized(statusLock) {
             currentStatus.active &&
                 currentStatus.desiredRevision == ready.policy.revision &&
                 currentStatus.appliedRevision == ready.policy.revision &&
                 currentProxyPort == proxyPort &&
+                currentCoreGeneration == coreGeneration &&
                 currentCoreEngineGeneration == engineGeneration
           }
-      if (alreadyExact || !recoveryDispatchInFlight.compareAndSet(false, true)) {
-        return
-      }
       val liveService = activeInstance.get()
       if (liveService != null && !liveService.destroyed) {
-        try {
-          liveService.controlExecutor.execute {
-            try {
-              liveService.handleStart(
-                  revision = ready.policy.revision,
-                  proxyPort = proxyPort,
-                  coreGeneration = coreGeneration,
-                  engineGeneration = engineGeneration,
-                  requestId = null,
-              )
-            } finally {
-              recoveryDispatchInFlight.set(false)
+        synchronized(liveService.routeEventDispatchLock) {
+          val recovery =
+              liveService.routeRecoveryState.observeProvenRoute(
+                  identity = identity,
+                  routeAlreadyExact = alreadyExact,
+              ) ?: return
+          try {
+            liveService.controlExecutor.execute {
+              try {
+                val stillCurrent =
+                    synchronized(liveService.routeEventDispatchLock) {
+                      liveService.routeRecoveryState.recoveryIsCurrent(recovery)
+                    }
+                if (stillCurrent && !liveService.destroyed) {
+                  liveService.handleStart(
+                      revision = ready.policy.revision,
+                      proxyPort = recovery.identity.proxyPort,
+                      coreGeneration = recovery.identity.coreGeneration,
+                      engineGeneration = recovery.identity.engineGeneration,
+                      expectedNetworkEpoch = recovery.identity.networkEpoch,
+                      requestId = null,
+                      recoveryAction = recovery,
+                  )
+                }
+              } finally {
+                synchronized(liveService.routeEventDispatchLock) {
+                  liveService.routeRecoveryState.completeRecovery(recovery)
+                }
+              }
             }
+          } catch (_: Exception) {
+            liveService.routeRecoveryState.completeRecovery(recovery)
           }
-        } catch (_: Exception) {
-          recoveryDispatchInFlight.set(false)
         }
+        return
+      }
+      if (alreadyExact || !recoveryDispatchInFlight.compareAndSet(false, true)) {
         return
       }
       val intent =
@@ -2099,6 +2307,7 @@ class MasqVpnService : VpnService() {
               .putExtra(EXTRA_PROXY_PORT, proxyPort)
               .putExtra(EXTRA_CORE_GENERATION, coreGeneration)
               .putExtra(EXTRA_ENGINE_GENERATION, engineGeneration)
+              .putExtra(EXTRA_NETWORK_EPOCH, networkEpoch)
       try {
         ContextCompat.startForegroundService(context.applicationContext, intent)
       } catch (_: Exception) {
@@ -2151,6 +2360,7 @@ class MasqVpnService : VpnService() {
                   diagnostic = diagnostic,
               )
           currentProxyPort = null
+          currentCoreGeneration = null
           currentCoreEngineGeneration = null
           currentStatus.toJson()
         }
@@ -2197,6 +2407,7 @@ class MasqVpnService : VpnService() {
               )
           if (!currentStatus.active) {
             currentProxyPort = null
+            currentCoreGeneration = null
             currentCoreEngineGeneration = null
           }
           currentStatus.toJson()
@@ -2206,26 +2417,36 @@ class MasqVpnService : VpnService() {
         load: SystemRoutingPolicyLoadResult,
         coreRouteAvailable: Boolean,
         proxyPort: Int,
+        coreGeneration: Long,
         engineGeneration: Long,
     ): String {
       publishDesiredPolicy(load)
-      return synchronized(statusLock) {
+      var activeRouteWasLost = false
+      val result = synchronized(statusLock) {
         val prior = currentStatus
         val exactCoreRoute =
             coreRouteAvailable &&
                 proxyPort in 1..65535 &&
+                coreGeneration > 0 &&
                 engineGeneration > 0 &&
                 currentProxyPort == proxyPort &&
+                currentCoreGeneration == coreGeneration &&
                 currentCoreEngineGeneration == engineGeneration
+        val liveService = activeInstance.get()?.takeIf { !it.destroyed }
+        val exactTranslatorSnapshot =
+            if (prior.translatorReady && prior.appliedRevision != null) {
+              liveService?.translator?.exactRunningSnapshot(prior.appliedRevision)
+            } else {
+              null
+            }
+        val exactTranslatorReady =
+            prior.translatorReady && exactTranslatorSnapshot != null
+        activeRouteWasLost =
+            prior.active && (!exactCoreRoute || !exactTranslatorReady)
         val trafficObserved =
             exactCoreRoute &&
-                prior.translatorReady &&
-                runCatching { JniPacketTunnelNativeApi.snapshot() }
-                    .getOrNull()
-                    ?.let { snapshot ->
-                      snapshot.state == PacketTunnelNativeState.RUNNING &&
-                          snapshot.trafficObserved
-                    } == true
+                exactTranslatorReady &&
+                exactTranslatorSnapshot?.trafficObserved == true
         val desired =
             when (load) {
               is SystemRoutingPolicyLoadResult.Ready -> load.policy
@@ -2246,7 +2467,7 @@ class MasqVpnService : VpnService() {
                 appliedSelectedApps = prior.appliedSelectedApps,
                 transition = transitionFor(prior.phase),
                 tunPresent = prior.tunPresent,
-                translatorReady = prior.translatorReady,
+                translatorReady = exactTranslatorReady,
                 coreRouteReady = exactCoreRoute && prior.coreRouteReady,
                 trafficObserved = trafficObserved,
                 alwaysOn = prior.alwaysOn,
@@ -2254,6 +2475,8 @@ class MasqVpnService : VpnService() {
                 lastError =
                     when {
                       load is SystemRoutingPolicyLoadResult.BlockRequired -> load.reason
+                      prior.active && !exactTranslatorReady ->
+                          SystemRoutingDiagnostic.TRANSLATOR_RETURNED
                       prior.active && !exactCoreRoute ->
                           SystemRoutingDiagnostic.CORE_ROUTE_NOT_READY
                       else -> prior.lastError
@@ -2261,10 +2484,15 @@ class MasqVpnService : VpnService() {
             )
         if (!currentStatus.active) {
           currentProxyPort = null
+          currentCoreGeneration = null
           currentCoreEngineGeneration = null
         }
         currentStatus.toJson()
       }
+      if (!coreRouteAvailable || activeRouteWasLost) {
+        dispatchCoreRouteLoss(activeRouteWasLost)
+      }
+      return result
     }
 
     fun publishCoreRouteUnavailable(context: Context): String {
@@ -2279,8 +2507,44 @@ class MasqVpnService : VpnService() {
           load = store.loadForServiceStart(),
           coreRouteAvailable = false,
           proxyPort = 0,
+          coreGeneration = 0,
           engineGeneration = 0,
       )
+    }
+
+    private fun dispatchCoreRouteLoss(activeRouteWasLost: Boolean) {
+      val liveService = activeInstance.get()
+      if (liveService == null || liveService.destroyed) return
+      synchronized(liveService.routeEventDispatchLock) {
+        val translatorOwned =
+            !liveService.destroyed && liveService.translator.hasOwnedRun()
+        val loss =
+            liveService.routeRecoveryState.observeRouteLoss(
+                captureOrRecoveryNeedsBlocking =
+                    activeRouteWasLost ||
+                        translatorOwned ||
+                        liveService.routeRecoveryState.hasPendingRecovery(),
+            ) ?: return
+        if (liveService.destroyed) {
+          liveService.routeRecoveryState.completeRouteLoss(loss)
+          return
+        }
+        try {
+          // Submission occurs under the same lock as route observation, so a
+          // later proven-route recovery is always queued after this stop.
+          liveService.controlExecutor.execute {
+            try {
+              liveService.handleCoreRouteLoss()
+            } finally {
+              synchronized(liveService.routeEventDispatchLock) {
+                liveService.routeRecoveryState.completeRouteLoss(loss)
+              }
+            }
+          }
+        } catch (_: Exception) {
+          liveService.routeRecoveryState.completeRouteLoss(loss)
+        }
+      }
     }
 
     fun registerStartAcknowledgement(
@@ -2315,6 +2579,7 @@ class MasqVpnService : VpnService() {
     private fun updateStatus(
         status: SystemRoutingStatus,
         activeProxyPort: Int?,
+        activeCoreGeneration: Long?,
         activeEngineGeneration: Long?,
         ownerEpoch: Long,
     ) {
@@ -2335,6 +2600,14 @@ class MasqVpnService : VpnService() {
                 activeEngineGeneration != null &&
                 activeEngineGeneration > 0) {
               activeEngineGeneration
+            } else {
+              null
+            }
+        currentCoreGeneration =
+            if (status.active &&
+                activeCoreGeneration != null &&
+                activeCoreGeneration > 0) {
+              activeCoreGeneration
             } else {
               null
             }

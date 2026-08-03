@@ -434,16 +434,21 @@ impl OverallConnectionStatus {
             OverallConnectionStage::ConnectedToNeighbor => {
                 Some(UiConnectionStatusReason::RouteNotReady)
             }
-            OverallConnectionStage::NotConnected
-                if !self.progress.is_empty()
-                    && self.progress.iter().all(|progress| {
-                        matches!(progress.connection_stage, ConnectionStage::Failed(_))
-                    }) =>
-            {
+            OverallConnectionStage::NotConnected if self.all_entry_attempts_terminal() => {
                 Some(UiConnectionStatusReason::EntryNodesUnreachable)
             }
             OverallConnectionStage::NotConnected => None,
         }
+    }
+
+    /// True only when every currently selected initial peer has reached an
+    /// explicit terminal state. A single failed parallel peer is never enough.
+    pub fn all_entry_attempts_terminal(&self) -> bool {
+        !self.progress.is_empty()
+            && self
+                .progress
+                .iter()
+                .all(|progress| matches!(progress.connection_stage, ConnectionStage::Failed(_)))
     }
 }
 
@@ -1205,6 +1210,28 @@ mod tests {
             Some(UiConnectionStatusReason::RouteNotReady)
         );
         subject.stage = OverallConnectionStage::RouteFound;
+        assert_eq!(subject.ui_connection_status_reason(), None);
+    }
+
+    #[test]
+    fn entry_attempts_are_terminal_only_after_every_parallel_peer_failed() {
+        let first = make_node_descriptor(make_ip(1));
+        let second = make_node_descriptor(make_ip(2));
+        let mut subject = OverallConnectionStatus::new(vec![first, second]);
+
+        subject.progress[0].connection_stage = ConnectionStage::Failed(TcpConnectionFailed);
+        assert!(!subject.all_entry_attempts_terminal());
+        assert_eq!(subject.ui_connection_status_reason(), None);
+
+        subject.progress[1].connection_stage = ConnectionStage::Failed(PassLoopFound);
+        assert!(subject.all_entry_attempts_terminal());
+        assert_eq!(
+            subject.ui_connection_status_reason(),
+            Some(UiConnectionStatusReason::EntryNodesUnreachable)
+        );
+
+        subject.progress[1].connection_stage = ConnectionStage::NeighborshipEstablished;
+        assert!(!subject.all_entry_attempts_terminal());
         assert_eq!(subject.ui_connection_status_reason(), None);
     }
 

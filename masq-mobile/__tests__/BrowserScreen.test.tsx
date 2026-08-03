@@ -15,6 +15,10 @@ import type {
 
 const mockReload = jest.fn();
 const mockGoBack = jest.fn();
+const mockStopLoading = jest.fn();
+const mockClearCache = jest.fn();
+const mockClearFormData = jest.fn();
+const mockClearHistory = jest.fn();
 const mockPrepareBrowserProtection = jest.fn();
 const mockSetBrowserProtection = jest.fn();
 const TEST_PLATFORM_OS = Platform.OS;
@@ -22,6 +26,8 @@ const HARDWARE_BACK_EVENT = {
   timeStamp: 0,
   type: 'hardwareBackPress',
 };
+const waitForBrowserCloseFrame = () =>
+  new Promise<void>(resolve => setTimeout(resolve, 20));
 const PUBLIC_PROTECTION: BrowserProtectionConfiguration = {
   blockAdsAndTrackers: true,
   blockCrossSiteCookies: true,
@@ -37,8 +43,12 @@ jest.mock('react-native-webview', () => {
   const ReactNative = require('react-native');
   const MockWebView = ReactModule.forwardRef((props: object, ref: unknown) => {
     ReactModule.useImperativeHandle(ref, () => ({
+      clearCache: mockClearCache,
+      clearFormData: mockClearFormData,
+      clearHistory: mockClearHistory,
       goBack: mockGoBack,
       reload: mockReload,
+      stopLoading: mockStopLoading,
     }));
     return ReactModule.createElement(ReactNative.View, {
       ...props,
@@ -55,6 +65,10 @@ describe('BrowserScreen recovery lifecycle', () => {
   beforeEach(() => {
     mockReload.mockReset();
     mockGoBack.mockReset();
+    mockStopLoading.mockReset();
+    mockClearCache.mockReset();
+    mockClearFormData.mockReset();
+    mockClearHistory.mockReset();
     mockPrepareBrowserProtection
       .mockReset()
       .mockResolvedValue({ ...PUBLIC_PROTECTION });
@@ -118,7 +132,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     });
     await ReactTestRenderer.act(async () => {
       expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
-      await Promise.resolve();
+      await waitForBrowserCloseFrame();
     });
 
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -151,9 +165,10 @@ describe('BrowserScreen recovery lifecycle', () => {
       accessibilityLabel: 'Close private browser',
     });
 
-    ReactTestRenderer.act(() => {
+    await ReactTestRenderer.act(async () => {
       close.props.onPress();
       close.props.onPress();
+      await waitForBrowserCloseFrame();
     });
 
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -187,7 +202,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       renderer.root
         .findByProps({ accessibilityLabel: 'Retry closing browser' })
         .props.onPress();
-      await Promise.resolve();
+      await waitForBrowserCloseFrame();
     });
     expect(onClose).toHaveBeenCalledTimes(2);
     expect(
@@ -215,7 +230,7 @@ describe('BrowserScreen recovery lifecycle', () => {
 
     await ReactTestRenderer.act(async () => {
       appStateChanges.forEach(listener => listener('background'));
-      await Promise.resolve();
+      await waitForBrowserCloseFrame();
     });
 
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -255,7 +270,8 @@ describe('BrowserScreen recovery lifecycle', () => {
   });
 
   it('automatically reloads a transient Android WebView failure', async () => {
-    const renderer = await renderBrowser();
+    const repairRoute = jest.fn().mockResolvedValue(undefined);
+    const renderer = await renderBrowser('masq', jest.fn(), repairRoute);
     jest.useFakeTimers();
     const address = renderer.root.findByType(TextInput);
     ReactTestRenderer.act(() => {
@@ -266,7 +282,7 @@ describe('BrowserScreen recovery lifecycle', () => {
       testID: 'private-webview',
     });
 
-    ReactTestRenderer.act(() => {
+    await ReactTestRenderer.act(async () => {
       privateWebView.props.onError({
         nativeEvent: {
           code: -8,
@@ -275,9 +291,49 @@ describe('BrowserScreen recovery lifecycle', () => {
         },
       });
       jest.advanceTimersByTime(600);
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
+    expect(repairRoute).toHaveBeenCalledTimes(1);
     expect(mockReload).toHaveBeenCalledTimes(1);
+    expect(repairRoute.mock.invocationCallOrder[0]).toBeLessThan(
+      mockReload.mock.invocationCallOrder[0],
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not reload when MASQ route repair fails', async () => {
+    const repairRoute = jest
+      .fn()
+      .mockRejectedValue(new Error('private implementation detail'));
+    const renderer = await renderBrowser('masq', jest.fn(), repairRoute);
+    jest.useFakeTimers();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const privateWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      privateWebView.props.onError({
+        nativeEvent: {
+          code: -1005,
+          description: 'connection lost',
+          domain: 'NSURLErrorDomain',
+        },
+      });
+      jest.advanceTimersByTime(600);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(repairRoute).toHaveBeenCalledTimes(1);
+    expect(mockReload).not.toHaveBeenCalled();
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('could not be repaired safely');
+    expect(rendered).not.toContain('private implementation detail');
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -357,6 +413,285 @@ describe('BrowserScreen recovery lifecycle', () => {
       useSharedProcessPool: false,
       webviewDebuggingEnabled: false,
     });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('uses the isolated Android profile cache during a temporary session', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+
+    const privateWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+    expect(privateWebView.props.cacheEnabled).toBe(true);
+    expect(privateWebView.props.androidBlockedResourceHosts).toEqual(
+      expect.arrayContaining(['doubleclick.net', 'googlesyndication.com']),
+    );
+    expect(
+      privateWebView.props.androidBlockedResourceHosts.length,
+    ).toBeLessThanOrEqual(64);
+
+    ReactTestRenderer.act(() => renderer.unmount());
+    expect(mockStopLoading).toHaveBeenCalled();
+    expect(mockClearFormData).toHaveBeenCalled();
+    expect(mockClearHistory).toHaveBeenCalled();
+    expect(mockClearCache).toHaveBeenCalledWith(true);
+  });
+
+  it('stops and reports a page load that exceeds the bounded watchdog', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const privateWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    ReactTestRenderer.act(() => {
+      privateWebView.props.onLoadStart();
+      jest.advanceTimersByTime(35_000);
+    });
+
+    expect(mockStopLoading).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The page did not finish loading through MASQ in time.',
+    );
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props,
+    ).toMatchObject({
+      accessibilityState: { busy: false },
+      accessibilityValue: {
+        text: expect.stringContaining('timed_out'),
+      },
+    });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not arm the watchdog for an Android same-document history update', async () => {
+    jest.useFakeTimers();
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const privateWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    ReactTestRenderer.act(() => {
+      privateWebView.props.onLoadStart({
+        nativeEvent: { loading: false },
+      });
+      jest.advanceTimersByTime(35_000);
+    });
+
+    expect(mockStopLoading).not.toHaveBeenCalled();
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props
+        .accessibilityState,
+    ).toEqual({ busy: false });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('gives overlapping same-site navigation a fresh watchdog and ignores a late completion', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const privateWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    ReactTestRenderer.act(() => {
+      privateWebView.props.onLoadStart({
+        nativeEvent: { loading: true, url: 'https://example.com/first' },
+      });
+      jest.advanceTimersByTime(30_000);
+      privateWebView.props.onLoadStart({
+        nativeEvent: { loading: true, url: 'https://example.com/second' },
+      });
+      // Cross the first document's old deadline. The new document must retain
+      // its own full watchdog window.
+      jest.advanceTimersByTime(10_000);
+    });
+
+    expect(mockStopLoading).not.toHaveBeenCalled();
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props
+        .accessibilityState,
+    ).toEqual({ busy: true });
+
+    ReactTestRenderer.act(() => {
+      privateWebView.props.onLoadEnd({
+        nativeEvent: { url: 'https://example.com/first' },
+      });
+    });
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props
+        .accessibilityState,
+    ).toEqual({ busy: true });
+
+    ReactTestRenderer.act(() => {
+      privateWebView.props.onLoad({
+        nativeEvent: { url: 'https://example.com/second' },
+      });
+      jest.advanceTimersByTime(40_000);
+    });
+    expect(mockStopLoading).not.toHaveBeenCalled();
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props,
+    ).toMatchObject({
+      accessibilityState: { busy: false },
+      accessibilityValue: { text: expect.stringContaining('completed') },
+    });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('cancels the old load before a profile switch and gives the new load a fresh watchdog', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    let resolveSecondSite!: (
+      value: Awaited<ReturnType<typeof masqCore.getBrowserSiteSettings>>,
+    ) => void;
+    jest
+      .spyOn(masqCore, 'getBrowserSiteSettings')
+      .mockImplementation(async (mode, hostname) => {
+        if (hostname === 'second.example') {
+          return new Promise(resolve => {
+            resolveSecondSite = resolve;
+          });
+        }
+        return {
+          hostname,
+          mode,
+          persistentSessionsSupported: true,
+          protectionDisabled: false,
+          rememberSignIn: false,
+        };
+      });
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('first.example'));
+    await submitAddress(address);
+    const firstWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    ReactTestRenderer.act(() => {
+      firstWebView.props.onLoadStart();
+      jest.advanceTimersByTime(20_000);
+      address.props.onChangeText('second.example');
+    });
+    await ReactTestRenderer.act(async () => {
+      address.props.onSubmitEditing();
+      await Promise.resolve();
+    });
+
+    expect(mockStopLoading).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findAllByProps({ testID: 'private-webview' }),
+    ).toHaveLength(0);
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props,
+    ).toMatchObject({
+      accessibilityState: { busy: false },
+      accessibilityValue: {
+        text: expect.stringContaining('cancelled'),
+      },
+    });
+
+    await ReactTestRenderer.act(async () => {
+      resolveSecondSite({
+        hostname: 'second.example',
+        mode: 'masq',
+        persistentSessionsSupported: true,
+        protectionDisabled: false,
+        rememberSignIn: false,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const secondWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+    ReactTestRenderer.act(() => {
+      secondWebView.props.onLoadStart();
+      // The original load's 35-second deadline has passed, but the new load
+      // has used only 20 seconds of its own independent deadline.
+      jest.advanceTimersByTime(20_000);
+    });
+    expect(mockStopLoading).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props
+        .accessibilityState,
+    ).toEqual({ busy: true });
+
+    ReactTestRenderer.act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(mockStopLoading).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The page did not finish loading through MASQ in time.',
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('stops an Android load and clears only temporary browser caches before close', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    const onClose = jest.fn().mockResolvedValue(undefined);
+    const renderer = await renderBrowser('masq', onClose);
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const close = renderer.root.findByProps({
+      accessibilityLabel: 'Close private browser',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      close.props.onPress();
+      await waitForBrowserCloseFrame();
+    });
+
+    expect(mockStopLoading).toHaveBeenCalled();
+    expect(mockClearCache).toHaveBeenCalledWith(true);
+    expect(mockClearFormData).toHaveBeenCalled();
+    expect(mockClearHistory).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledWith('user');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not erase an explicitly remembered Android site during browser close', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    jest.spyOn(masqCore, 'getBrowserSiteSettings').mockResolvedValue({
+      hostname: 'example.com',
+      mode: 'masq',
+      persistentSessionsSupported: true,
+      protectionDisabled: false,
+      rememberSignIn: true,
+    });
+    const onClose = jest.fn().mockResolvedValue(undefined);
+    const renderer = await renderBrowser('masq', onClose);
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+
+    await ReactTestRenderer.act(async () => {
+      renderer.root
+        .findByProps({ accessibilityLabel: 'Close private browser' })
+        .props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(mockStopLoading).toHaveBeenCalled();
+    expect(mockClearCache).not.toHaveBeenCalled();
+    expect(mockClearFormData).not.toHaveBeenCalled();
+    expect(mockClearHistory).not.toHaveBeenCalled();
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -716,6 +1051,7 @@ describe('BrowserScreen recovery lifecycle', () => {
   });
 
   it('persists a toggle through native code and remounts the active page', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
     const renderer = await renderBrowser();
     expandProtectionSettings(renderer);
     const address = renderer.root.findByType(TextInput);
@@ -749,6 +1085,64 @@ describe('BrowserScreen recovery lifecycle', () => {
     });
     expect(remountedWebView.props.injectedJavaScript).not.toContain(
       '[data-ad-slot]',
+    );
+    expect(remountedWebView.props.androidBlockedResourceHosts).toEqual([]);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('stops an active load before a protection remount and starts a fresh watchdog', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    const renderer = await renderBrowser();
+    expandProtectionSettings(renderer);
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const firstWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+
+    ReactTestRenderer.act(() => {
+      firstWebView.props.onLoadStart();
+      jest.advanceTimersByTime(20_000);
+    });
+    await ReactTestRenderer.act(async () => {
+      findProtectionToggle(renderer, 'Ads & trackers').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockStopLoading).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props,
+    ).toMatchObject({
+      accessibilityState: { busy: false },
+      accessibilityValue: {
+        text: expect.stringContaining('cancelled'),
+      },
+    });
+    const remountedWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+    expect(remountedWebView).not.toBe(firstWebView);
+
+    ReactTestRenderer.act(() => {
+      remountedWebView.props.onLoadStart();
+      // Passing the first load's old deadline must not stop this new request.
+      jest.advanceTimersByTime(20_000);
+    });
+    expect(mockStopLoading).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findByProps({ testID: 'browser-load-status' }).props
+        .accessibilityState,
+    ).toEqual({ busy: true });
+
+    ReactTestRenderer.act(() => {
+      jest.advanceTimersByTime(15_000);
+    });
+    expect(mockStopLoading).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The page did not finish loading through MASQ in time.',
     );
     ReactTestRenderer.act(() => renderer.unmount());
   });
@@ -829,6 +1223,60 @@ describe('BrowserScreen recovery lifecycle', () => {
     ).toMatchObject({
       cacheEnabled: true,
     });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('unmounts the Android WebView before deleting site profiles', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    const remembered = {
+      hostname: 'example.com',
+      mode: 'masq' as const,
+      persistentSessionsSupported: true,
+      protectionDisabled: false,
+      rememberSignIn: true,
+    };
+    jest
+      .spyOn(masqCore, 'getBrowserSiteSettings')
+      .mockResolvedValue(remembered);
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    const clearSite = jest
+      .spyOn(masqCore, 'clearBrowserSiteData')
+      .mockImplementation(async () => {
+        expect(
+          renderer.root.findAllByProps({ testID: 'private-webview' }),
+        ).toHaveLength(0);
+        return { ...remembered, rememberSignIn: false };
+      });
+    const clearAll = jest
+      .spyOn(masqCore, 'clearRememberedBrowserData')
+      .mockImplementation(async () => {
+        expect(
+          renderer.root.findAllByProps({ testID: 'private-webview' }),
+        ).toHaveLength(0);
+      });
+    renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    expandProtectionSettings(renderer);
+
+    await ReactTestRenderer.act(async () => {
+      renderer.root
+        .findByProps({ accessibilityLabel: 'Forget data for this site' })
+        .props.onPress();
+      await waitForBrowserCloseFrame();
+      await Promise.resolve();
+    });
+    expect(clearSite).toHaveBeenCalledWith('masq', 'example.com');
+
+    await ReactTestRenderer.act(async () => {
+      renderer.root
+        .findByProps({ accessibilityLabel: 'Clear all remembered sign-ins' })
+        .props.onPress();
+      await waitForBrowserCloseFrame();
+      await Promise.resolve();
+    });
+    expect(clearAll).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -1034,11 +1482,16 @@ describe('BrowserScreen recovery lifecycle', () => {
 async function renderBrowser(
   mode: 'masq' | 'direct' = 'masq',
   onClose: (reason?: 'user' | 'background') => Promise<void> | void = jest.fn(),
+  onRepairRoute: () => Promise<void> = () => Promise.resolve(),
 ) {
   let renderer!: ReactTestRenderer.ReactTestRenderer;
   await ReactTestRenderer.act(async () => {
     renderer = ReactTestRenderer.create(
-      <BrowserScreen mode={mode} onClose={onClose} />,
+      <BrowserScreen
+        mode={mode}
+        onClose={onClose}
+        onRepairRoute={onRepairRoute}
+      />,
     );
     await Promise.resolve();
     await Promise.resolve();

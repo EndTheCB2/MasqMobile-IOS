@@ -15,8 +15,12 @@ import {
   type NetworkStatus,
 } from '../src/core/types';
 import {
+  automaticReconnectDelayMs,
+  isNativeMasqRecoveryInProgress,
+  NATIVE_RECOVERY_OBSERVATION_MS,
   PROFILE_NOT_READY_MESSAGE,
   PROFILE_RECOVERY_NOT_AVAILABLE_MESSAGE,
+  shouldAutomaticallyRetryMasqIssue,
   useMasqController,
 } from '../src/hooks/useMasqController';
 
@@ -40,6 +44,15 @@ const SAVED_PROFILE: MasqConfig = {
   minHops: 5,
   exitCountry: 'BE',
   exitCountryFallback: false,
+};
+
+const REFRESHED_PROFILE: MasqConfig = {
+  ...SAVED_PROFILE,
+  neighbors: [
+    'masq://base-mainnet:key-three@198.51.100.12:443',
+    'masq://base-mainnet:key-four@198.51.100.13:443',
+    'masq://base-mainnet:key-five@198.51.100.14:443',
+  ],
 };
 
 const CONFIGURED_STATUS: CoreStatus = {
@@ -835,6 +848,476 @@ describe('useMasqController entry-node connection lifecycle', () => {
     Object.assign(AppState, { currentState: INITIAL_APP_STATE });
   });
 
+  it('bounds automatic reconnect backoff', () => {
+    expect([1, 2, 3, 4, 99].map(automaticReconnectDelayMs)).toEqual([
+      2_000, 5_000, 15_000, 30_000, 30_000,
+    ]);
+  });
+
+  it('automatically retries only issues with an explicit retry action', () => {
+    const issue = (
+      action: 'retry' | 'wallet' | 'network-profile' | 'none',
+    ) => ({
+      action,
+      category: 'unknown' as const,
+      code: null,
+      message: 'Safe test diagnostic.',
+    });
+
+    expect(shouldAutomaticallyRetryMasqIssue(issue('retry'))).toBe(true);
+    expect(shouldAutomaticallyRetryMasqIssue(issue('wallet'))).toBe(false);
+    expect(shouldAutomaticallyRetryMasqIssue(issue('network-profile'))).toBe(
+      false,
+    );
+    expect(shouldAutomaticallyRetryMasqIssue(issue('none'))).toBe(false);
+    expect(shouldAutomaticallyRetryMasqIssue(null)).toBe(false);
+  });
+
+  it('recognizes native route progress without hiding a terminal stage-one error', () => {
+    const stageOne: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 70,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+
+    expect(isNativeMasqRecoveryInProgress(stageOne)).toBe(true);
+    expect(
+      isNativeMasqRecoveryInProgress({
+        ...stageOne,
+        lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+      }),
+    ).toBe(false);
+    expect(
+      isNativeMasqRecoveryInProgress({
+        ...stageOne,
+        engineGeneration: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it('observes native stage-one recovery after wifi returns before starting another engine', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const offline: NetworkStatus = {
+      ...NETWORK,
+      available: false,
+      generation: 40,
+    };
+    const restored: NetworkStatus = { ...NETWORK, generation: 41 };
+    const nativeProgress: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 90,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    const terminalStageOne: CoreStatus = {
+      ...nativeProgress,
+      lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+    };
+    const recovered: CoreStatus = {
+      ...nativeProgress,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    let observedNetwork = offline;
+    let observedStatus = nativeProgress;
+    jest
+      .mocked(masqCore.getNetworkStatus)
+      .mockImplementation(() => Promise.resolve(observedNetwork));
+    jest
+      .mocked(masqCore.getStatus)
+      .mockImplementation(() => Promise.resolve(observedStatus));
+    const start = jest.spyOn(masqCore, 'start').mockResolvedValue(recovered);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    observedNetwork = restored;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).not.toHaveBeenCalled();
+    expect(current.status).toEqual(nativeProgress);
+
+    observedStatus = terminalStageOne;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('reserves a new wifi generation while native status still briefly reports ready', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    let appStateListener!: (state: AppStateStatus) => void;
+    jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_type, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      });
+    const offline: NetworkStatus = {
+      ...NETWORK,
+      available: false,
+      generation: 50,
+    };
+    const restored: NetworkStatus = { ...NETWORK, generation: 51 };
+    const priorRoute: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 92,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    const nativeProgress: CoreStatus = {
+      ...priorRoute,
+      engineGeneration: 93,
+      phase: 'connecting',
+    };
+    let observedNetwork = offline;
+    let observedStatus = priorRoute;
+    jest
+      .mocked(masqCore.getNetworkStatus)
+      .mockImplementation(() => Promise.resolve(observedNetwork));
+    jest
+      .mocked(masqCore.getStatus)
+      .mockImplementation(() => Promise.resolve(observedStatus));
+    const start = jest.spyOn(masqCore, 'start');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    observedNetwork = restored;
+    observedStatus = CONFIGURED_STATUS;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).not.toHaveBeenCalled();
+
+    expect(47).toBeLessThan(NATIVE_RECOVERY_OBSERVATION_MS);
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(47);
+      appStateListener('active');
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).not.toHaveBeenCalled();
+
+    observedStatus = nativeProgress;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).not.toHaveBeenCalled();
+    expect(current.status).toEqual(nativeProgress);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not queue foreground recovery behind the wifi recovery flight', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    let appStateListener!: (state: AppStateStatus) => void;
+    jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_type, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      });
+    const awaitingRoute: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 91,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    const terminalStageOne: CoreStatus = {
+      ...awaitingRoute,
+      lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+    };
+    const recovered: CoreStatus = {
+      ...awaitingRoute,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    jest
+      .mocked(masqCore.getStatus)
+      .mockResolvedValueOnce(awaitingRoute)
+      .mockResolvedValue(terminalStageOne);
+    const pendingStart = deferred<CoreStatus>();
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockReturnValueOnce(pendingStart.promise)
+      .mockResolvedValueOnce(recovered);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    ReactTestRenderer.act(() => appStateListener('active'));
+    await ReactTestRenderer.act(async () => {
+      pendingStart.reject(
+        Object.assign(new Error('Transient native startup failure.'), {
+          code: 'E_CORE_STARTUP_FAILED',
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(1_999);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('preserves recovery intent after a transient automatic reconnect failure', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const awaitingRoute: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 71,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    const recovered: CoreStatus = {
+      ...awaitingRoute,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    jest
+      .spyOn(masqCore, 'getStatus')
+      .mockResolvedValueOnce(awaitingRoute)
+      .mockResolvedValue({
+        ...awaitingRoute,
+        lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+      });
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Transient native startup failure.'), {
+          code: 'E_CORE_STARTUP_FAILED',
+        }),
+      )
+      .mockResolvedValueOnce(recovered);
+    const shutdown = jest
+      .spyOn(masqCore, 'shutdown')
+      .mockResolvedValue(CONFIGURED_STATUS);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('stops background retries when the wallet requires user attention', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const awaitingRoute: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 72,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    jest
+      .spyOn(masqCore, 'getStatus')
+      .mockResolvedValueOnce(awaitingRoute)
+      .mockResolvedValue({
+        ...awaitingRoute,
+        lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+      });
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValue(
+        new Error('The consumer wallet keystore requires attention.'),
+      );
+    const shutdown = jest
+      .spyOn(masqCore, 'shutdown')
+      .mockResolvedValue(CONFIGURED_STATUS);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(current.issue).toMatchObject({
+      action: 'wallet',
+      category: 'wallet',
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('coalesces a manual waiter without cancelling automatic recovery intent', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const awaitingRoute: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 73,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+    };
+    const recovered: CoreStatus = {
+      ...awaitingRoute,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    jest
+      .spyOn(masqCore, 'getStatus')
+      .mockResolvedValueOnce(awaitingRoute)
+      .mockResolvedValue({
+        ...awaitingRoute,
+        lastError: 'E_ENTRY_NO_INBOUND_BYTES: no peer reply',
+      });
+    const pendingStart = deferred<CoreStatus>();
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockReturnValueOnce(pendingStart.promise)
+      .mockResolvedValueOnce(recovered);
+    const shutdown = jest
+      .spyOn(masqCore, 'shutdown')
+      .mockResolvedValue(CONFIGURED_STATUS);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    let manualConnect!: Promise<CoreStatus>;
+    await ReactTestRenderer.act(async () => {
+      manualConnect = current.connect();
+      await Promise.resolve();
+      pendingStart.reject(
+        Object.assign(new Error('Transient native startup failure.'), {
+          code: 'E_CORE_STARTUP_FAILED',
+        }),
+      );
+      await manualConnect.catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('publishes attempt 1 before waiting for a long native start', async () => {
     const pendingStart = deferred<CoreStatus>();
     jest.spyOn(masqCore, 'start').mockReturnValue(pendingStart.promise);
@@ -851,20 +1334,24 @@ describe('useMasqController entry-node connection lifecycle', () => {
     expect(current.status.phase).toBe('connecting');
     expect(current.entryNodeRefresh).toEqual({
       attempt: 1,
-      maxAttempts: 6,
+      maxAttempts: 3,
       stage: 'discovery',
     });
     expect(current.connectionProgress).toEqual({
       step: 2,
       total: 5,
-      label: 'Finding reachable entry nodes (1/6)',
+      label: 'Finding reachable entry nodes (1/3)',
     });
 
     await ReactTestRenderer.act(async () => {
       pendingStart.resolve({
         ...CONFIGURED_STATUS,
         connectedNeighbors: 1,
+        engineGeneration: 74,
         phase: 'connected',
+        proxyPort: 44_443,
+        routeHops: 3,
+        routeStage: 2,
       });
       await connection;
     });
@@ -906,7 +1393,7 @@ describe('useMasqController entry-node connection lifecycle', () => {
     expect(current.status.phase).toBe('connecting');
     expect(current.entryNodeRefresh).toEqual({
       attempt: 2,
-      maxAttempts: 6,
+      maxAttempts: 3,
       stage: 'discovery',
     });
 
@@ -914,11 +1401,280 @@ describe('useMasqController entry-node connection lifecycle', () => {
       pendingSecondStart.resolve({
         ...CONFIGURED_STATUS,
         connectedNeighbors: 1,
+        engineGeneration: 75,
         phase: 'connected',
+        proxyPort: 44_443,
+        routeHops: 3,
+        routeStage: 2,
       });
       await connection;
     });
     expect(current.entryNodeRefresh).toBeNull();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('retries a foreground network handover without shutting down service recovery', async () => {
+    jest.useFakeTimers();
+    const recovered: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 76,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Safe network handover diagnostic.'), {
+          code: 'E_NETWORK_HANDOVER_RETRY',
+        }),
+      )
+      .mockResolvedValueOnce(recovered);
+    const shutdown = jest.spyOn(masqCore, 'shutdown');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let connection!: Promise<CoreStatus>;
+
+    await ReactTestRenderer.act(async () => {
+      connection = current.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(1_500);
+      await connection;
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('preserves handover recovery while offline and reconnects when the network returns', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const offline: NetworkStatus = {
+      ...NETWORK,
+      available: false,
+      generation: 2,
+    };
+    const restored: NetworkStatus = { ...NETWORK, generation: 3 };
+    let observedNetwork = offline;
+    jest
+      .mocked(masqCore.getNetworkStatus)
+      .mockImplementation(() => Promise.resolve(observedNetwork));
+    const recovered: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 77,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    const handoverError = Object.assign(
+      new Error('Safe network handover diagnostic.'),
+      { code: 'E_NETWORK_HANDOVER_RETRY' },
+    );
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(handoverError)
+      .mockRejectedValueOnce(handoverError)
+      .mockRejectedValueOnce(handoverError)
+      .mockResolvedValueOnce(recovered);
+    const shutdown = jest.spyOn(masqCore, 'shutdown');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+    let connection!: Promise<unknown>;
+
+    await ReactTestRenderer.act(async () => {
+      connection = current.connect().catch(error => error);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(1_500);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(3_000);
+      await connection;
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(3);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.issue).toMatchObject({ category: 'offline' });
+
+    observedNetwork = restored;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(3);
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(4);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('preserves a manual retry intent while offline and resumes on network restoration', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const offline: NetworkStatus = {
+      ...NETWORK,
+      available: false,
+      generation: 8,
+    };
+    const restored: NetworkStatus = { ...NETWORK, generation: 9 };
+    let observedNetwork = offline;
+    jest
+      .mocked(masqCore.getNetworkStatus)
+      .mockImplementation(() => Promise.resolve(observedNetwork));
+    const recovered: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 79,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Transient native startup failure.'), {
+          code: 'E_CORE_STARTUP_FAILED',
+        }),
+      )
+      .mockResolvedValueOnce(recovered);
+    const shutdown = jest.spyOn(masqCore, 'shutdown');
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      await current.connect().catch(() => undefined);
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.issue).toMatchObject({ category: 'offline' });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start).toHaveBeenCalledTimes(1);
+
+    observedNetwork = restored;
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('cancels the preserved retry intent when the user disconnects during backoff', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
+    const start = jest.spyOn(masqCore, 'start').mockRejectedValueOnce(
+      Object.assign(new Error('Transient native startup failure.'), {
+        code: 'E_CORE_STARTUP_FAILED',
+      }),
+    );
+    jest
+      .spyOn(masqCore, 'setBrowserRoutingMode')
+      .mockResolvedValue('blocked');
+    jest.spyOn(masqCore, 'stop').mockResolvedValue(CONFIGURED_STATUS);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      await current.connect().catch(() => undefined);
+      await current.disconnect();
+    });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(1);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('synchronizes refreshed native entry nodes after a successful connection', async () => {
+    jest
+      .mocked(masqCore.getSavedConfiguration)
+      .mockResolvedValueOnce(SAVED_PROFILE)
+      .mockResolvedValueOnce(REFRESHED_PROFILE);
+    const connected: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 80,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    jest.spyOn(masqCore, 'start').mockResolvedValue(connected);
+    const renderer = await renderController(value => {
+      current = value;
+    });
+
+    await ReactTestRenderer.act(async () => {
+      await current.connect();
+    });
+
+    expect(masqCore.getSavedConfiguration).toHaveBeenCalledTimes(2);
+    expect(current.draft).toMatchObject({
+      ...REFRESHED_PROFILE,
+      neighbors: REFRESHED_PROFILE.neighbors,
+      walletSecret: '',
+    });
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -934,8 +1690,11 @@ describe('useMasqController entry-node connection lifecycle', () => {
     const connectedStatus: CoreStatus = {
       ...CONFIGURED_STATUS,
       connectedNeighbors: 1,
+      engineGeneration: 78,
       phase: 'connected',
-      routeStage: 1,
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
     };
     jest
       .mocked(masqCore.getStatus)
@@ -945,10 +1704,7 @@ describe('useMasqController entry-node connection lifecycle', () => {
       .spyOn(masqCore, 'start')
       .mockImplementationOnce(() => firstNativeStart.promise);
     const shutdown = jest.spyOn(masqCore, 'shutdown');
-    const setBrowserRoutingMode = jest.spyOn(
-      masqCore,
-      'setBrowserRoutingMode',
-    );
+    const setBrowserRoutingMode = jest.spyOn(masqCore, 'setBrowserRoutingMode');
     const reset = jest.spyOn(masqCore, 'reset');
     const resetNetworkProfile = jest.spyOn(masqCore, 'resetNetworkProfile');
     const removeWallet = jest.spyOn(masqCore, 'removeWallet');
@@ -1001,12 +1757,26 @@ describe('useMasqController entry-node connection lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('shuts down a failed start without resetting the wallet or profile', async () => {
+  it('keeps a retryable failed manual start alive without resetting the wallet or profile', async () => {
+    jest.useFakeTimers();
+    Object.assign(AppState, { currentState: 'active' });
     const startupError = Object.assign(
       new Error('The embedded MASQ core could not start.'),
       { code: 'E_CORE_STARTUP_FAILED' },
     );
-    jest.spyOn(masqCore, 'start').mockRejectedValue(startupError);
+    const recovered: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 81,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    const start = jest
+      .spyOn(masqCore, 'start')
+      .mockRejectedValueOnce(startupError)
+      .mockResolvedValueOnce(recovered);
     const shutdown = jest
       .spyOn(masqCore, 'shutdown')
       .mockResolvedValue({ ...CONFIGURED_STATUS });
@@ -1027,7 +1797,7 @@ describe('useMasqController entry-node connection lifecycle', () => {
     });
 
     expect(caught).toBe(startupError);
-    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(shutdown).not.toHaveBeenCalled();
     expect(reset).not.toHaveBeenCalled();
     expect(resetNetworkProfile).not.toHaveBeenCalled();
     expect(removeWallet).not.toHaveBeenCalled();
@@ -1042,6 +1812,18 @@ describe('useMasqController entry-node connection lifecycle', () => {
       category: 'native-core',
       code: 'E_CORE_STARTUP_FAILED',
     });
+
+    await ReactTestRenderer.act(async () => {
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(current.status).toEqual(recovered);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });
@@ -1065,8 +1847,10 @@ async function renderController(
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(fulfill => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((fulfill, fail) => {
     resolve = fulfill;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }

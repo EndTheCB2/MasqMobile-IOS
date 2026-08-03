@@ -19,6 +19,7 @@ char *masq_mobile_reset(void);
 char *masq_mobile_reset_network_profile(void);
 char *masq_mobile_remove_wallet(void);
 char *masq_mobile_preflight_proxy(void);
+char *masq_mobile_refresh_route_proof(void);
 char *masq_mobile_set_proxy_enabled(bool enabled);
 char *masq_mobile_get_debt_summary(void);
 char *masq_mobile_prepare_debt_settlement(void);

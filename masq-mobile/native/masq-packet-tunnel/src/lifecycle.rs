@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use tun2proxy::CancellationToken;
+use tun2proxy::{CancellationToken, SessionMetrics};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TunnelState {
@@ -47,6 +47,31 @@ pub(crate) struct LifecycleSnapshot {
     pub(crate) last_result: Option<LastResult>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeTunnelSnapshot {
+    pub(crate) lifecycle: LifecycleSnapshot,
+    pub(crate) traffic_observed: bool,
+    pub(crate) session_metrics: SessionMetrics,
+    pub(crate) payload_tx_bytes: u64,
+    pub(crate) payload_rx_bytes: u64,
+}
+
+impl Default for NativeTunnelSnapshot {
+    fn default() -> Self {
+        Self {
+            lifecycle: LifecycleSnapshot {
+                state: TunnelState::Idle,
+                generation: 0,
+                last_result: None,
+            },
+            traffic_observed: false,
+            session_metrics: SessionMetrics::default(),
+            payload_tx_bytes: 0,
+            payload_rx_bytes: 0,
+        }
+    }
+}
+
 impl LifecycleSnapshot {
     pub(crate) fn to_json(self) -> String {
         let last_result = self
@@ -86,10 +111,18 @@ struct ActiveSession {
     cancellation: CancellationToken,
 }
 
+struct GenerationObservability {
+    generation: u64,
+    metrics_ready: bool,
+    payload_tx_bytes: u64,
+    payload_rx_bytes: u64,
+}
+
 struct Lifecycle {
     generation: u64,
     state: TunnelState,
     active: Option<ActiveSession>,
+    observability: Option<GenerationObservability>,
     last_result: Option<LastResult>,
 }
 
@@ -99,6 +132,7 @@ impl Default for Lifecycle {
             generation: 0,
             state: TunnelState::Idle,
             active: None,
+            observability: None,
             last_result: None,
         }
     }
@@ -135,6 +169,15 @@ impl LifecycleController {
             generation,
             cancellation,
         });
+        // Reset the generation tag atomically with STARTING. tun2proxy resets
+        // its own session counters during the first worker poll; metrics stay
+        // hidden until mark_running confirms that initialization completed.
+        lifecycle.observability = Some(GenerationObservability {
+            generation,
+            metrics_ready: false,
+            payload_tx_bytes: 0,
+            payload_rx_bytes: 0,
+        });
         lifecycle.last_result = None;
         Ok(generation)
     }
@@ -154,7 +197,48 @@ impl LifecycleController {
         if lifecycle.state != TunnelState::Starting {
             return false;
         }
+        let Some(observability) = lifecycle
+            .observability
+            .as_mut()
+            .filter(|observability| observability.generation == generation)
+        else {
+            return false;
+        };
+        // The caller marks the worker running only after tun2proxy's first
+        // poll reset all generation-local session counters. Publishing this
+        // tag and RUNNING under one lock prevents stale metrics from becoming
+        // visible as counters for the new generation.
+        observability.metrics_ready = true;
         lifecycle.state = TunnelState::Running;
+        true
+    }
+
+    pub(crate) fn record_payload(&self, generation: u64, tx: u64, rx: u64) -> bool {
+        if tx == 0 && rx == 0 {
+            return false;
+        }
+        let mut lifecycle = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches_active_generation = lifecycle
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation);
+        if !matches_active_generation {
+            return false;
+        }
+        let Some(observability) = lifecycle
+            .observability
+            .as_mut()
+            .filter(|observability| observability.generation == generation)
+        else {
+            return false;
+        };
+        // The callback supplies generation-local cumulative totals. max is a
+        // defensive fence against any stale or duplicated callback delivery.
+        observability.payload_tx_bytes = observability.payload_tx_bytes.max(tx);
+        observability.payload_rx_bytes = observability.payload_rx_bytes.max(rx);
         true
     }
 
@@ -194,6 +278,7 @@ impl LifecycleController {
             lifecycle.state == TunnelState::Stopping || active.cancellation.is_cancelled();
 
         lifecycle.active = None;
+        lifecycle.observability = None;
         if stop_requested {
             lifecycle.state = TunnelState::Idle;
             lifecycle.last_result = Some(LastResult::Stopped);
@@ -213,6 +298,7 @@ impl LifecycleController {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> LifecycleSnapshot {
         let lifecycle = self
             .inner
@@ -224,12 +310,58 @@ impl LifecycleController {
             last_result: lifecycle.last_result,
         }
     }
+
+    pub(crate) fn native_snapshot<F>(&self, session_metrics_snapshot: F) -> NativeTunnelSnapshot
+    where
+        F: FnOnce() -> SessionMetrics,
+    {
+        let lifecycle = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lifecycle_snapshot = LifecycleSnapshot {
+            state: lifecycle.state,
+            generation: lifecycle.generation,
+            last_result: lifecycle.last_result,
+        };
+        let current_observability = lifecycle.observability.as_ref().filter(|observability| {
+            observability.generation == lifecycle.generation
+                && observability.metrics_ready
+                && lifecycle
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.generation == observability.generation)
+                && matches!(
+                    lifecycle.state,
+                    TunnelState::Running | TunnelState::Stopping
+                )
+        });
+        let Some(observability) = current_observability else {
+            return NativeTunnelSnapshot {
+                lifecycle: lifecycle_snapshot,
+                ..NativeTunnelSnapshot::default()
+            };
+        };
+
+        // Evaluate the external atomic counters while the lifecycle lock is
+        // held. A completion/new begin cannot cross this read, and a new
+        // tun2proxy generation cannot reset its counters until begin returns.
+        NativeTunnelSnapshot {
+            lifecycle: lifecycle_snapshot,
+            traffic_observed: observability.payload_tx_bytes > 0
+                || observability.payload_rx_bytes > 0,
+            session_metrics: session_metrics_snapshot(),
+            payload_tx_bytes: observability.payload_tx_bytes,
+            payload_rx_bytes: observability.payload_rx_bytes,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, mpsc::sync_channel};
+    use std::sync::{Arc, Barrier, mpsc, mpsc::sync_channel};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -386,5 +518,117 @@ mod tests {
             controller.snapshot().to_json(),
             format!(r#"{{"state":"starting","generation":{generation},"lastResult":null}}"#)
         );
+    }
+
+    #[test]
+    fn metrics_and_payload_are_exposed_only_for_the_tagged_running_generation() {
+        let controller = LifecycleController::default();
+        let first_generation = controller.begin(CancellationToken::new()).unwrap();
+        assert!(controller.record_payload(first_generation, 17, 0));
+
+        let starting =
+            controller.native_snapshot(|| panic!("STARTING must not read old session metrics"));
+        assert_eq!(starting.lifecycle.state, TunnelState::Starting);
+        assert_eq!(starting.lifecycle.generation, first_generation);
+        assert_eq!(starting.session_metrics, SessionMetrics::default());
+        assert!(!starting.traffic_observed);
+
+        assert!(controller.mark_running(first_generation));
+        assert!(controller.record_payload(first_generation, 17, 29));
+        let first = controller.native_snapshot(|| SessionMetrics {
+            session_capacity: 256,
+            active_sessions: 2,
+            ..SessionMetrics::default()
+        });
+        assert_eq!(first.lifecycle.generation, first_generation);
+        assert_eq!(first.session_metrics.active_sessions, 2);
+        assert_eq!(first.payload_tx_bytes, 17);
+        assert_eq!(first.payload_rx_bytes, 29);
+        assert!(first.traffic_observed);
+
+        assert_eq!(
+            controller.complete(first_generation, RunCompletion::Failed),
+            CompletionOutcome::Failed
+        );
+        let second_generation = controller.begin(CancellationToken::new()).unwrap();
+        assert_eq!(second_generation, first_generation + 1);
+        assert!(!controller.record_payload(first_generation, 999, 999));
+        assert!(controller.mark_running(second_generation));
+
+        let second = controller.native_snapshot(|| SessionMetrics {
+            session_capacity: 256,
+            active_sessions: 1,
+            ..SessionMetrics::default()
+        });
+        assert_eq!(second.lifecycle.generation, second_generation);
+        assert_eq!(second.session_metrics.active_sessions, 1);
+        assert!(!second.traffic_observed);
+        assert_eq!(second.payload_tx_bytes, 0);
+        assert_eq!(second.payload_rx_bytes, 0);
+    }
+
+    #[test]
+    fn lifecycle_transition_cannot_cross_a_generation_tagged_metrics_snapshot() {
+        let controller = Arc::new(LifecycleController::default());
+        let first_generation = controller.begin(CancellationToken::new()).unwrap();
+        assert!(controller.mark_running(first_generation));
+        assert!(controller.record_payload(first_generation, 10, 20));
+
+        let (snapshot_entered_tx, snapshot_entered_rx) = sync_channel(0);
+        let (release_snapshot_tx, release_snapshot_rx) = sync_channel(0);
+        let reader_controller = Arc::clone(&controller);
+        let reader = thread::spawn(move || {
+            reader_controller.native_snapshot(|| {
+                snapshot_entered_tx.send(()).unwrap();
+                release_snapshot_rx.recv().unwrap();
+                SessionMetrics {
+                    session_capacity: 256,
+                    active_sessions: 3,
+                    ..SessionMetrics::default()
+                }
+            })
+        });
+        snapshot_entered_rx.recv().unwrap();
+
+        let (transition_attempted_tx, transition_attempted_rx) = sync_channel(0);
+        let (transition_done_tx, transition_done_rx) = mpsc::channel();
+        let writer_controller = Arc::clone(&controller);
+        let writer = thread::spawn(move || {
+            transition_attempted_tx.send(()).unwrap();
+            assert_eq!(
+                writer_controller.complete(first_generation, RunCompletion::Failed),
+                CompletionOutcome::Failed
+            );
+            let next_generation = writer_controller.begin(CancellationToken::new()).unwrap();
+            assert!(writer_controller.mark_running(next_generation));
+            transition_done_tx.send(next_generation).unwrap();
+        });
+        transition_attempted_rx.recv().unwrap();
+        assert!(
+            transition_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
+        release_snapshot_tx.send(()).unwrap();
+        let first_snapshot = reader.join().unwrap();
+        assert_eq!(first_snapshot.lifecycle.generation, first_generation);
+        assert_eq!(first_snapshot.session_metrics.active_sessions, 3);
+        assert_eq!(first_snapshot.payload_tx_bytes, 10);
+        assert_eq!(first_snapshot.payload_rx_bytes, 20);
+
+        let second_generation = transition_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        writer.join().unwrap();
+        let second_snapshot = controller.native_snapshot(|| SessionMetrics {
+            session_capacity: 256,
+            active_sessions: 1,
+            ..SessionMetrics::default()
+        });
+        assert_eq!(second_snapshot.lifecycle.generation, second_generation);
+        assert_eq!(second_snapshot.session_metrics.active_sessions, 1);
+        assert_eq!(second_snapshot.payload_tx_bytes, 0);
+        assert_eq!(second_snapshot.payload_rx_bytes, 0);
     }
 }

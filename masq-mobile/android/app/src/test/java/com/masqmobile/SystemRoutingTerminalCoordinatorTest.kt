@@ -53,7 +53,10 @@ class SystemRoutingTerminalCoordinatorTest {
     val recreatedResult = recreatedServiceReset.get(2, TimeUnit.SECONDS)
 
     assertTrue(oldResult is TerminalLeaseCloseResult.Closed)
-    assertEquals(oldResult, recreatedResult)
+    assertTrue(
+        "A recreated cleanup either joins the exact close or observes that it already finished.",
+        recreatedResult == oldResult || recreatedResult == TerminalLeaseCloseResult.NoLease,
+    )
     assertEquals(1, descriptor.closeCount.get())
     assertNull(coordinator.snapshot())
   }

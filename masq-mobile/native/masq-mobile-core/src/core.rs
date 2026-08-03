@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -15,7 +16,7 @@ use crate::wallet::WalletMaterial;
 #[cfg(feature = "node-engine")]
 use node_lib::mobile_debt_settlement::PreparedDebtSettlement;
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum Phase {
@@ -42,6 +43,7 @@ pub struct CoreStatus<'a> {
     connected_neighbors: usize,
     route_stage: u8,
     route_hops: usize,
+    route_proof_generation: u64,
     min_hops: u8,
     exit_country: Option<&'a str>,
     exit_country_fallback: bool,
@@ -49,6 +51,65 @@ pub struct CoreStatus<'a> {
     bytes_up: u64,
     bytes_down: u64,
     last_error: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteProofRefreshOutcome {
+    attempted: bool,
+    succeeded: bool,
+    error_code: Option<&'static str>,
+}
+
+impl RouteProofRefreshOutcome {
+    const fn succeeded() -> Self {
+        Self {
+            attempted: true,
+            succeeded: true,
+            error_code: None,
+        }
+    }
+
+    const fn failed() -> Self {
+        Self {
+            attempted: true,
+            succeeded: false,
+            error_code: Some("E_PRIVATE_ROUTE_REFRESH_FAILED"),
+        }
+    }
+
+    const fn not_ready() -> Self {
+        Self {
+            attempted: false,
+            succeeded: false,
+            error_code: Some("E_PRIVATE_ROUTE_REFRESH_NOT_READY"),
+        }
+    }
+
+    #[cfg(not(feature = "node-engine"))]
+    const fn unavailable() -> Self {
+        Self {
+            attempted: false,
+            succeeded: false,
+            error_code: Some("E_PRIVATE_ROUTE_REFRESH_UNAVAILABLE"),
+        }
+    }
+}
+
+/// Exact process-local identity of the engine whose healthy route is being
+/// refreshed. The socket probe deliberately owns only this copy, never a
+/// borrow of `MobileCore`, so callers can release the global core mutex while
+/// waiting for CONNECT, TLS and the remote response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouteProofRefreshTicket {
+    engine_generation: u64,
+    proxy_port: u16,
+}
+
+impl RouteProofRefreshTicket {
+    pub(crate) const fn proxy_port(self) -> u16 {
+        self.proxy_port
+    }
 }
 
 #[cfg(feature = "node-engine")]
@@ -77,7 +138,9 @@ pub struct MobileCore {
     proxy_enabled: bool,
     proxy_port: Option<u16>,
     connected_neighbors: usize,
+    route_stage: u8,
     route_hops: usize,
+    route_proof_generation: u64,
     bytes_up: u64,
     bytes_down: u64,
     last_error: Option<String>,
@@ -98,7 +161,9 @@ impl Default for MobileCore {
             proxy_enabled: false,
             proxy_port: None,
             connected_neighbors: 0,
+            route_stage: 0,
             route_hops: 0,
+            route_proof_generation: 0,
             bytes_up: 0,
             bytes_down: 0,
             last_error: None,
@@ -126,9 +191,28 @@ impl MobileCore {
                 && current.exit_country == config.exit_country
                 && current.exit_country_fallback == config.exit_country_fallback
                 && current.data_directory == config.data_directory;
+            let entry_nodes_changed = current.neighbors != config.neighbors;
             if !only_entry_nodes_changed {
                 return self
                     .fail("Fully restart the app before changing the chain or blockchain RPC.");
+            }
+            if entry_retry_requires_fresh_runtime(
+                self.phase,
+                entry_nodes_changed,
+                self.last_error.as_deref(),
+            ) {
+                if !self.stop_engine_for_state_reset() {
+                    return Err(
+                        "The previous MASQ peer session could not be stopped for a safe retry."
+                            .to_owned(),
+                    );
+                }
+                self.proxy_enabled = false;
+                self.proxy_port = None;
+                self.connected_neighbors = 0;
+                self.route_stage = 0;
+                self.route_hops = 0;
+                self.route_proof_generation = 0;
             }
         }
         self.config = Some(config);
@@ -178,6 +262,7 @@ impl MobileCore {
             .as_mut()
             .expect("configuration checked above")
             .min_hops = min_hops;
+        self.route_stage = self.route_stage.min(1);
         self.route_hops = 0;
         self.last_error = None;
         self.available_exit_countries.clear();
@@ -213,7 +298,9 @@ impl MobileCore {
                         self.phase = Phase::Connecting;
                         self.proxy_enabled = false;
                         self.connected_neighbors = 0;
+                        self.route_stage = 0;
                         self.route_hops = 0;
+                        self.route_proof_generation = 0;
                         self.last_error = None;
                         self.refresh_engine_status();
                         return Ok(());
@@ -242,6 +329,8 @@ impl MobileCore {
         }
         self.phase = Phase::Connecting;
         self.proxy_enabled = false;
+        self.route_stage = 0;
+        self.route_proof_generation = 0;
         Ok(())
     }
 
@@ -263,7 +352,9 @@ impl MobileCore {
         self.proxy_enabled = false;
         self.proxy_port = None;
         self.connected_neighbors = 0;
+        self.route_stage = 0;
         self.route_hops = 0;
+        self.route_proof_generation = 0;
         self.last_error = None;
         self.available_exit_countries.clear();
     }
@@ -289,7 +380,9 @@ impl MobileCore {
         self.proxy_enabled = false;
         self.proxy_port = None;
         self.connected_neighbors = 0;
+        self.route_stage = 0;
         self.route_hops = 0;
+        self.route_proof_generation = 0;
         self.last_error = None;
         self.available_exit_countries.clear();
     }
@@ -312,7 +405,9 @@ impl MobileCore {
         self.proxy_enabled = false;
         self.proxy_port = None;
         self.connected_neighbors = 0;
+        self.route_stage = 0;
         self.route_hops = 0;
+        self.route_proof_generation = 0;
         self.last_error = None;
         self.available_exit_countries.clear();
     }
@@ -327,7 +422,9 @@ impl MobileCore {
         self.proxy_enabled = false;
         self.proxy_port = None;
         self.connected_neighbors = 0;
+        self.route_stage = 0;
         self.route_hops = 0;
+        self.route_proof_generation = 0;
         self.last_error = None;
         self.available_exit_countries.clear();
     }
@@ -349,19 +446,267 @@ impl MobileCore {
         }
     }
 
+    fn has_healthy_route_for_refresh(&self) -> bool {
+        matches!(self.phase, Phase::Connected)
+            && self.engine_generation > 0
+            && self.connected_neighbors > 0
+            && self.route_stage >= 2
+            && self.proxy_port.is_some()
+    }
+
+    fn current_route_proof_refresh_ticket(&self) -> Option<RouteProofRefreshTicket> {
+        self.has_healthy_route_for_refresh()
+            .then(|| RouteProofRefreshTicket {
+                engine_generation: self.engine_generation,
+                proxy_port: self
+                    .proxy_port
+                    .expect("a healthy route always has a local proxy port"),
+            })
+    }
+
+    /// Snapshots the precise engine identity for a scheduled route refresh.
+    /// The caller must drop its core lock immediately after this returns.
+    pub(crate) fn begin_route_proof_refresh(&mut self) -> Option<RouteProofRefreshTicket> {
+        self.refresh_engine_status();
+        self.current_route_proof_refresh_ticket()
+    }
+
+    fn route_proof_refresh_ticket_is_current(&self, ticket: RouteProofRefreshTicket) -> bool {
+        self.current_route_proof_refresh_ticket() == Some(ticket)
+    }
+
+    fn status_json_without_refresh(&self) -> String {
+        let status = CoreStatus {
+            phase: self.phase,
+            engine_available: engine_available(),
+            engine_generation: self.engine_generation,
+            proxy_enabled: self.proxy_enabled,
+            proxy_port: self.proxy_port,
+            chain: self.config.as_ref().map(|config| config.chain),
+            wallet_address: self.wallet.as_ref().map(WalletMaterial::address),
+            connected_neighbors: self.connected_neighbors,
+            route_stage: self.route_stage,
+            route_hops: self.route_hops,
+            route_proof_generation: self.route_proof_generation,
+            min_hops: self
+                .config
+                .as_ref()
+                .map(|config| config.min_hops)
+                .unwrap_or(1),
+            exit_country: self
+                .config
+                .as_ref()
+                .and_then(|config| config.exit_country.as_deref()),
+            exit_country_fallback: self
+                .config
+                .as_ref()
+                .map(|config| config.exit_country_fallback)
+                .unwrap_or(true),
+            available_exit_countries: &self.available_exit_countries,
+            bytes_up: self.bytes_up,
+            bytes_down: self.bytes_down,
+            last_error: self.last_error.as_deref(),
+        };
+        serde_json::to_string(&status).expect("CoreStatus serialization is infallible")
+    }
+
+    fn status_json_with_route_proof_refresh(&self, outcome: RouteProofRefreshOutcome) -> String {
+        let mut status: serde_json::Value =
+            serde_json::from_str(&self.status_json_without_refresh())
+                .expect("CoreStatus serialization must remain valid JSON");
+        status["routeProofRefresh"] = serde_json::to_value(outcome)
+            .expect("RouteProofRefreshOutcome serialization is infallible");
+        serde_json::to_string(&status)
+            .expect("route-proof refresh status serialization is infallible")
+    }
+
+    pub(crate) fn route_proof_refresh_not_ready_json(&self) -> String {
+        self.status_json_with_route_proof_refresh(RouteProofRefreshOutcome::not_ready())
+    }
+
+    /// Completes a periodic refresh after the caller has reacquired the core
+    /// lock. A result for an old engine generation or proxy port is discarded
+    /// without refreshing, restoring or otherwise mutating the current core.
+    pub(crate) fn complete_route_proof_refresh(
+        &mut self,
+        ticket: RouteProofRefreshTicket,
+        probe_result: Result<(), String>,
+    ) -> String {
+        self.complete_route_proof_refresh_with(ticket, probe_result, |_| {
+            #[cfg(feature = "node-engine")]
+            node_lib::mobile_runtime::report_route_stage(2);
+        })
+    }
+
+    fn complete_route_proof_refresh_with(
+        &mut self,
+        ticket: RouteProofRefreshTicket,
+        probe_result: Result<(), String>,
+        report_current_route: impl FnOnce(&mut MobileCore),
+    ) -> String {
+        self.complete_route_proof_refresh_with_hooks(
+            ticket,
+            probe_result,
+            |core| core.refresh_engine_status(),
+            report_current_route,
+        )
+    }
+
+    fn complete_route_proof_refresh_with_hooks(
+        &mut self,
+        ticket: RouteProofRefreshTicket,
+        probe_result: Result<(), String>,
+        mut refresh_current_engine: impl FnMut(&mut MobileCore),
+        report_current_route: impl FnOnce(&mut MobileCore),
+    ) -> String {
+        // The socket probe ran without CORE locked. Import the live engine
+        // snapshot before trusting the cached ticket on both the success and
+        // failure paths. Otherwise an engine that stopped or lost its route
+        // during the probe could briefly be published as still connected.
+        refresh_current_engine(self);
+        if !self.route_proof_refresh_ticket_is_current(ticket) {
+            return self.route_proof_refresh_not_ready_json();
+        }
+
+        let outcome = match probe_result {
+            Err(_) => {
+                // A scheduled keepalive is advisory. Its endpoint, TLS handshake, or
+                // deadline can fail transiently while the already-proven MASQ route is
+                // still carrying traffic. Never turn that single observation into a
+                // global core error or revoke the browser/VPN route.
+                RouteProofRefreshOutcome::failed()
+            }
+            Ok(()) => {
+                // A correlated proxy response normally advances the actor runtime's
+                // route-use heartbeat before this point. First import and validate
+                // that state. Only then preserve the old explicit stage report for
+                // this exact engine; a stale probe must never report into a newer
+                // process-global runtime. Re-import and revalidate once more before
+                // publishing success.
+                report_current_route(self);
+                refresh_current_engine(self);
+                if !self.route_proof_refresh_ticket_is_current(ticket) {
+                    return self.route_proof_refresh_not_ready_json();
+                }
+                self.last_error = None;
+                RouteProofRefreshOutcome::succeeded()
+            }
+        };
+        self.status_json_with_route_proof_refresh(outcome)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn healthy_for_route_refresh_test(engine_generation: u64, proxy_port: u16) -> Self {
+        let mut core = Self::default();
+        core.phase = Phase::Connected;
+        core.engine_generation = engine_generation;
+        core.proxy_enabled = true;
+        core.proxy_port = Some(proxy_port);
+        core.connected_neighbors = 1;
+        core.route_stage = 2;
+        core.route_hops = 3;
+        core.route_proof_generation = 11;
+        core
+    }
+
+    #[cfg(not(feature = "node-engine"))]
+    pub(crate) fn route_proof_refresh_unavailable_json(&mut self) -> String {
+        self.refresh_engine_status();
+        self.status_json_with_route_proof_refresh(RouteProofRefreshOutcome::unavailable())
+    }
+
     #[cfg(feature = "node-engine")]
     pub fn preflight_proxy(&mut self) -> Result<(), String> {
-        use std::net::{Ipv4Addr, SocketAddrV4};
-
-        if !matches!(self.phase, Phase::Connected) {
-            return self.fail("Connect a MASQ route before testing it.");
+        if self.connected_neighbors == 0 || self.route_stage == 0 {
+            return Err(
+                "Connect to a MASQ entry peer before testing the private route.".to_owned(),
+            );
         }
+        self.probe_private_route()
+    }
+
+    /// Returns an operation-shaped error snapshot without poisoning the still-live entry session.
+    /// A first exit-route proof can race topology gossip; JavaScript may safely retry it within the
+    /// existing absolute connection deadline.
+    #[cfg(feature = "node-engine")]
+    pub fn preflight_proxy_status_json(&mut self) -> String {
+        self.preflight_proxy_status_json_with(MobileCore::preflight_proxy)
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn preflight_proxy_status_json_with(
+        &mut self,
+        probe: impl FnOnce(&mut MobileCore) -> Result<(), String>,
+    ) -> String {
+        match probe(self) {
+            Ok(()) => self.status_json(),
+            Err(_) => self.status_json_with_transient_error(
+                "E_PRIVATE_ROUTE_FAILED: MASQ could not yet prove an end-to-end private exit route.",
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "node-engine"))]
+    pub fn preflight_proxy_status_json(&mut self) -> String {
+        self.status_json_with_transient_error(
+            "E_PRIVATE_ROUTE_FAILED: The native MASQ Node actor adapter is unavailable.",
+        )
+    }
+
+    fn status_json_with_transient_error(&mut self, error: &str) -> String {
+        let mut status: serde_json::Value = serde_json::from_str(&self.status_json())
+            .expect("CoreStatus serialization must remain valid JSON");
+        status["phase"] = serde_json::json!("error");
+        status["proxyEnabled"] = serde_json::json!(false);
+        status["lastError"] = serde_json::json!(error);
+        serde_json::to_string(&status)
+            .expect("transient preflight status serialization is infallible")
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn probe_private_route(&mut self) -> Result<(), String> {
         let port = self
             .proxy_port
             .ok_or_else(|| "The local MASQ proxy has no port.".to_owned())?;
+        Self::probe_private_route_for_refresh(port)?;
+
+        node_lib::mobile_runtime::report_route_stage(2);
+        self.refresh_engine_status();
+        self.last_error = None;
+        Ok(())
+    }
+
+    /// Runs only the bounded network I/O portion of a route proof. In
+    /// particular, this function neither borrows `MobileCore` nor directly
+    /// writes process-wide MASQ runtime state, which makes it safe to call
+    /// without CORE's mutex being held. The proxied response can still update
+    /// normal actor telemetry, which is imported only after ticket validation.
+    #[cfg(feature = "node-engine")]
+    pub(crate) fn probe_private_route_for_refresh(port: u16) -> Result<(), String> {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(ROUTE_PROBE_TIMEOUT_SECONDS))
             .ok_or_else(|| "The MASQ route-test deadline could not be created.".to_owned())?;
+        loop {
+            let last_error = match Self::probe_private_route_once(port, deadline) {
+                Ok(()) => break,
+                Err(error) => error,
+            };
+            let remaining = match remaining_probe_time(deadline) {
+                Ok(remaining) => remaining,
+                Err(_) => return Err(last_error),
+            };
+            if remaining <= ROUTE_PROBE_RETRY_DELAY {
+                return Err(last_error);
+            }
+            thread::sleep(ROUTE_PROBE_RETRY_DELAY);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn probe_private_route_once(port: u16, deadline: Instant) -> Result<(), String> {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
         let connect_timeout = remaining_probe_time(deadline)
             .map_err(|_| "The MASQ route test timed out before it could start.".to_owned())?;
         let stream = TcpStream::connect_timeout(
@@ -401,9 +746,6 @@ impl MobileCore {
             return Err("The MASQ exit route returned an invalid encrypted response.".to_owned());
         }
 
-        node_lib::mobile_runtime::report_route_stage(2);
-        self.refresh_engine_status();
-        self.last_error = None;
         Ok(())
     }
 
@@ -524,7 +866,9 @@ impl MobileCore {
             }
             self.proxy_port = None;
             self.connected_neighbors = 0;
+            self.route_stage = 0;
             self.route_hops = 0;
+            self.route_proof_generation = 0;
         }
 
         let result = node_lib::mobile_debt_settlement::submit_prepared_debt_settlement(
@@ -582,7 +926,9 @@ impl MobileCore {
             }
             self.proxy_port = None;
             self.connected_neighbors = 0;
+            self.route_stage = 0;
             self.route_hops = 0;
+            self.route_proof_generation = 0;
         }
 
         let result = node_lib::mobile_debt_settlement::retry_ambiguous_debt_settlement(
@@ -634,43 +980,7 @@ impl MobileCore {
 
     pub fn status_json(&mut self) -> String {
         self.refresh_engine_status();
-        let status = CoreStatus {
-            phase: self.phase,
-            engine_available: engine_available(),
-            engine_generation: self.engine_generation,
-            proxy_enabled: self.proxy_enabled,
-            proxy_port: self.proxy_port,
-            chain: self.config.as_ref().map(|config| config.chain),
-            wallet_address: self.wallet.as_ref().map(WalletMaterial::address),
-            connected_neighbors: self.connected_neighbors,
-            route_stage: if self.route_hops > 0 {
-                2
-            } else if self.connected_neighbors > 0 {
-                1
-            } else {
-                0
-            },
-            route_hops: self.route_hops,
-            min_hops: self
-                .config
-                .as_ref()
-                .map(|config| config.min_hops)
-                .unwrap_or(1),
-            exit_country: self
-                .config
-                .as_ref()
-                .and_then(|config| config.exit_country.as_deref()),
-            exit_country_fallback: self
-                .config
-                .as_ref()
-                .map(|config| config.exit_country_fallback)
-                .unwrap_or(true),
-            available_exit_countries: &self.available_exit_countries,
-            bytes_up: self.bytes_up,
-            bytes_down: self.bytes_down,
-            last_error: self.last_error.as_deref(),
-        };
-        serde_json::to_string(&status).expect("CoreStatus serialization is infallible")
+        self.status_json_without_refresh()
     }
 
     fn fail<T>(&mut self, message: &str) -> Result<T, String> {
@@ -689,51 +999,81 @@ impl MobileCore {
     fn refresh_engine_status(&mut self) {
         #[cfg(feature = "node-engine")]
         {
-            let Some(engine) = self.engine.as_mut() else {
+            let Some(engine) = self.engine.as_ref() else {
                 return;
             };
             let snapshot = engine.snapshot();
-            self.available_exit_countries = snapshot.available_exit_countries.clone();
-            self.proxy_port = snapshot.proxy_port;
-            self.bytes_up = snapshot.bytes_up;
-            self.bytes_down = snapshot.bytes_down;
-            let paused = matches!(self.phase, Phase::Paused);
-            // A confirmed neighbor is enough to expose the fail-closed local proxy. The Node's
-            // RouteFound stage requires correlated response traffic, which cannot exist until the
-            // user opens the proxied browser for the first time.
-            if snapshot.route_stage >= 1 {
-                if !paused {
-                    self.phase = Phase::Connected;
-                }
-                self.connected_neighbors = 1;
-                self.route_hops = usize::from(snapshot.route_stage >= 2) * snapshot.route_hops;
+            self.apply_engine_snapshot(&snapshot);
+            if !snapshot.started && snapshot.last_exit_code.is_some() {
+                self.engine
+                    .as_mut()
+                    .expect("engine presence checked above")
+                    .reap_if_finished();
+            }
+        }
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn apply_engine_snapshot(&mut self, snapshot: &crate::engine::EngineSnapshot) {
+        let preserve_explicit_error = matches!(self.phase, Phase::Error | Phase::Blocked);
+        self.available_exit_countries = snapshot.available_exit_countries.clone();
+        self.proxy_port = snapshot.proxy_port;
+        self.bytes_up = snapshot.bytes_up;
+        self.bytes_down = snapshot.bytes_down;
+        self.route_stage = snapshot.route_stage.min(2);
+        self.route_proof_generation = snapshot.route_proof_generation;
+        self.connected_neighbors = usize::from(self.route_stage >= 1);
+        self.route_hops = if self.route_stage >= 2 {
+            snapshot.route_hops
+        } else {
+            0
+        };
+        let paused = matches!(self.phase, Phase::Paused);
+        // Stage one proves only an entry-neighbor handshake. Browser and system traffic become
+        // ready only after RouteFound (stage two), which represents correlated response bytes
+        // received through a MASQ exit route. A route-proof expiry therefore degrades the
+        // public state back to Connecting and immediately disables browser proxying.
+        if snapshot.started && self.route_stage >= 2 {
+            if !paused && !preserve_explicit_error {
+                self.phase = Phase::Connected;
+            }
+            if !preserve_explicit_error {
                 self.last_error = None;
-            } else if snapshot.started {
+            }
+        } else if snapshot.started && self.route_stage == 1 {
+            self.proxy_enabled = false;
+            if !paused && !preserve_explicit_error {
+                self.phase = Phase::Connecting;
+                self.last_error = None;
+            }
+        } else if snapshot.started {
+            self.proxy_enabled = false;
+            if !paused && !preserve_explicit_error {
                 self.phase = if snapshot.stop_requested {
                     Phase::Stopping
                 } else {
                     Phase::Connecting
                 };
-                self.connected_neighbors = 0;
-                self.route_hops = 0;
-                self.last_error = connection_timeout_message(&snapshot);
-            } else if let Some(exit_code) = snapshot.last_exit_code {
-                engine.reap_if_finished();
-                if snapshot.stop_requested && exit_code == 0 {
-                    self.phase = Phase::Ready;
-                    self.proxy_port = None;
-                } else {
-                    self.phase = Phase::Error;
-                    self.proxy_enabled = false;
-                    self.last_error = snapshot
+                self.last_error = connection_timeout_message(snapshot);
+            }
+        } else if let Some(exit_code) = snapshot.last_exit_code {
+            self.proxy_enabled = false;
+            if snapshot.stop_requested && exit_code == 0 {
+                self.phase = Phase::Ready;
+                self.proxy_port = None;
+                self.route_stage = 0;
+                self.route_proof_generation = 0;
+            } else {
+                self.phase = Phase::Error;
+                self.last_error = snapshot
                         .last_connection_error
+                        .clone()
                         .filter(|error| error.starts_with("E_CORE_PANIC_LOCATION:"))
                         .or_else(|| {
                             Some(format!(
                                 "The embedded MASQ Node stopped with code {exit_code}. Check the Node log."
                             ))
                         });
-                }
             }
         }
     }
@@ -741,36 +1081,62 @@ impl MobileCore {
 
 #[cfg(feature = "node-engine")]
 fn connection_timeout_message(snapshot: &crate::engine::EngineSnapshot) -> Option<String> {
-    connection_timeout_message_for_milestone(
-        snapshot,
-        node_lib::mobile_runtime::entry_handshake_milestone(),
-    )
+    let (milestone, milestone_age, attempt_age) =
+        node_lib::mobile_runtime::entry_handshake_progress();
+    connection_timeout_message_for_milestone(snapshot, milestone, milestone_age, attempt_age)
 }
+
+#[cfg(feature = "node-engine")]
+const ENTRY_PRE_DEBUT_IDLE_TIMEOUT: Duration = Duration::from_secs(18);
+#[cfg(feature = "node-engine")]
+const ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(feature = "node-engine")]
+const ENTRY_ACCEPTED_GOSSIP_PROMOTION_TIMEOUT: Duration = Duration::from_secs(26);
+#[cfg(feature = "node-engine")]
+const ENTRY_ATTEMPT_HARD_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(feature = "node-engine")]
 fn connection_timeout_message_for_milestone(
     snapshot: &crate::engine::EngineSnapshot,
     milestone: node_lib::mobile_runtime::EntryHandshakeMilestone,
+    milestone_age: std::time::Duration,
+    attempt_age: std::time::Duration,
 ) -> Option<String> {
     use node_lib::mobile_runtime::EntryHandshakeMilestone;
 
-    if snapshot.running_for < std::time::Duration::from_secs(32) {
-        return None;
+    // Neighborhood publishes these only after every parallel entry attempt is
+    // terminal, so it is safe to rotate the pair immediately.
+    if let Some(error) = snapshot.last_connection_error.as_deref() {
+        if error.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:") {
+            return Some(
+                "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop."
+                    .to_owned(),
+            );
+        }
+        if error.starts_with("E_ENTRY_NO_PROGRESS:") {
+            return Some(
+                "E_ENTRY_NO_PROGRESS: All selected entry peers exhausted the initial handshake."
+                    .to_owned(),
+            );
+        }
     }
 
-    // A pass loop is a protocol-level terminal signal and is more useful than
-    // the transport milestone that happened before it. It remains fixed text:
-    // no descriptor, address, identity, payload, or OS error is surfaced.
-    if snapshot
-        .last_connection_error
-        .as_deref()
-        .map(|error| error.starts_with("E_ENTRY_GOSSIP_PASS_LOOP:"))
-        .unwrap_or(false)
-    {
-        return Some(
-            "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop."
-                .to_owned(),
-        );
+    let inactivity_timeout = match milestone {
+        EntryHandshakeMilestone::None | EntryHandshakeMilestone::TcpConnected => {
+            ENTRY_PRE_DEBUT_IDLE_TIMEOUT
+        }
+        // Once Debut left the device, a compatible peer should begin its small
+        // gossip response promptly. Every positive clandestine read refreshes
+        // milestone_age, so a genuinely slow but progressing frame keeps its
+        // full idle budget while a silent or invalid peer rotates quickly.
+        EntryHandshakeMilestone::DebutBytesWritten
+        | EntryHandshakeMilestone::InboundBytesReceived => ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT,
+        // Validated gossip is stronger evidence than raw bytes. Keep the wider
+        // actor/topology promotion window after acceptance.
+        EntryHandshakeMilestone::GossipAccepted => ENTRY_ACCEPTED_GOSSIP_PROMOTION_TIMEOUT,
+    };
+    if milestone_age < inactivity_timeout && attempt_age < ENTRY_ATTEMPT_HARD_TIMEOUT {
+        return None;
     }
 
     let message = match milestone {
@@ -795,6 +1161,31 @@ fn connection_timeout_message_for_milestone(
 
 fn engine_available() -> bool {
     cfg!(feature = "node-engine")
+}
+
+fn entry_retry_requires_fresh_identity(last_error: Option<&str>) -> bool {
+    let code = last_error.map(|error| error.split_once(':').map_or(error, |(code, _)| code).trim());
+    matches!(
+        code,
+        Some(
+            "E_ENTRY_TCP_WAITING_GOSSIP"
+                | "E_ENTRY_GOSSIP_TIMEOUT"
+                | "E_ENTRY_GOSSIP_PASS_LOOP"
+                | "E_ENTRY_NO_PROGRESS"
+                | "E_ENTRY_NO_INBOUND_BYTES"
+                | "E_ENTRY_INBOUND_NOT_ACCEPTED"
+                | "E_ENTRY_GOSSIP_NOT_PROMOTED"
+        )
+    )
+}
+
+fn entry_retry_requires_fresh_runtime(
+    phase: Phase,
+    entry_nodes_changed: bool,
+    last_error: Option<&str>,
+) -> bool {
+    entry_retry_requires_fresh_identity(last_error)
+        || (entry_nodes_changed && matches!(phase, Phase::Connecting) && last_error.is_none())
 }
 
 #[cfg(feature = "node-engine")]
@@ -829,7 +1220,11 @@ fn constant_time_text_eq(left: &str, right: &str) -> bool {
 }
 
 #[cfg(feature = "node-engine")]
-const ROUTE_PROBE_TIMEOUT_SECONDS: u64 = 30;
+// A route that cannot complete CONNECT, TLS and a remote HTTP response within
+// this fixed budget is not healthy enough for interactive mobile browsing.
+const ROUTE_PROBE_TIMEOUT_SECONDS: u64 = 12;
+#[cfg(feature = "node-engine")]
+const ROUTE_PROBE_RETRY_DELAY: Duration = Duration::from_millis(400);
 
 #[cfg(feature = "node-engine")]
 struct DeadlineStream {
@@ -937,6 +1332,288 @@ fn http_status_code(response: &[u8]) -> Option<u16> {
 mod tests {
     use super::*;
 
+    fn healthy_core_for_route_refresh() -> MobileCore {
+        let mut core = configured_core();
+        core.phase = Phase::Connected;
+        core.engine_generation = 7;
+        core.proxy_enabled = true;
+        core.proxy_port = Some(44_443);
+        core.connected_neighbors = 1;
+        core.route_stage = 2;
+        core.route_hops = 3;
+        core.route_proof_generation = 11;
+        core
+    }
+
+    #[test]
+    fn scheduled_route_refresh_failure_preserves_healthy_state_and_redacts_probe_error() {
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+        let json = core.complete_route_proof_refresh(
+            ticket,
+            Err("socket 203.0.113.7:443 failed for private.example wallet 0xfeed".to_owned()),
+        );
+
+        assert_eq!(core.phase, Phase::Connected);
+        assert!(core.proxy_enabled);
+        assert_eq!(core.proxy_port, Some(44_443));
+        assert_eq!(core.connected_neighbors, 1);
+        assert_eq!(core.route_stage, 2);
+        assert_eq!(core.route_hops, 3);
+        assert_eq!(core.route_proof_generation, 11);
+        assert_eq!(core.last_error, None);
+
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["phase"], "connected");
+        assert_eq!(status["proxyEnabled"], true);
+        assert_eq!(status["routeStage"], 2);
+        assert_eq!(status["routeProofRefresh"]["attempted"], true);
+        assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+        assert_eq!(
+            status["routeProofRefresh"]["errorCode"],
+            "E_PRIVATE_ROUTE_REFRESH_FAILED"
+        );
+        assert!(!json.contains("203.0.113.7"));
+        assert!(!json.contains("private.example"));
+        assert!(!json.contains("0xfeed"));
+    }
+
+    #[test]
+    fn scheduled_route_refresh_failure_imports_engine_demotion_before_publishing_status() {
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+
+        let json = core.complete_route_proof_refresh_with_hooks(
+            ticket,
+            Err("bounded route probe failed".to_owned()),
+            |core| {
+                core.phase = Phase::Connecting;
+                core.proxy_enabled = false;
+                core.connected_neighbors = 1;
+                core.route_stage = 1;
+                core.route_hops = 0;
+            },
+            |_| panic!("a failed probe must not report a successful route"),
+        );
+
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["phase"], "connecting");
+        assert_eq!(status["proxyEnabled"], false);
+        assert_eq!(status["routeStage"], 1);
+        assert_eq!(status["routeProofRefresh"]["attempted"], false);
+        assert_eq!(
+            status["routeProofRefresh"]["errorCode"],
+            "E_PRIVATE_ROUTE_REFRESH_NOT_READY"
+        );
+    }
+
+    #[test]
+    fn scheduled_route_refresh_reports_stage_only_for_the_current_ticket() {
+        use std::cell::Cell;
+
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+        let report_calls = Cell::new(0);
+
+        let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |_| {
+            report_calls.set(report_calls.get() + 1);
+        });
+
+        assert_eq!(report_calls.get(), 1);
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["routeProofRefresh"]["succeeded"], true);
+        assert_eq!(
+            status["routeProofRefresh"]["errorCode"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn stale_route_refresh_success_never_invokes_the_runtime_report_callback() {
+        use std::cell::Cell;
+
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+        core.engine_generation += 1;
+        let report_calls = Cell::new(0);
+
+        let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |_| {
+            report_calls.set(report_calls.get() + 1);
+        });
+
+        assert_eq!(report_calls.get(), 0);
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["engineGeneration"], 8);
+        assert_eq!(status["routeProofRefresh"]["attempted"], false);
+        assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+    }
+
+    #[test]
+    fn route_refresh_revalidates_health_after_the_runtime_report_callback() {
+        let mut core = healthy_core_for_route_refresh();
+        let ticket = core.begin_route_proof_refresh().unwrap();
+
+        let json = core.complete_route_proof_refresh_with(ticket, Ok(()), |core| {
+            core.route_stage = 1;
+            core.proxy_enabled = false;
+        });
+
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(status["routeStage"], 1);
+        assert_eq!(status["proxyEnabled"], false);
+        assert_eq!(status["routeProofRefresh"]["attempted"], false);
+        assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn explicit_preflight_failure_is_transient_and_privacy_safe() {
+        let mut core = configured_core();
+        core.phase = Phase::Connecting;
+        core.engine_generation = 9;
+        core.proxy_port = Some(44_443);
+        core.connected_neighbors = 1;
+        core.route_stage = 1;
+
+        let json = core.preflight_proxy_status_json_with(|_| {
+            Err("peer 203.0.113.8 failed while loading private.example".to_owned())
+        });
+        let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(response["phase"], "error");
+        assert_eq!(response["proxyEnabled"], false);
+        assert_eq!(
+            response["lastError"],
+            "E_PRIVATE_ROUTE_FAILED: MASQ could not yet prove an end-to-end private exit route."
+        );
+        assert!(!json.contains("203.0.113.8"));
+        assert!(!json.contains("private.example"));
+        assert_eq!(core.phase, Phase::Connecting);
+        assert_eq!(core.connected_neighbors, 1);
+        assert_eq!(core.route_stage, 1);
+        assert_eq!(core.last_error, None);
+    }
+
+    #[test]
+    fn only_post_debut_entry_failures_require_a_fresh_identity() {
+        for code in [
+            "E_ENTRY_TCP_WAITING_GOSSIP",
+            "E_ENTRY_GOSSIP_TIMEOUT",
+            "E_ENTRY_GOSSIP_PASS_LOOP",
+            "E_ENTRY_NO_PROGRESS",
+            "E_ENTRY_NO_INBOUND_BYTES",
+            "E_ENTRY_INBOUND_NOT_ACCEPTED",
+            "E_ENTRY_GOSSIP_NOT_PROMOTED",
+        ] {
+            assert!(entry_retry_requires_fresh_identity(Some(&format!(
+                "{code}: safe diagnostic"
+            ))));
+        }
+        for error in [
+            None,
+            Some("E_ENTRY_TCP_FAILED: no TCP transport"),
+            Some("E_ENTRY_DEBUT_NOT_WRITTEN: no Debut bytes"),
+            Some("E_PRIVATE_ROUTE_FAILED: exit proof failed"),
+            Some("unstructured error"),
+        ] {
+            assert!(!entry_retry_requires_fresh_identity(error));
+        }
+
+        assert!(entry_retry_requires_fresh_runtime(
+            Phase::Connecting,
+            true,
+            None,
+        ));
+        assert!(!entry_retry_requires_fresh_runtime(
+            Phase::Connecting,
+            false,
+            None,
+        ));
+        assert!(!entry_retry_requires_fresh_runtime(
+            Phase::Connecting,
+            true,
+            Some("E_ENTRY_TCP_FAILED: no TCP transport"),
+        ));
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn configuring_new_entries_after_a_post_debut_failure_reaps_the_old_engine() {
+        let mut core = configured_core();
+        core.engine = Some(crate::engine::EngineHandle::finished_for_state_transition_test());
+        core.engine_generation = 7;
+        core.phase = Phase::Connecting;
+        core.last_error = Some(
+            "E_ENTRY_NO_INBOUND_BYTES: Debut was written but the peer stayed silent.".to_owned(),
+        );
+
+        core.configure(
+            r#"{"chain":"base-mainnet","rpcUrl":"https://rpc.example","neighbors":["masq://base-mainnet:key2@example.net:4434"]}"#,
+        )
+        .unwrap();
+
+        assert!(core.engine.is_none());
+        assert_eq!(core.engine_generation, 7);
+        assert_eq!(core.phase, Phase::Ready);
+        assert_eq!(core.last_error, None);
+        assert_eq!(
+            core.config.as_ref().unwrap().neighbors,
+            vec!["masq://base-mainnet:key2@example.net:4434"]
+        );
+        assert!(core.wallet.is_some());
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn configuring_new_entries_before_debut_keeps_the_live_engine_for_in_place_retry() {
+        let mut core = configured_core();
+        core.engine = Some(crate::engine::EngineHandle::finished_for_state_transition_test());
+        core.engine_generation = 7;
+        core.phase = Phase::Connecting;
+        core.last_error = Some(
+            "E_ENTRY_DEBUT_NOT_WRITTEN: TCP connected but no Debut bytes left the device."
+                .to_owned(),
+        );
+
+        core.configure(
+            r#"{"chain":"base-mainnet","rpcUrl":"https://rpc.example","neighbors":["masq://base-mainnet:key2@example.net:4434"]}"#,
+        )
+        .unwrap();
+
+        assert!(core.engine.is_some());
+        assert_eq!(core.engine_generation, 7);
+        assert_eq!(core.phase, Phase::Ready);
+        assert_eq!(core.last_error, None);
+        assert!(core.wallet.is_some());
+    }
+
+    #[test]
+    fn scheduled_route_refresh_does_not_probe_an_unhealthy_route() {
+        let mut core = healthy_core_for_route_refresh();
+        core.route_stage = 1;
+
+        assert_eq!(core.begin_route_proof_refresh(), None);
+        assert_eq!(core.phase, Phase::Connected);
+        assert_eq!(core.route_stage, 1);
+    }
+
+    #[cfg(not(feature = "node-engine"))]
+    #[test]
+    fn scheduled_route_refresh_reports_a_fixed_unavailable_code_without_an_engine() {
+        let mut core = MobileCore::default();
+
+        let json = core.route_proof_refresh_unavailable_json();
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(status["phase"], "unconfigured");
+        assert_eq!(status["routeProofRefresh"]["attempted"], false);
+        assert_eq!(status["routeProofRefresh"]["succeeded"], false);
+        assert_eq!(
+            status["routeProofRefresh"]["errorCode"],
+            "E_PRIVATE_ROUTE_REFRESH_UNAVAILABLE"
+        );
+    }
+
     #[cfg(feature = "node-engine")]
     #[test]
     fn route_probe_deadline_expires_before_attempting_socket_configuration() {
@@ -951,6 +1628,12 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(!setter_called);
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn route_probe_budget_remains_fail_fast_for_interactive_browsing() {
+        assert_eq!(ROUTE_PROBE_TIMEOUT_SECONDS, 12);
     }
 
     #[cfg(feature = "node-engine")]
@@ -982,12 +1665,23 @@ mod tests {
 
     #[cfg(feature = "node-engine")]
     fn engine_snapshot(error: Option<&str>, seconds: u64) -> crate::engine::EngineSnapshot {
+        engine_snapshot_with_route(0, 1, error, seconds)
+    }
+
+    #[cfg(feature = "node-engine")]
+    fn engine_snapshot_with_route(
+        route_stage: u8,
+        route_hops: usize,
+        error: Option<&str>,
+        seconds: u64,
+    ) -> crate::engine::EngineSnapshot {
         crate::engine::EngineSnapshot {
             started: true,
             stop_requested: false,
             proxy_port: Some(44_443),
-            route_stage: 0,
-            route_hops: 1,
+            route_stage,
+            route_hops,
+            route_proof_generation: 0,
             bytes_up: 0,
             bytes_down: 0,
             last_exit_code: None,
@@ -1112,14 +1806,104 @@ mod tests {
 
     #[cfg(feature = "node-engine")]
     #[test]
-    fn delays_entry_node_errors_during_the_initial_retry_window() {
+    fn entry_neighbor_remains_connecting_until_an_exit_route_is_proven() {
+        let mut core = configured_core();
+        core.phase = Phase::Connecting;
+        core.proxy_enabled = true;
+
+        core.apply_engine_snapshot(&engine_snapshot_with_route(1, 4, None, 5));
+
+        let status: serde_json::Value = serde_json::from_str(&core.status_json()).unwrap();
+        assert_eq!(status["phase"], "connecting");
+        assert_eq!(status["connectedNeighbors"], 1);
+        assert_eq!(status["routeStage"], 1);
+        assert_eq!(status["routeHops"], 0);
+        assert_eq!(status["proxyEnabled"], false);
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn correlated_exit_response_marks_the_private_route_connected() {
+        let mut core = configured_core();
+        core.phase = Phase::Connecting;
+
+        core.apply_engine_snapshot(&engine_snapshot_with_route(2, 4, None, 5));
+
+        let status: serde_json::Value = serde_json::from_str(&core.status_json()).unwrap();
+        assert_eq!(status["phase"], "connected");
+        assert_eq!(status["connectedNeighbors"], 1);
+        assert_eq!(status["routeStage"], 2);
+        assert_eq!(status["routeHops"], 4);
+        assert_eq!(status["proxyPort"], 44_443);
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn route_proof_degradation_revokes_connected_and_proxy_states() {
+        let mut core = configured_core();
+        core.phase = Phase::Connecting;
+        core.apply_engine_snapshot(&engine_snapshot_with_route(2, 3, None, 5));
+        core.proxy_enabled = true;
+
+        core.apply_engine_snapshot(&engine_snapshot_with_route(1, 3, None, 6));
+
+        assert_eq!(core.phase, Phase::Connecting);
+        assert_eq!(core.connected_neighbors, 1);
+        assert_eq!(core.route_stage, 1);
+        assert_eq!(core.route_hops, 0);
+        assert!(!core.proxy_enabled);
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn entry_progress_does_not_hide_an_explicit_route_probe_error() {
+        let mut core = configured_core();
+        core.phase = Phase::Connecting;
+        core.record_error("E_PRIVATE_ROUTE_FAILED: probe failed".to_owned());
+
+        core.apply_engine_snapshot(&engine_snapshot_with_route(1, 3, None, 6));
+
+        assert_eq!(core.phase, Phase::Error);
+        assert_eq!(core.route_stage, 1);
+        assert_eq!(
+            core.last_error.as_deref(),
+            Some("E_PRIVATE_ROUTE_FAILED: probe failed")
+        );
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn entry_node_timeout_is_short_only_while_post_debut_gossip_is_unaccepted() {
         use node_lib::mobile_runtime::EntryHandshakeMilestone;
 
-        let snapshot = engine_snapshot(None, 31);
+        let transport_snapshot = engine_snapshot(None, 17);
         assert_eq!(
             connection_timeout_message_for_milestone(
-                &snapshot,
-                EntryHandshakeMilestone::GossipAccepted
+                &transport_snapshot,
+                EntryHandshakeMilestone::TcpConnected,
+                std::time::Duration::from_secs(17),
+                std::time::Duration::from_secs(17),
+            ),
+            None
+        );
+        let progressing_inbound_snapshot = engine_snapshot(None, 35);
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &progressing_inbound_snapshot,
+                EntryHandshakeMilestone::InboundBytesReceived,
+                ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT - std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(35),
+            ),
+            None,
+            "recent inbound activity must protect a slow but progressing peer"
+        );
+        let progressed_snapshot = engine_snapshot(None, 25);
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &progressed_snapshot,
+                EntryHandshakeMilestone::GossipAccepted,
+                std::time::Duration::from_secs(25),
+                std::time::Duration::from_secs(25),
             ),
             None
         );
@@ -1127,10 +1911,42 @@ mod tests {
 
     #[cfg(feature = "node-engine")]
     #[test]
+    fn silent_or_unaccepted_post_debut_gossip_expires_after_eight_idle_seconds() {
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let snapshot = engine_snapshot(None, 8);
+        for (milestone, expected_code) in [
+            (
+                EntryHandshakeMilestone::DebutBytesWritten,
+                "E_ENTRY_NO_INBOUND_BYTES:",
+            ),
+            (
+                EntryHandshakeMilestone::InboundBytesReceived,
+                "E_ENTRY_INBOUND_NOT_ACCEPTED:",
+            ),
+        ] {
+            let diagnostic = connection_timeout_message_for_milestone(
+                &snapshot,
+                milestone,
+                ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT,
+                ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT,
+            )
+            .expect("post-Debut inactivity diagnostic expected");
+            assert!(
+                diagnostic.starts_with(expected_code),
+                "expected {expected_code}, got {diagnostic}"
+            );
+        }
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
     fn entry_timeout_codes_identify_the_last_privacy_safe_handshake_milestone() {
         use node_lib::mobile_runtime::EntryHandshakeMilestone;
 
-        let snapshot = engine_snapshot(None, 32);
+        let transport_snapshot = engine_snapshot(None, 18);
+        let unaccepted_debut_snapshot = engine_snapshot(None, 8);
+        let progressed_snapshot = engine_snapshot(None, 26);
         let cases = [
             (EntryHandshakeMilestone::None, "E_ENTRY_TCP_FAILED:"),
             (
@@ -1152,8 +1968,31 @@ mod tests {
         ];
 
         for (milestone, expected_code) in cases {
-            let message = connection_timeout_message_for_milestone(&snapshot, milestone)
-                .expect("diagnostic expected");
+            let snapshot = match milestone {
+                EntryHandshakeMilestone::DebutBytesWritten
+                | EntryHandshakeMilestone::InboundBytesReceived => &unaccepted_debut_snapshot,
+                EntryHandshakeMilestone::GossipAccepted => &progressed_snapshot,
+                EntryHandshakeMilestone::None | EntryHandshakeMilestone::TcpConnected => {
+                    &transport_snapshot
+                }
+            };
+            let milestone_age = match milestone {
+                EntryHandshakeMilestone::DebutBytesWritten
+                | EntryHandshakeMilestone::InboundBytesReceived => {
+                    ENTRY_UNACCEPTED_DEBUT_IDLE_TIMEOUT
+                }
+                EntryHandshakeMilestone::GossipAccepted => ENTRY_ACCEPTED_GOSSIP_PROMOTION_TIMEOUT,
+                EntryHandshakeMilestone::None | EntryHandshakeMilestone::TcpConnected => {
+                    ENTRY_PRE_DEBUT_IDLE_TIMEOUT
+                }
+            };
+            let message = connection_timeout_message_for_milestone(
+                snapshot,
+                milestone,
+                milestone_age,
+                milestone_age,
+            )
+            .expect("diagnostic expected");
             assert!(
                 message.starts_with(expected_code),
                 "expected {expected_code}, got {message}"
@@ -1163,23 +2002,71 @@ mod tests {
 
     #[cfg(feature = "node-engine")]
     #[test]
-    fn pass_loop_code_takes_priority_over_transport_milestones() {
+    fn aggregate_pass_loop_code_bypasses_the_fallback_watchdog() {
         use node_lib::mobile_runtime::EntryHandshakeMilestone;
 
         let snapshot = engine_snapshot(
             Some("E_ENTRY_GOSSIP_PASS_LOOP: internal fixed diagnostic"),
-            32,
+            1,
         );
 
         assert_eq!(
             connection_timeout_message_for_milestone(
                 &snapshot,
-                EntryHandshakeMilestone::InboundBytesReceived
+                EntryHandshakeMilestone::InboundBytesReceived,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
             ),
             Some(
                 "E_ENTRY_GOSSIP_PASS_LOOP: The entry-node handshake encountered a pass loop."
                     .to_owned()
             )
         );
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn terminal_entry_progress_code_bypasses_the_fallback_watchdog() {
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let snapshot = engine_snapshot(Some("E_ENTRY_NO_PROGRESS: fixed internal diagnostic"), 1);
+
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &snapshot,
+                EntryHandshakeMilestone::DebutBytesWritten,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ),
+            Some(
+                "E_ENTRY_NO_PROGRESS: All selected entry peers exhausted the initial handshake."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[cfg(feature = "node-engine")]
+    #[test]
+    fn entry_hard_cap_is_scoped_to_the_current_attempt_not_engine_uptime() {
+        use node_lib::mobile_runtime::EntryHandshakeMilestone;
+
+        let long_running_engine = engine_snapshot(None, 3_600);
+        assert_eq!(
+            connection_timeout_message_for_milestone(
+                &long_running_engine,
+                EntryHandshakeMilestone::DebutBytesWritten,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+            None
+        );
+        assert!(connection_timeout_message_for_milestone(
+            &long_running_engine,
+            EntryHandshakeMilestone::DebutBytesWritten,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(45),
+        )
+        .expect("current-attempt hard-cap diagnostic expected")
+        .starts_with("E_ENTRY_NO_INBOUND_BYTES:"));
     }
 }

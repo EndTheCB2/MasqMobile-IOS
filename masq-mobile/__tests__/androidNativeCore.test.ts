@@ -72,6 +72,12 @@ describe('Android native MASQ core integration', () => {
   const webViewClientSource = read(
     'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java',
   );
+  const webViewSource = read(
+    'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java',
+  );
+  const webViewManagerSource = read(
+    'node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt',
+  );
   const mobileCi = read('../.github/workflows/mobile-ci.yml');
 
   it('builds and packages the real Rust node engine for supported Android ABIs', () => {
@@ -103,7 +109,9 @@ describe('Android native MASQ core integration', () => {
       'verify-android-native-elf.js" --jni-dir "$OUTPUT_DIR"',
     );
     expect(buildScript).toContain("-name 'libsysinfo-*.so'");
+    expect(buildScript).toContain("-name 'libsysinfo.so'");
     expect(buildScript).toContain("-name 'libtun2proxy-*.so'");
+    expect(buildScript).toContain("-name 'libtun2proxy.so'");
     expect(buildScript).not.toContain("! -name 'libmasq_mobile_core.so'");
     expect(buildScript).toContain('cd "$(dirname "$MANIFEST")"');
     expect(buildScript).toContain(
@@ -235,6 +243,8 @@ describe('Android native MASQ core integration', () => {
     expect(masqRouting.indexOf('installBlockedBrowserState(')).toBeLessThan(
       masqRouting.indexOf('MasqCoreJni.nativeGetStatus()'),
     );
+    expect(masqRouting).toContain('status.optInt("connectedNeighbors", 0) < 1');
+    expect(masqRouting).toContain('status.optInt("routeStage", 0) < 2');
     expect(moduleSource).not.toContain('override fun setBrowserProxy(');
     expect(nativeSpec).toContain(
       'setBrowserRoutingMode(mode: string): Promise<string>',
@@ -249,13 +259,13 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).not.toContain('cdn-cgi/trace');
   });
 
-  it('blocks top-level non-GET WebView requests before Android can submit them', () => {
+  it('blocks every top-level non-GET WebView request before Android can follow an opaque redirect', () => {
     expect(webViewClientSource).toContain(
       'shouldInterceptRequest(WebView view, WebResourceRequest request)',
     );
     expect(webViewClientSource).toContain('request.isForMainFrame()');
     expect(webViewClientSource).toContain(
-      '!"GET".equalsIgnoreCase(request.getMethod())',
+      'request.isForMainFrame() && !"GET".equalsIgnoreCase(request.getMethod())',
     );
     expect(webViewClientSource).toContain(
       'Collections.singletonMap("Cache-Control", "no-store")',
@@ -263,6 +273,22 @@ describe('Android native MASQ core integration', () => {
     expect(webViewClientSource).toContain(
       'new ByteArrayInputStream(blockedBody)',
     );
+  });
+
+  it('blocks bounded exact-host ad subresources before Android downloads them', () => {
+    expect(webViewClientSource).toContain('!request.isForMainFrame()');
+    expect(webViewClientSource).toContain(
+      'shouldBlockResource(request.getUrl())',
+    );
+    expect(webViewClientSource).toContain('204');
+    expect(webViewClientSource).toContain('"No Content"');
+    expect(webViewSource).toContain('MAX_BLOCKED_RESOURCE_HOSTS = 64');
+    expect(webViewSource).toContain('host.equals(blockedHost)');
+    expect(webViewSource).toContain('host.endsWith("." + blockedHost)');
+    expect(webViewSource).not.toContain('host.contains(blockedHost)');
+    expect(webViewManagerSource).toContain('setAndroidBlockedResourceHosts');
+    expect(webViewManagerSource).toContain('.take(64)');
+    expect(webViewPatch).toContain('androidBlockedResourceHosts');
   });
 
   it('clears Android WebView cookies and website storage in blocked mode', () => {
@@ -283,9 +309,9 @@ describe('Android native MASQ core integration', () => {
 
     expect(moduleSource).toContain('import android.webkit.CookieManager');
     expect(moduleSource).toContain('import android.webkit.WebStorage');
-    expect(blockedRouting).toContain(
-      'clearBrowserWebsiteData(onReady, onError)',
-    );
+    expect(blockedRouting).toContain('clearBrowserWebsiteData(');
+    expect(blockedRouting).toContain('onComplete = {');
+    expect(blockedRouting).toContain('isBrowserRoutingRequestLive(request)');
     expect(websiteDataCleanup).toContain(
       'profile?.webStorage ?: WebStorage.getInstance()',
     );
@@ -295,6 +321,27 @@ describe('Android native MASQ core integration', () => {
     expect(websiteDataCleanup).toContain('onError(error)');
     expect(websiteDataCleanup).toContain('return@removeAllCookies');
     expect(failClosedRecovery).toContain('installBlockedBrowserState(');
+  });
+
+  it('detaches Android WebView documents before destroying their proxy sessions', () => {
+    const cleanup = webViewSource.slice(
+      webViewSource.indexOf('protected void cleanupCallbacksAndDestroy()'),
+      webViewSource.indexOf('\n    @Override\n    public void destroy()'),
+    );
+
+    expect(cleanup).toContain('stopLoading();');
+    expect(cleanup).toContain('setWebViewClient(null);');
+    expect(cleanup).toContain('loadUrl("about:blank");');
+    expect(cleanup).toContain('clearHistory();');
+    expect(cleanup).toContain('removeAllViews();');
+    expect(cleanup.indexOf('stopLoading();')).toBeLessThan(
+      cleanup.indexOf('loadUrl("about:blank");'),
+    );
+    expect(cleanup.indexOf('loadUrl("about:blank");')).toBeLessThan(
+      cleanup.indexOf('destroy();'),
+    );
+    expect(webViewPatch).toContain("leave Chromium's proxy CONNECT sockets");
+    expect(webViewPatch).toContain('+        loadUrl("about:blank");');
   });
 
   it('isolates remembered sign-ins by exact host and MASQ/direct profile when supported', () => {
@@ -355,7 +402,7 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
     expect(gradle).toContain('applicationIdSuffix ".dogfood"');
     expect(gradle).toContain('versionNameSuffix "-dogfood"');
-    expect(gradle).toContain('versionCode 6007');
+    expect(gradle).toContain('versionCode 6016');
     expect(gradle).toContain(
       'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
     );
@@ -405,16 +452,20 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain(
       'if (apps.any(::isMasqControlPlanePackage))',
     );
-    expect(vpnService).toContain(
-      'builder.addDisallowedApplication(packageId)',
-    );
+    expect(vpnService).toContain('builder.addDisallowedApplication(packageId)');
     expect(vpnService).toContain('BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED &&');
     expect(moduleSource).toContain('"E_VPN_PREVIEW_DISABLED"');
     expect(moduleSource).toContain(
       'if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED)',
     );
-    expect(vpnService).toContain('.addRoute("0.0.0.0", 0)');
-    expect(vpnService).toContain('.addRoute("::", 0)');
+    expect(vpnService).toContain('MasqTunPrefix("0.0.0.0", 0)');
+    expect(vpnService).toContain('MasqTunPrefix("::", 0)');
+    expect(vpnService).toContain(
+      'MasqTunNetworkConfiguration.routes.forEach { prefix ->',
+    );
+    expect(vpnService).toContain(
+      'builder.addRoute(prefix.address, prefix.prefixLength)',
+    );
     expect(vpnService).toContain(
       'MASQ_CONTROL_PLANE_PACKAGE_IDS.forEach { packageId ->',
     );
@@ -575,7 +626,9 @@ describe('Android native MASQ core integration', () => {
     );
     const resetModule = moduleSource.slice(
       moduleSource.indexOf('override fun reset(promise: Promise)'),
-      moduleSource.indexOf('override fun resetNetworkProfile(promise: Promise)'),
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
     );
     const safeClose = vpnService.slice(
       vpnService.indexOf('private fun stopAndCloseAllTunnelsSafely('),
@@ -642,9 +695,7 @@ describe('Android native MASQ core integration', () => {
     expect(asyncCleanup).toBeLessThan(safeClose);
     expect(safeClose).toBeLessThan(finalPublish);
     expect(destruction).toContain('ServiceDestructionSnapshot(');
-    expect(destruction).toContain(
-      'terminalCoordinator.retain(',
-    );
+    expect(destruction).toContain('terminalCoordinator.retain(');
     expect(destruction).toContain(
       'retainedAppliedPolicy = terminalSnapshot.retainedAppliedPolicy',
     );
@@ -652,9 +703,9 @@ describe('Android native MASQ core integration', () => {
     expect(destruction).toContain(
       'captureValid = terminalSnapshot.captureValid',
     );
-    expect(
-      destruction.indexOf('terminalCoordinator.retain('),
-    ).toBeLessThan(destruction.indexOf('tunnelDescriptor = null'));
+    expect(destruction.indexOf('terminalCoordinator.retain(')).toBeLessThan(
+      destruction.indexOf('tunnelDescriptor = null'),
+    );
     expect(destruction.indexOf('tunnelDescriptor = null')).toBeLessThan(
       destruction.indexOf('terminalCoordinator.snapshot()'),
     );
@@ -682,23 +733,19 @@ describe('Android native MASQ core integration', () => {
     );
     const activation = vpnService.slice(
       vpnService.indexOf('TranslatorReadiness.Ready ->'),
-      vpnService.indexOf(
-        'private fun startTranslatorForCapturedDescriptor(',
-      ),
+      vpnService.indexOf('private fun startTranslatorForCapturedDescriptor('),
     );
 
     expect(startDispatch).toContain(
       'tunnelStartAcknowledgementIsSemanticallyAccepted(',
     );
     expect(moduleSource).toContain(
-      'private const val START_TUNNEL_TIMEOUT_MS = 70_000L',
+      'private const val START_TUNNEL_TIMEOUT_MS = 45_000L',
     );
     expect(startDispatch).toContain(
       'currentCoreGeneration = currentCoreGeneration',
     );
-    expect(startDispatch).toContain(
-      'return@completeTunnelStart false',
-    );
+    expect(startDispatch).toContain('return@completeTunnelStart false');
     expect(startDispatch).toContain('promise.resolve(serialized)');
     expect(startDispatch).toContain('\n              true');
     expect(startAuthority).toContain(
@@ -707,16 +754,15 @@ describe('Android native MASQ core integration', () => {
     expect(startAuthority).toContain(
       'status.appliedRevision == expectedPolicyRevision',
     );
-    expect(activation).toContain(
-      'synchronized(MasqCoreLifecycle.lock)',
-    );
+    expect(activation).toContain('synchronized(MasqCoreLifecycle.lock)');
     expect(activation).toContain('acknowledgementAccepted &&');
     const acknowledgement = activation.indexOf(
       'settleStart(it, candidateStatus, null)',
     );
     expect(acknowledgement).toBeGreaterThan(-1);
-    expect(activation.indexOf('coreGeneration ==', acknowledgement))
-      .toBeGreaterThan(acknowledgement);
+    expect(
+      activation.indexOf('coreGeneration ==', acknowledgement),
+    ).toBeGreaterThan(acknowledgement);
     expect(activation.indexOf('authorityStillExact')).toBeLessThan(
       activation.indexOf('SystemRoutingTransition.IDLE'),
     );
@@ -742,9 +788,7 @@ describe('Android native MASQ core integration', () => {
     expect(terminalCoordinator).toContain('var captureValid: Boolean');
     expect(terminalCoordinator).toContain('fun invalidateCapture(');
     expect(terminalCoordinator).toContain('adoptedEpoch: Long? = null');
-    expect(terminalCoordinator).toContain(
-      'candidate.translator.stopAndAwait(',
-    );
+    expect(terminalCoordinator).toContain('candidate.translator.stopAndAwait(');
     expect(terminalCoordinator).toContain(
       'candidate.translator.confirmsProcessReleased(candidate.ownership)',
     );
@@ -757,18 +801,14 @@ describe('Android native MASQ core integration', () => {
     );
     expect(resetService).toContain('stopAndCloseAllTunnelsSafely()');
     expect(resetService).toContain('policyStore.clearAfterExplicitReset()');
-    expect(translatorReturn).toContain(
-      'runAttemptEpoch',
-    );
+    expect(translatorReturn).toContain('runAttemptEpoch');
     expect(packetTranslator).toContain(
       'finalSnapshot.generation == run.expectedNativeGeneration',
     );
     expect(packetTranslator).toContain('val runAttemptEpoch: Long');
     expect(packetTranslator).toContain('proof?.ownership == expectedOwnership');
     expect(vpnService).toContain('claimStatusEpoch(serviceEpoch)');
-    expect(vpnService).toContain(
-      'if (ownerEpoch < currentStatusOwnerEpoch)',
-    );
+    expect(vpnService).toContain('if (ownerEpoch < currentStatusOwnerEpoch)');
     expect(vpnService).toContain('ownedResetRequests');
   });
 
@@ -793,9 +833,9 @@ describe('Android native MASQ core integration', () => {
     expect(revoke.indexOf('revoked = true')).toBeLessThan(
       revoke.indexOf('terminalCoordinator.invalidateCapture('),
     );
-    expect(revoke.indexOf('terminalCoordinator.invalidateCapture(')).toBeLessThan(
-      revoke.indexOf('controlExecutor.execute'),
-    );
+    expect(
+      revoke.indexOf('terminalCoordinator.invalidateCapture('),
+    ).toBeLessThan(revoke.indexOf('controlExecutor.execute'));
     expect(revoke).toContain('tunPresentOverride = false');
     expect(destruction).toContain(
       'captureValid = terminalSnapshot.captureValid',
@@ -805,18 +845,12 @@ describe('Android native MASQ core integration', () => {
     );
     expect(revoke).toContain('adoptedEpoch = revokedOwnership.second');
     expect(destruction.indexOf('terminalCoordinator.retain(')).toBeLessThan(
-      destruction.indexOf(
-        'adoptedTerminalLeaseEpoch = retainResult?.epoch',
-      ),
+      destruction.indexOf('adoptedTerminalLeaseEpoch = retainResult?.epoch'),
     );
     expect(
-      destruction.indexOf(
-        'adoptedTerminalLeaseEpoch = retainResult?.epoch',
-      ),
+      destruction.indexOf('adoptedTerminalLeaseEpoch = retainResult?.epoch'),
     ).toBeLessThan(destruction.indexOf('tunnelDescriptor = null'));
-    expect(destruction).toContain(
-      'SystemRoutingDiagnostic.PERMISSION_REVOKED',
-    );
+    expect(destruction).toContain('SystemRoutingDiagnostic.PERMISSION_REVOKED');
     expect(sticky).toContain(
       'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
     );
@@ -825,7 +859,7 @@ describe('Android native MASQ core integration', () => {
       'terminalCoordinator.closeOrJoin(TRANSLATOR_STOP_TIMEOUT_MS)',
     );
     expect(start).toContain(
-      'handleStart(\n              revision,\n              proxyPort,\n              coreGeneration,\n              engineGeneration,\n              requestId,',
+      'handleStart(\n              revision,\n              proxyPort,\n              coreGeneration,\n              engineGeneration,\n              expectedNetworkEpoch,\n              requestId,\n              recoveryAction,',
     );
     expect(vpnService).toContain(
       'terminalCoordinator.snapshot()?.captureValid == true',
@@ -846,8 +880,9 @@ describe('Android native MASQ core integration', () => {
       vpnService.indexOf('private fun terminalCloseResult('),
     );
 
-    expect(stopWithPermit.match(/scheduleTerminalCleanupRetryIfBlocked\(\)/g))
-      .toHaveLength(2);
+    expect(
+      stopWithPermit.match(/scheduleTerminalCleanupRetryIfBlocked\(\)/g),
+    ).toHaveLength(2);
     expect(stop).toContain('scheduleTerminalCleanupRetryIfBlocked()');
     expect(retry).toContain('terminalCoordinator.blocksNewStart()');
     expect(retry).toContain('scheduleStickyHandoffRetry()');
@@ -895,9 +930,7 @@ describe('Android native MASQ core integration', () => {
     expect(vpnService).toContain('Package IDs and');
     expect(vpnService).toContain('consent timestamps stay on-device');
     expect(vpnService).toContain('Shared-UID apps and attached restricted');
-    expect(vpnService).toContain(
-      'work profiles are separate.',
-    );
+    expect(vpnService).toContain('work profiles are separate.');
     expect(vpnService).toContain(
       'TLS handshake and encrypted HEAD request to example.com',
     );
@@ -929,9 +962,7 @@ describe('Android native MASQ core integration', () => {
     );
     const start = vpnService.slice(
       vpnService.indexOf('private fun handleStartWithPermit('),
-      vpnService.indexOf(
-        'private fun startTranslatorForCapturedDescriptor(',
-      ),
+      vpnService.indexOf('private fun startTranslatorForCapturedDescriptor('),
     );
     const establish = vpnService.slice(
       vpnService.indexOf('private fun ensureBlockingTun('),
@@ -955,18 +986,22 @@ describe('Android native MASQ core integration', () => {
     expect(start).toContain(
       'refuseActivationWithoutNotification(load, requestId)',
     );
-    expect(establish.indexOf('notificationPermissionDiagnostic(policy)'))
-      .toBeLessThan(establish.indexOf('builder.establish()'));
-    expect(establish.lastIndexOf('notificationPermissionDiagnostic(policy)'))
-      .toBeGreaterThan(establish.indexOf('builder.establish()'));
+    expect(
+      establish.indexOf('notificationPermissionDiagnostic(policy)'),
+    ).toBeLessThan(establish.indexOf('builder.establish()'));
+    expect(
+      establish.lastIndexOf('notificationPermissionDiagnostic(policy)'),
+    ).toBeGreaterThan(establish.indexOf('builder.establish()'));
     expect(establish.indexOf('tunnelDescriptor = descriptor')).toBeLessThan(
       establish.lastIndexOf('notificationPermissionDiagnostic(policy)'),
     );
     expect(establish).not.toContain('descriptor.close()');
-    expect(start.match(/refuseActivationWithoutNotification\(/g))
-      .toHaveLength(2);
-    expect(stickyRestore.match(/refuseActivationWithoutNotification\(/g))
-      .toHaveLength(2);
+    expect(start.match(/refuseActivationWithoutNotification\(/g)).toHaveLength(
+      2,
+    );
+    expect(
+      stickyRestore.match(/refuseActivationWithoutNotification\(/g),
+    ).toHaveLength(2);
     expect(stop).not.toContain('notificationPermissionDiagnostic(');
     expect(notificationPermission).toContain(
       'SystemRoutingDiagnostic.NOTIFICATION_PERMISSION_REQUIRED',
@@ -977,6 +1012,10 @@ describe('Android native MASQ core integration', () => {
     const recoveryRequest = sessionService.slice(
       sessionService.indexOf('private fun requestRecovery('),
       sessionService.indexOf('private fun cancelRecovery()'),
+    );
+    const recoveryCancellation = sessionService.slice(
+      sessionService.indexOf('private fun cancelRecovery()'),
+      sessionService.indexOf('private fun isRecoveryCurrent('),
     );
     const wakeAcquisition = sessionService.slice(
       sessionService.indexOf('private fun acquireTimedWakeLock('),
@@ -990,19 +1029,13 @@ describe('Android native MASQ core integration', () => {
     expect(manifest).toContain(
       'User-initiated MASQ consumer peer session kept active while the screen is locked',
     );
-    expect(sessionService).toContain(
-      'class MasqSessionService : Service()',
-    );
+    expect(sessionService).toContain('class MasqSessionService : Service()');
     expect(sessionService).not.toContain(
       'class MasqSessionService : VpnService()',
     );
-    expect(sessionService).toContain(
-      'PowerManager.PARTIAL_WAKE_LOCK',
-    );
+    expect(sessionService).toContain('PowerManager.PARTIAL_WAKE_LOCK');
     expect(sessionService).toContain('setReferenceCounted(false)');
-    expect(sessionService).toContain(
-      'lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS)',
-    );
+    expect(sessionService).toContain('lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS)');
     expect(wakeAcquisition).toContain(
       'val scheduleRenewal = forceRenewal || !lock.isHeld',
     );
@@ -1020,18 +1053,47 @@ describe('Android native MASQ core integration', () => {
     expect(sessionService).toContain('return START_STICKY');
     expect(sessionService).toContain('return START_NOT_STICKY');
     expect(sessionService).toContain('MasqCoreLifecycle.executor.execute');
-    expect(sessionService).toContain('MasqSessionIntentStore(context)');
-    expect(sessionService).toContain(
-      'activeInstance.get()?.adoptGeneration',
+    expect(recoveryRequest).toContain('recoveryExecutor.submit');
+    expect(recoveryCancellation).toContain('recoveryFuture?.cancel(true)');
+    expect(sessionService).toContain('hasTerminalEntryRecoverySignal()');
+    expect(sessionService).toContain('terminalEntryRetryDelayMillis()');
+    expect(sessionService).toContain('recovery.recordKnownGoodRoute(snapshot)');
+    expect(sessionService).toContain('recovery.recordSavedRouteProofFailure()');
+    expect(backgroundRecovery).toContain('fun recordKnownGoodRoute(');
+    expect(backgroundRecovery).toContain('fun recordSavedRouteProofFailure()');
+    expect(backgroundRecovery).toContain(
+      'entryNodeDiscovery.recordKnownGoodRoute(chain, descriptors, snapshot)',
     );
+    expect(backgroundRecovery).toContain(
+      'entryNodeDiscovery.recordRouteProofFailure(chain, descriptors)',
+    );
+    const periodicProofEscalation = sessionService.slice(
+      sessionService.indexOf(
+        'MasqPeriodicRouteProofFailureAction.FAIL_CLOSED_RESTART\n      ) {',
+      ),
+      sessionService.indexOf('// The first two transient failures'),
+    );
+    expect(periodicProofEscalation).toContain(
+      'recovery.recordSavedRouteProofFailure()',
+    );
+    expect(
+      periodicProofEscalation.indexOf(
+        'recovery.recordSavedRouteProofFailure()',
+      ),
+    ).toBeLessThan(
+      periodicProofEscalation.indexOf(
+        'MasqVpnService.publishCoreRouteUnavailable(this)',
+      ),
+    );
+    expect(sessionService).toContain('MasqSessionIntentStore(context)');
+    expect(sessionService).toContain('activeInstance.get()?.adoptGeneration');
     expect(sessionService).toContain(
       'screenOff && networkAvailable && cpuRequired',
     );
-    expect(sessionService).toContain(
-      'phase == "connected" &&',
-    );
+    expect(sessionService).toContain('phase == "connected" &&');
     expect(sessionService).toContain('connectedNeighbors > 0 &&');
-    expect(sessionService).toContain('routeStage > 0 &&');
+    expect(sessionService).toContain('routeStage >= 2 &&');
+    expect(sessionService).toContain('isEntryConnectedAwaitingRoute()');
     expect(sessionService).toContain('proxyPort in 1..65535');
     expect(sessionService).toContain(
       'NetworkCapabilities.NET_CAPABILITY_VALIDATED',
@@ -1042,6 +1104,14 @@ describe('Android native MASQ core integration', () => {
     expect(sessionService).toContain(
       'requestRecovery(nextRecoveryDelayMillis())',
     );
+    expect(sessionService).toContain('MasqCoreJni.nativeRefreshRouteProof()');
+    expect(sessionService).toContain('shouldApplyMasqSessionSnapshot(');
+    expect(sessionService).toContain(
+      'recoveryBackoff = recoveryBackoff.afterStarted(now)',
+    );
+    expect(sessionService).toContain(
+      'isNonMutatingRouteProofRefreshFailure(',
+    );
     expect(recoveryRequest.indexOf('cpuRequired = true')).toBeLessThan(
       recoveryRequest.indexOf(
         'if (recoveryRunningToken != NO_RECOVERY_TOKEN) return',
@@ -1050,13 +1120,29 @@ describe('Android native MASQ core integration', () => {
     expect(backgroundRecovery).toContain('SecureWalletStore(context)');
     expect(backgroundRecovery).toContain('entryNodeDiscovery.discover(');
     expect(backgroundRecovery).toContain('MasqCoreJni.nativeStart()');
+    expect(backgroundRecovery).toContain('MasqCoreJni.nativePreflightProxy()');
+    expect(backgroundRecovery).toContain('MasqRecoveryRouteVerificationGate()');
+    expect(backgroundRecovery).toContain('isEntryConnectedAwaitingRoute()');
+    expect(backgroundRecovery).toContain(
+      'entryNodeDiscovery.recordConnectionFailure(chain, preferredNodes)',
+    );
+    expect(
+      backgroundRecovery.indexOf(
+        'entryNodeDiscovery.recordConnectionFailure(chain, preferredNodes)',
+      ),
+    ).toBeLessThan(backgroundRecovery.indexOf('entryNodeDiscovery.discover('));
     expect(backgroundRecovery).toContain(
       'MasqCoreLifecycle.startGeneration.get() == recoveryGeneration',
     );
-    expect(backgroundRecovery.indexOf('entryNodeDiscovery.discover('))
-      .toBeLessThan(backgroundRecovery.indexOf('walletStore.load()'));
+    expect(
+      backgroundRecovery.indexOf('entryNodeDiscovery.discover('),
+    ).toBeLessThan(backgroundRecovery.indexOf('walletStore.load()'));
     expect(sessionService).not.toContain('VpnService.prepare');
-    expect(sessionService).not.toContain('.Builder()');
+    expect(sessionService).not.toContain('VpnService.Builder');
+    expect(sessionService).not.toContain(
+      'class MasqSessionService : VpnService()',
+    );
+    expect(sessionService).toContain('MasqCoreJni.nativeShutdown()');
   });
 
   it('cleans up Android native executors and pending tunnel acknowledgements', () => {
@@ -1146,6 +1232,28 @@ describe('Android native MASQ core integration', () => {
     expect(rustCore).toContain('pub fn shutdown(&mut self)');
   });
 
+  it('keeps scheduled route-proof refresh failures observational and privacy-safe', () => {
+    const refreshJni = rustAndroid.slice(
+      rustAndroid.indexOf(
+        'Java_com_masqmobile_MasqCoreJni_nativeRefreshRouteProof',
+      ),
+      rustAndroid.indexOf(
+        'Java_com_masqmobile_MasqCoreJni_nativeSetProxyEnabled',
+      ),
+    );
+
+    expect(coreJni).toContain('external fun nativeRefreshRouteProof(): String');
+    expect(refreshJni).toContain('refresh_route_proof_status()');
+    expect(refreshJni).not.toContain('status_after(');
+    expect(rustCore).toContain('begin_route_proof_refresh');
+    expect(rustCore).toContain('complete_route_proof_refresh');
+    expect(rustCore).toContain('route_proof_refresh_ticket_is_current');
+    expect(rustCore).not.toContain('restore_healthy_route_state');
+    expect(rustCore).toContain('E_PRIVATE_ROUTE_REFRESH_FAILED');
+    expect(rustCore).toContain('E_PRIVATE_ROUTE_REFRESH_NOT_READY');
+    expect(rustCore).toContain('routeProofRefresh');
+  });
+
   it('persists the wallet only as Android Keystore encrypted ciphertext', () => {
     expect(walletStore).toContain('AndroidKeyStore');
     expect(walletStore).toContain('AES/GCM/NoPadding');
@@ -1226,9 +1334,9 @@ describe('Android native MASQ core integration', () => {
     );
     expect(preservationRead).toContain('?: return PreservationRead.Unreadable');
     expect(preservationRead).toContain('catch (_: Exception)');
-    expect(preservationRead.match(/PreservationRead\.Unreadable/g)?.length).toBeGreaterThanOrEqual(
-      4,
-    );
+    expect(
+      preservationRead.match(/PreservationRead\.Unreadable/g)?.length,
+    ).toBeGreaterThanOrEqual(4);
     expect(preservationRead).not.toContain('deleteEncryptedValue()');
     expect(preservationRead).not.toContain('walletStore.delete()');
     expect(ordinaryLoad).toContain('PreservationRead.Unreadable');
@@ -1275,11 +1383,17 @@ describe('Android native MASQ core integration', () => {
     );
   });
 
-  it('refreshes and validates entry nodes before starting without an active TCP preflight', () => {
+  it('refreshes, probes, ranks, caches, and quarantines entry nodes before starting', () => {
     expect(gradle).toContain(
       'implementation("com.squareup.okhttp3:okhttp:4.9.2")',
     );
-    expect(discovery).toContain('NODE_FINDER_ATTEMPTS = 6');
+    expect(discovery).toContain('NODE_FINDER_ATTEMPTS = 12');
+    expect(discovery).toContain('NODE_FINDER_MAX_CONCURRENT_REQUESTS = 12');
+    expect(discovery).toContain('NODE_FINDER_BUDGET_MS = 6_000L');
+    expect(discovery).toContain('ENTRY_PROBE_CONNECT_TIMEOUT_MS = 900');
+    expect(discovery).toContain('ENTRY_PROBE_BUDGET_MS = 2_500L');
+    expect(discovery).toContain('MAX_PROBED_ENTRY_IDENTITIES = 8');
+    expect(discovery).toContain('ENTRY_PROBE_MAX_CONCURRENCY = 8');
     expect(discovery).toContain('CacheControl.FORCE_NETWORK');
     expect(discovery).toContain('MAX_RESPONSE_BYTES = 1024');
     expect(discovery).toContain('ConnectionSpec.MODERN_TLS');
@@ -1288,8 +1402,54 @@ describe('Android native MASQ core integration', () => {
     expect(discovery).toContain('preferredDescriptors = preferredNodes');
     expect(discovery).toContain('candidate.publicKey in selectedKeys');
     expect(discovery).toContain('candidate.host in selectedHosts');
-    expect(discovery).toContain('saveCached(chain, result.persistentDescriptors)');
-    expect(discovery).toContain('candidate.singlePortDescriptor(generation)');
+    expect(discovery).toContain('saveCached(chain, result.cacheDescriptors)');
+    expect(discovery).toContain('planEntryNodeProbes(');
+    expect(discovery).toContain(
+      'planEntryNodeProbes(candidates, maxIdentities, generation)',
+    );
+    expect(discovery).toContain(
+      'maxIdentities: Int = MAX_PROBED_ENTRY_IDENTITIES',
+    );
+    expect(discovery).toContain(
+      'Math.floorMod(generation, candidate.ports.size)',
+    );
+    expect(discovery).toContain('plan.primaryTargets');
+    expect(discovery).toContain('entryNodeProbeFallbackRequired(');
+    expect(discovery).toContain('plan.fallbackTargets');
+    expect(discovery).toContain('"NF_PROBE_PRIMARY"');
+    expect(discovery).toContain('"NF_PROBE_FALLBACK"');
+    expect(discovery).toContain('planEntryNodeProbePhases(');
+    expect(discovery).toContain('MAX_QUARANTINED_STANDBY_PROBE_IDENTITIES');
+    expect(discovery).toContain('"NF_PROBE_STANDBY"');
+    expect(discovery).toContain('ENTRY_PROBE_LATENCY_BAND_MS = 100');
+    expect(discovery).toContain('"best_band"');
+    expect(discovery).toContain('"worst_band"');
+    expect(discovery).not.toContain('"best_ms"');
+    expect(discovery).not.toContain('"worst_ms"');
+    expect(discovery).toContain('EntryNodePortProbe');
+    expect(discovery).toContain('recordConnectionFailure(');
+    expect(discovery).toContain('recordRouteProofFailure(');
+    expect(discovery).toContain('recordKnownGoodRoute(');
+    expect(discovery).toContain('KNOWN_GOOD_TTL_MS = 24 * 60 * 60_000L');
+    expect(discovery).toContain('MIN_REQUIRED_ENTRY_NODES = 2');
+    expect(discovery).toContain('MAX_RUNTIME_ENTRY_NODES = 3');
+    expect(discovery).toContain(
+      'MAX_KNOWN_GOOD_CANDIDATES = MAX_RUNTIME_ENTRY_NODES',
+    );
+    expect(discovery).toContain('private val finderSessionNonce = UUID.randomUUID().toString()');
+    expect(discovery).toContain('.addQueryParameter(');
+    expect(discovery).toContain('"refresh",');
+    expect(discovery).toContain(
+      '"$finderSessionNonce-${generation.toUInt()}-$attempt"',
+    );
+    expect(discovery).toContain('decodeKnownGoodEntryNodes(');
+    expect(discovery).toContain('prioritizeKnownGoodEntryNodes(');
+    expect(discovery).toContain('"NF_KNOWN_GOOD_OK"');
+    expect(discovery).toContain('deprioritizeAttemptedEntryNodes(');
+    expect(discovery).toContain(
+      'ROUTE_FAILURE_DEPRIORITIZATION_MS = 2 * 60_000L',
+    );
+    expect(discovery).toContain('excludeQuarantinedEntryNodes(');
     expect(discovery).toContain('mergePortVariants(');
     expect(discovery).toContain('"NF_SELECTION_OK"');
     expect(discovery).toContain(
@@ -1299,10 +1459,36 @@ describe('Android native MASQ core integration', () => {
     expect(discovery).not.toContain('Log.i(LOG_TAG, descriptor');
     expect(discovery).not.toContain('Log.i(LOG_TAG, publicKey');
     expect(discovery).not.toContain('Log.i(LOG_TAG, host');
-    expect(discovery).not.toContain('Socket()');
-    expect(discovery).not.toContain('InetSocketAddress');
+    expect(discovery).toContain('Socket().use');
+    expect(discovery).toContain('InetSocketAddress(host, port)');
     expect(moduleSource).toContain(
       'entryNodeDiscovery.discover(chain, preferredNodes)',
+    );
+    expect(moduleSource).toContain(
+      'entryNodeDiscovery.recordConnectionFailure(chain, preferredNodes)',
+    );
+    expect(moduleSource).toContain(
+      'val lastError = safeLastErrorValue(status.opt("lastError"))',
+    );
+    expect(moduleSource).toContain('ENTRY_NODE_QUARANTINE_CODES');
+    expect(moduleSource).toContain('routeStage != 0');
+    expect(backgroundRecovery).toContain(
+      'lastError = initialSnapshot.lastError',
+    );
+    expect(backgroundRecovery).toContain(
+      'entryNodeDiscovery.recordRouteProofFailure(chain, preferredNodes)',
+    );
+    expect(backgroundRecovery).toContain(
+      'var routeProofFailed =\n        shouldDeprioritizeAttemptedEntryNodes(',
+    );
+    expect(moduleSource).toContain(
+      'recordEntrySelectionFeedbackFromSavedConfig(currentStatus)',
+    );
+    expect(moduleSource).toContain(
+      'recordKnownGoodEntrySelectionFromSavedConfig(JSONObject(status))',
+    );
+    expect(moduleSource).toContain(
+      'entryNodeDiscovery.recordKnownGoodRoute(chain, preferredNodes, snapshot)',
     );
     expect(moduleSource).toContain(
       'JSONArray(discoveryResult.runtimeDescriptors)',
@@ -1412,16 +1598,76 @@ describe('Android native MASQ core integration', () => {
     expect(shutdown.indexOf('MasqSessionService.stop(')).toBeLessThan(
       shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
     );
-    expect(
-      shutdown.indexOf('MasqCoreLifecycle.executor.execute'),
-    ).toBeLessThan(
+    expect(shutdown.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
       shutdown.indexOf('MasqCoreJni.nativeShutdown()'),
     );
+    expect(
+      shutdown.indexOf('recordEntrySelectionFeedbackFromSavedConfig('),
+    ).toBeLessThan(shutdown.indexOf('MasqCoreJni.nativeShutdown()'));
     expect(rejection).toContain(
       'promise.reject("E_CORE_START_CANCELLED", START_CANCELLED_MESSAGE)',
     );
     expect(rejection).toContain('} else if (error == null) {');
     expect(rejection).not.toContain('MasqSessionService.stop');
+  });
+
+  it('uses validated network identity and retains recovery authority while system routing is active', () => {
+    const networkStatus = moduleSource.slice(
+      moduleSource.indexOf('override fun getNetworkStatus(promise: Promise)'),
+      moduleSource.indexOf('override fun getNodeFinderUrl(promise: Promise)'),
+    );
+    const stop = moduleSource.slice(
+      moduleSource.indexOf('override fun stop(promise: Promise)'),
+      moduleSource.indexOf('override fun shutdown(promise: Promise)'),
+    );
+    const shutdown = moduleSource.slice(
+      moduleSource.indexOf('override fun shutdown(promise: Promise)'),
+      moduleSource.indexOf(
+        'private fun recordEntrySelectionFeedbackFromSavedConfig(',
+      ),
+    );
+    const reset = moduleSource.slice(
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+    );
+    const networkReset = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+    );
+
+    expect(networkStatus).toContain(
+      'NetworkCapabilities.NET_CAPABILITY_VALIDATED',
+    );
+    expect(networkStatus).toContain('resolveMasqValidatedUnderlayNetwork(');
+    expect(networkStatus).toContain('underlay?.network?.networkHandle');
+    expect(networkStatus).toContain('MasqNetworkStatusLifecycle.tracker');
+    expect(networkStatus).not.toContain('System.currentTimeMillis()');
+    expect(stop.indexOf('authorizeSessionSupervisorStop(')).toBeLessThan(
+      stop.indexOf('MasqSessionService.stop('),
+    );
+    expect(shutdown.indexOf('authorizeSessionSupervisorStop(')).toBeLessThan(
+      shutdown.indexOf('MasqSessionService.stop('),
+    );
+    expect(reset.indexOf('resetConfirmed')).toBeLessThan(
+      reset.indexOf('MasqSessionService.stop('),
+    );
+    expect(reset.indexOf('MasqSessionService.stop(')).toBeLessThan(
+      reset.indexOf('finishFullReset(promise)'),
+    );
+    expect(networkReset).toContain(
+      'stopSessionSupervisorAfterConfirmedSystemRoutingOff(promise)',
+    );
+    expect(
+      networkReset.indexOf(
+        'stopSessionSupervisorAfterConfirmedSystemRoutingOff(promise)',
+      ),
+    ).toBeLessThan(
+      networkReset.indexOf('MasqCoreJni.nativeResetNetworkProfile()'),
+    );
   });
 
   it('serializes destructive Android actions behind one process-global start fence', () => {
@@ -1457,9 +1703,7 @@ describe('Android native MASQ core integration', () => {
     );
     expect(
       removeWallet.indexOf('MasqCoreLifecycle.executor.execute'),
-    ).toBeLessThan(
-      removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()'),
-    );
+    ).toBeLessThan(removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()'));
     expect(moduleSource).not.toContain('private val ioExecutor');
   });
 
@@ -1479,14 +1723,14 @@ describe('Android native MASQ core integration', () => {
     expect(startSnapshot).toContain('MasqCoreLifecycle.executor.execute');
     expect(startSnapshot).toContain('discoveryExecutor.execute');
     expect(startSnapshot).not.toContain('entryNodeDiscovery.discover(');
-    expect(discoveryCompletion.indexOf('entryNodeDiscovery.discover(')).toBeLessThan(
+    expect(
+      discoveryCompletion.indexOf('entryNodeDiscovery.discover('),
+    ).toBeLessThan(
       discoveryCompletion.indexOf('MasqCoreLifecycle.executor.execute'),
     );
     expect(
       discoveryCompletion.indexOf('MasqCoreLifecycle.executor.execute'),
-    ).toBeLessThan(
-      discoveryCompletion.indexOf('MasqCoreJni.nativeConfigure('),
-    );
+    ).toBeLessThan(discoveryCompletion.indexOf('MasqCoreJni.nativeConfigure('));
     expect(discoveryCompletion).toContain(
       'synchronized(MasqCoreLifecycle.lock)',
     );
@@ -1514,6 +1758,10 @@ describe('Android native MASQ core integration', () => {
       moduleSource.indexOf('override fun setSystemTunnel('),
       moduleSource.indexOf('private fun stopSystemTunnel('),
     );
+    const preflight = moduleSource.slice(
+      moduleSource.indexOf('override fun preflightBrowserProxy('),
+      moduleSource.indexOf('override fun getDebtSummary('),
+    );
 
     for (const operation of [
       getStatus,
@@ -1525,9 +1773,20 @@ describe('Android native MASQ core integration', () => {
       expect(operation).toContain('MasqCoreLifecycle.executor.execute');
     }
     expect(getStatus).toContain('E_CORE_RESTORE');
-    expect(setSystemTunnel.indexOf('MasqCoreLifecycle.executor.execute')).toBeLessThan(
-      setSystemTunnel.indexOf('restoreCoreIfNeeded()'),
+    expect(getStatus).toContain(
+      'recordKnownGoodEntrySelectionFromSavedConfig(JSONObject(status))',
     );
+    expect(preflight).toContain('MasqCoreJni.nativePreflightProxy()');
+    expect(preflight).toContain(
+      'MasqCoreJni.nativePreflightProxy().also { status ->',
+    );
+    expect(preflight).toContain('runCatching {');
+    expect(preflight).toContain(
+      'recordKnownGoodEntrySelectionFromSavedConfig(JSONObject(status))',
+    );
+    expect(
+      setSystemTunnel.indexOf('MasqCoreLifecycle.executor.execute'),
+    ).toBeLessThan(setSystemTunnel.indexOf('restoreCoreIfNeeded()'));
     expect(moduleSource).toContain('E_VPN_STALE_CORE');
     for (const operation of [configure, importWallet, updateMinHops]) {
       expect(operation.indexOf('invalidatePendingStarts()')).toBeLessThan(
@@ -1577,15 +1836,15 @@ describe('Android native MASQ core integration', () => {
     expect(removeWallet.indexOf('if (!MasqCoreJni.isAvailable)')).toBeLessThan(
       removeWallet.indexOf('walletStore.delete()'),
     );
-    expect(removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()')).toBeLessThan(
-      removeWallet.indexOf('walletStore.delete()'),
-    );
+    expect(
+      removeWallet.indexOf('MasqCoreJni.nativeRemoveWallet()'),
+    ).toBeLessThan(removeWallet.indexOf('walletStore.delete()'));
     expect(removeWallet.indexOf('isExactWalletRemovalStatus(')).toBeLessThan(
       removeWallet.indexOf('walletStore.delete()'),
     );
-    expect(removeWallet.lastIndexOf('MasqCoreJni.nativeGetStatus()')).toBeLessThan(
-      removeWallet.indexOf('promise.resolve(finalStatusJson)'),
-    );
+    expect(
+      removeWallet.lastIndexOf('MasqCoreJni.nativeGetStatus()'),
+    ).toBeLessThan(removeWallet.indexOf('promise.resolve(finalStatusJson)'));
   });
 
   it('rejects missing or malformed Android core phases as unsuccessful', () => {
@@ -1594,7 +1853,9 @@ describe('Android native MASQ core integration', () => {
       moduleSource.indexOf('private fun nullableStatusString('),
     );
 
-    expect(statusSucceeded).toContain('val phase = JSONObject(statusJson).opt("phase")');
+    expect(statusSucceeded).toContain(
+      'val phase = JSONObject(statusJson).opt("phase")',
+    );
     expect(statusSucceeded).toContain('phase is String');
     expect(statusSucceeded).toContain('phase in');
     expect(statusSucceeded).not.toContain('optString("phase") != "error"');
@@ -1613,14 +1874,36 @@ describe('Android native MASQ core integration', () => {
       moduleSource.indexOf('private fun applyDirectBrowserRouting('),
       moduleSource.indexOf('private fun failBrowserRoutingClosed('),
     );
+    const proxyMutationGuards = moduleSource.slice(
+      moduleSource.indexOf('private fun setBrowserProxyOverride('),
+      moduleSource.indexOf('private data class BrowserRoutingRequest('),
+    );
+    const abortRouting = moduleSource.slice(
+      moduleSource.indexOf('private fun abortBrowserRoutingRequestClosed('),
+      moduleSource.indexOf(
+        'private fun armFailClosedBrowserTransitionTimeout(',
+      ),
+    );
+    const failClosedRouting = moduleSource.slice(
+      moduleSource.indexOf(
+        'private fun armFailClosedBrowserTransitionTimeout(',
+      ),
+      moduleSource.indexOf('private fun invalidateBrowserRoutingRequests('),
+    );
+    const failClosedCompletion = moduleSource.slice(
+      moduleSource.indexOf('private fun completeFailClosedBrowserTransition('),
+      moduleSource.indexOf('private fun timeoutFailClosedBrowserTransition('),
+    );
+    const failClosedTimeout = moduleSource.slice(
+      moduleSource.indexOf('private fun timeoutFailClosedBrowserTransition('),
+      moduleSource.indexOf('private fun invalidateBrowserRoutingRequests('),
+    );
     const companion = moduleSource.slice(
       moduleSource.indexOf('companion object {'),
       moduleSource.indexOf('private data class BrowserSite('),
     );
 
-    expect(browserRouting).toContain(
-      'MasqCoreLifecycle.startGeneration.get()',
-    );
+    expect(browserRouting).toContain('MasqCoreLifecycle.startGeneration.get()');
     expect(browserRouting).toContain('requireCurrentBrowserCore(request)');
     expect(moduleSource).toContain('E_BROWSER_STALE_CORE');
     expect(browserRouting).toContain('MasqCoreLifecycle.executor.execute');
@@ -1629,20 +1912,87 @@ describe('Android native MASQ core integration', () => {
     ).toBeLessThan(
       browserRouting.indexOf('MasqCoreJni.nativeSetProxyEnabled(true)'),
     );
-    expect(masqConfirmation.match(/requireCurrentBrowserCore\(request\)/g))
-      .toHaveLength(3);
-    expect(directRouting.indexOf('requireCurrentBrowserCore(request)'))
-      .toBeLessThan(
-        directRouting.indexOf(
-          'ProxyController.getInstance().clearProxyOverride',
-        ),
-      );
-    expect(directRouting.match(/requireCurrentBrowserCore\(request\)/g)?.length)
-      .toBeGreaterThanOrEqual(4);
+    expect(
+      masqConfirmation.match(/requireCurrentBrowserCore\(request\)/g),
+    ).toHaveLength(3);
+    expect(
+      directRouting.indexOf('requireCurrentBrowserCore(request)'),
+    ).toBeLessThan(directRouting.indexOf('clearBrowserProxyOverride(request)'));
+    expect(
+      directRouting.match(/requireCurrentBrowserCore\(request\)/g)?.length,
+    ).toBeGreaterThanOrEqual(4);
     expect(companion).toContain(
       'private val browserRoutingQueue = ArrayDeque<BrowserRoutingRequest>()',
     );
-    expect(moduleSource).toContain('next?.owner?.applyBrowserRoutingMode(next)');
+    expect(moduleSource).toContain(
+      'private const val BROWSER_ROUTING_TIMEOUT_MS = 12_000L',
+    );
+    expect(moduleSource).toContain(
+      'private const val BROWSER_FAIL_CLOSED_TIMEOUT_MS = 12_000L',
+    );
+    expect(browserRouting).toContain('timeoutBrowserRoutingRequest(request)');
+    expect(abortRouting).toContain('scheduleFailClosedBrowserTransition');
+    expect(abortRouting).not.toContain('startNextBrowserRoutingRequest');
+    expect(failClosedRouting).toContain(
+      'browserProxyCallbackFence.hasActiveMutation()',
+    );
+    expect(failClosedRouting).toContain(
+      'ProxyController.getInstance().setProxyOverride',
+    );
+    expect(
+      failClosedCompletion.indexOf(
+        'browserProxyCallbackFence.complete(ticket)',
+      ),
+    ).toBeLessThan(
+      failClosedCompletion.indexOf('startNextBrowserRoutingRequest'),
+    );
+    expect(failClosedTimeout).toContain(
+      'browserProxyCallbackFence.markActiveTimedOut()',
+    );
+    expect(failClosedTimeout).toContain('browserProxyFenceTimedOut = true');
+    expect(failClosedTimeout).toContain('browserRoutingQueue.removeFirst()');
+    expect(moduleSource).toContain(
+      'request.completed.compareAndSet(false, true)',
+    );
+    expect(browserRouting).toContain('E_BROWSER_ROUTING_SUPERSEDED');
+    expect(browserRouting).toContain('E_BROWSER_ROUTING_TIMEOUT');
+    expect(moduleSource).toContain('invalidateBrowserRoutingRequests()');
+    expect(browserRouting).toContain('enqueueBrowserRoutingRequest(');
+    expect(browserRouting).toContain('prioritizeBlocked = true');
+    expect(browserRouting).not.toContain('.addDirect()');
+    expect(proxyMutationGuards).toContain('synchronized(browserRoutingLock)');
+    expect(proxyMutationGuards).toContain('browserRoutingActive !== request');
+    expect(proxyMutationGuards).toContain(
+      'ProxyController.getInstance().setProxyOverride',
+    );
+    expect(proxyMutationGuards).toContain(
+      'ProxyController.getInstance().clearProxyOverride',
+    );
+    expect(proxyMutationGuards).toContain('beginBrowserProxyMutation(request)');
+    expect(proxyMutationGuards).toContain(
+      'BrowserProxyCallbackCompletion.STALE',
+    );
+  });
+
+  it('keeps timed-out Android proxy callbacks fenced until their matching callback', () => {
+    const callbackFence = moduleSource.slice(
+      moduleSource.indexOf('internal class BrowserProxyCallbackFence'),
+      moduleSource.indexOf('internal fun safeCoreStatusDiagnostic('),
+    );
+    const timeoutMutation = callbackFence.slice(
+      callbackFence.indexOf('fun markTimedOut('),
+      callbackFence.indexOf('fun complete('),
+    );
+
+    expect(callbackFence).toContain('if (activeTicket != null) return null');
+    expect(callbackFence).toContain(
+      'if (activeTicket != ticket) return BrowserProxyCallbackCompletion.STALE',
+    );
+    expect(timeoutMutation).toContain('activeTimedOut = true');
+    expect(timeoutMutation).not.toContain('activeTicket = null');
+    expect(callbackFence).toContain(
+      'BrowserProxyCallbackCompletion.CURRENT_AFTER_TIMEOUT',
+    );
   });
 
   it('persists only strict Android browser protection preferences', () => {

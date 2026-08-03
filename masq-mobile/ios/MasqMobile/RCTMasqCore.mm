@@ -2722,8 +2722,19 @@ NSString *_Nullable financialResultError(NSString *_Nullable result) {
         NSNumber *port = [status isKindOfClass:[NSDictionary class]]
             ? status[@"proxyPort"]
             : nil;
+        NSNumber *connectedNeighbors =
+            [status isKindOfClass:[NSDictionary class]]
+                ? status[@"connectedNeighbors"]
+                : nil;
+        NSNumber *routeStage = [status isKindOfClass:[NSDictionary class]]
+            ? status[@"routeStage"]
+            : nil;
         if (![status isKindOfClass:[NSDictionary class]] ||
             ![status[@"phase"] isEqualToString:@"connected"] ||
+            ![connectedNeighbors isKindOfClass:[NSNumber class]] ||
+            connectedNeighbors.integerValue < 1 ||
+            ![routeStage isKindOfClass:[NSNumber class]] ||
+            routeStage.integerValue < 2 ||
             ![port isKindOfClass:[NSNumber class]] || port.integerValue < 1 ||
             port.integerValue > 65535) {
           reject(@"E_NOT_CONNECTED", @"Build a valid MASQ route first.", nil);

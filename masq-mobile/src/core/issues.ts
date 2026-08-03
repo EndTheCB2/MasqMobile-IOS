@@ -1,8 +1,11 @@
 import type { CoreStatus, NetworkStatus } from './types';
+import { isCoreRouteReady } from './connectionReadiness';
 import {
   extractMasqErrorCode,
   extractMasqErrorMessage,
   isEntryNodeRetryCode,
+  isNetworkTransitionRetryCode,
+  isPrivateRouteRetryCode,
 } from './errorCodes';
 
 export type MasqIssueCategory =
@@ -93,8 +96,7 @@ export function reconcileMasqIssue(
 ): MasqIssue | null {
   if (!current) return null;
 
-  const connected =
-    status.phase === 'connected' && status.connectedNeighbors > 0;
+  const connected = isCoreRouteReady(status);
   switch (current.category) {
     case 'offline':
       return network.available ? null : current;
@@ -102,9 +104,7 @@ export function reconcileMasqIssue(
     case 'permission':
       return connected ? null : current;
     case 'route':
-      return connected && status.routeStage >= 2 && !status.lastError
-        ? null
-        : current;
+      return connected ? null : current;
     case 'unknown':
       return ['ready', 'connected'].includes(status.phase) && !status.lastError
         ? null
@@ -133,6 +133,32 @@ export function classifyMasqIssue(
       'settings',
       code,
       'No internet connection is available. Reconnect Wi-Fi or mobile data, then try again.',
+    );
+  }
+  if (isNetworkTransitionRetryCode(code)) {
+    return issue(
+      'route',
+      'retry',
+      code,
+      'The active network changed while MASQ was connecting. MASQ will retry safely on the current network.',
+    );
+  }
+  if (isPrivateRouteRetryCode(code)) {
+    return issue(
+      'route',
+      'retry',
+      code,
+      code === 'E_PRIVATE_ROUTE_TIMEOUT'
+        ? 'MASQ connected to an entry peer, but could not prove a private exit route in time. Retry with refreshed entry nodes.'
+        : 'MASQ could not prove an end-to-end private exit route. Retry with refreshed entry nodes.',
+    );
+  }
+  if (code === 'E_CONNECTION_BUDGET_EXHAUSTED') {
+    return issue(
+      'route',
+      'retry',
+      code,
+      'MASQ could not prove a private route within the bounded connection time. Retry to test fresh entry nodes.',
     );
   }
   if (isEntryNodeRetryCode(code)) {

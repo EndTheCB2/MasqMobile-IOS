@@ -4,7 +4,7 @@ use jni::JNIEnv;
 use zeroize::Zeroizing;
 
 use crate::core::MobileCore;
-use crate::CORE;
+use crate::{refresh_route_proof_status, CORE};
 
 fn status_after(operation: impl FnOnce(&mut MobileCore) -> Result<(), String>) -> String {
     let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -154,7 +154,22 @@ pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativePreflightProxy(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jstring {
-    let status = status_after(MobileCore::preflight_proxy);
+    let status = CORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .preflight_proxy_status_json();
+    java_string(&mut env, status)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeRefreshRouteProof(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    // Periodic refresh failures are observations, not global core failures.
+    // Deliberately bypass the generic mutating status wrapper, whose
+    // explicit-operation contract promotes every Err to phase=error.
+    let status = refresh_route_proof_status();
     java_string(&mut env, status)
 }
 

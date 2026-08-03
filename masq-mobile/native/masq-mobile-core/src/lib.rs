@@ -15,6 +15,44 @@ use zeroize::Zeroizing;
 
 static CORE: Lazy<Mutex<MobileCore>> = Lazy::new(|| Mutex::new(MobileCore::default()));
 
+/// Shared two-phase refresh boundary for the C ABI and Android JNI.
+///
+/// Only the tiny identity snapshots run under the mutex. The potentially
+/// twelve-second socket/TLS probe runs after the first guard has been dropped,
+/// allowing shutdown and recovery operations to acquire CORE immediately.
+fn refresh_route_proof_status_with(
+    core_mutex: &Mutex<MobileCore>,
+    probe: impl FnOnce(u16) -> Result<(), String>,
+) -> String {
+    let ticket = {
+        let mut core = core_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match core.begin_route_proof_refresh() {
+            Some(ticket) => ticket,
+            None => return core.route_proof_refresh_not_ready_json(),
+        }
+    };
+
+    let probe_result = probe(ticket.proxy_port());
+    core_mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .complete_route_proof_refresh(ticket, probe_result)
+}
+
+#[cfg(feature = "node-engine")]
+pub(crate) fn refresh_route_proof_status() -> String {
+    refresh_route_proof_status_with(&CORE, MobileCore::probe_private_route_for_refresh)
+}
+
+#[cfg(not(feature = "node-engine"))]
+pub(crate) fn refresh_route_proof_status() -> String {
+    CORE.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .route_proof_refresh_unavailable_json()
+}
+
 fn with_core(operation: impl FnOnce(&mut MobileCore) -> Result<(), String>) -> *mut c_char {
     let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Err(error) = operation(&mut core) {
@@ -125,7 +163,16 @@ pub extern "C" fn masq_mobile_remove_wallet() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn masq_mobile_preflight_proxy() -> *mut c_char {
-    with_core(MobileCore::preflight_proxy)
+    let status = CORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .preflight_proxy_status_json();
+    into_c_string(status)
+}
+
+#[no_mangle]
+pub extern "C" fn masq_mobile_refresh_route_proof() -> *mut c_char {
+    into_c_string(refresh_route_proof_status())
 }
 
 #[no_mangle]
@@ -175,6 +222,92 @@ pub extern "C" fn masq_mobile_retry_debt_settlement() -> *mut c_char {
 pub unsafe extern "C" fn masq_mobile_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(CString::from_raw(value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn route_refresh_probe_releases_core_lock_and_stale_success_cannot_restore_shutdown_state() {
+        let core_mutex = Arc::new(Mutex::new(MobileCore::healthy_for_route_refresh_test(
+            7, 44_443,
+        )));
+        let refresh_core = Arc::clone(&core_mutex);
+        let (probe_started_tx, probe_started_rx) = mpsc::channel();
+        let (finish_probe_tx, finish_probe_rx) = mpsc::channel();
+
+        let refresh = thread::spawn(move || {
+            refresh_route_proof_status_with(&refresh_core, |port| {
+                assert_eq!(port, 44_443);
+                probe_started_tx.send(()).unwrap();
+                finish_probe_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the test releases its bounded probe");
+                Ok(())
+            })
+        });
+
+        probe_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the refresh reached its unlocked probe phase");
+        {
+            let mut core = core_mutex
+                .try_lock()
+                .expect("CORE must not be locked by the route socket/TLS probe");
+            core.shutdown();
+        }
+        finish_probe_tx.send(()).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&refresh.join().unwrap()).unwrap();
+        assert_eq!(response["phase"], "unconfigured");
+        assert_eq!(response["proxyEnabled"], false);
+        assert_eq!(response["proxyPort"], serde_json::Value::Null);
+        assert_eq!(response["routeStage"], 0);
+        assert_eq!(response["routeProofRefresh"]["attempted"], false);
+        assert_eq!(response["routeProofRefresh"]["succeeded"], false);
+        assert_eq!(
+            response["routeProofRefresh"]["errorCode"],
+            "E_PRIVATE_ROUTE_REFRESH_NOT_READY"
+        );
+    }
+
+    #[test]
+    fn stale_probe_result_cannot_mutate_a_replacement_engine_with_the_same_proxy_port() {
+        let core_mutex = Arc::new(Mutex::new(MobileCore::healthy_for_route_refresh_test(
+            41, 44_443,
+        )));
+        let refresh_core = Arc::clone(&core_mutex);
+        let (probe_started_tx, probe_started_rx) = mpsc::channel();
+        let (finish_probe_tx, finish_probe_rx) = mpsc::channel();
+
+        let refresh = thread::spawn(move || {
+            refresh_route_proof_status_with(&refresh_core, |_| {
+                probe_started_tx.send(()).unwrap();
+                finish_probe_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the test releases its bounded probe");
+                Ok(())
+            })
+        });
+
+        probe_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the refresh reached its unlocked probe phase");
+        *core_mutex.lock().unwrap() = MobileCore::healthy_for_route_refresh_test(42, 44_443);
+        finish_probe_tx.send(()).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&refresh.join().unwrap()).unwrap();
+        assert_eq!(response["engineGeneration"], 42);
+        assert_eq!(response["proxyPort"], 44_443);
+        assert_eq!(response["phase"], "connected");
+        assert_eq!(response["routeProofRefresh"]["attempted"], false);
+        assert_eq!(response["routeProofRefresh"]["succeeded"], false);
     }
 }
 

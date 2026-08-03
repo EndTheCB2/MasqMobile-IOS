@@ -26,6 +26,7 @@ import { UNSUPPORTED_SYSTEM_TUNNEL } from '../src/core/systemTunnel';
 
 const mockPrepareBrowserSession = jest.fn();
 const mockCloseBrowserSession = jest.fn();
+const mockRepairPrivateBrowserRoute = jest.fn();
 const TEST_PLATFORM_OS = Platform.OS;
 const HARDWARE_BACK_EVENT = {
   timeStamp: 0,
@@ -70,6 +71,8 @@ jest.mock('../src/core/browserSession', () => ({
   closeBrowserSession: (...args: unknown[]) => mockCloseBrowserSession(...args),
   prepareBrowserSession: (...args: unknown[]) =>
     mockPrepareBrowserSession(...args),
+  repairPrivateBrowserRoute: (...args: unknown[]) =>
+    mockRepairPrivateBrowserRoute(...args),
 }));
 
 jest.mock('../src/hooks/useMasqController', () => ({
@@ -83,9 +86,11 @@ jest.mock('../src/screens/BrowserScreen', () => {
     BrowserScreen: ({
       mode,
       onClose,
+      onRepairRoute,
     }: {
       mode: 'masq' | 'direct';
       onClose: (reason?: 'user' | 'background') => Promise<void> | void;
+      onRepairRoute?: () => Promise<void>;
     }) => {
       ReactModule.useEffect(() => {
         const subscription = NativeAppState.addEventListener(
@@ -101,6 +106,7 @@ jest.mock('../src/screens/BrowserScreen', () => {
       return ReactModule.createElement(View, {
         mode,
         onClose,
+        onRepairRoute,
         testID: 'browser-screen',
       });
     },
@@ -126,6 +132,7 @@ describe('App browser routing modes', () => {
       .mockReset()
       .mockImplementation(async (_core, mode) => mode);
     mockCloseBrowserSession.mockReset().mockResolvedValue('blocked');
+    mockRepairPrivateBrowserRoute.mockReset().mockResolvedValue(undefined);
     mockController.refresh.mockClear();
     mockController.retryInitialization.mockClear();
     mockController.recoverNetworkProfile.mockClear();
@@ -336,6 +343,7 @@ describe('App browser routing modes', () => {
       chain: 'base-mainnet',
       connectedNeighbors: 1,
       engineAvailable: true,
+      engineGeneration: 1,
       phase: 'connected',
       proxyPort: 44_443,
       routeHops: 2,
@@ -453,7 +461,9 @@ describe('App browser routing modes', () => {
       connectedNeighbors: 1,
       engineAvailable: true,
       phase: 'connected',
+      proxyPort: 44_443,
       routeHops: 2,
+      routeStage: 2,
       walletAddress: '0x1234567890abcdef',
     };
     mockPrepareBrowserSession.mockRejectedValue(
@@ -475,6 +485,50 @@ describe('App browser routing modes', () => {
       renderer.root.findAllByProps({ testID: 'browser-screen' }),
     ).toHaveLength(0);
     expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The private route was interrupted',
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('clears a transient private-browser issue after the native route recovers', async () => {
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      engineGeneration: 1,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+      walletAddress: '0x1234567890abcdef',
+    };
+    mockPrepareBrowserSession.mockRejectedValue(
+      new Error('MASQ route verification failed.'),
+    );
+    const renderer = await renderApp();
+
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The private route was interrupted',
+    );
+
+    mockController.status = {
+      ...mockController.status,
+      lastError: null,
+      routeHops: 2,
+      routeStage: 2,
+    };
+    await ReactTestRenderer.act(async () => {
+      renderer.update(<App />);
+      await Promise.resolve();
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
       'The private route was interrupted',
     );
     ReactTestRenderer.act(() => renderer.unmount());
@@ -588,6 +642,68 @@ describe('App browser routing modes', () => {
     await ReactTestRenderer.act(async () => {
       await browser.props.onClose();
     });
+    expect(
+      renderer.root.findAllByProps({ testID: 'browser-screen' }),
+    ).toHaveLength(0);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('invalidates and fully settles a pending route repair before leaving the browser', async () => {
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      phase: 'connected',
+      proxyEnabled: true,
+      proxyPort: 44_443,
+      routeHops: 2,
+      routeStage: 2,
+      walletAddress: '0x1234567890abcdef',
+    };
+    let resolveRepair!: () => void;
+    let repairIsCurrent!: () => boolean;
+    mockRepairPrivateBrowserRoute.mockImplementation(
+      (_core, _reconnect, isCurrent: () => boolean) => {
+        repairIsCurrent = isCurrent;
+        return new Promise<void>(resolve => {
+          resolveRepair = resolve;
+        });
+      },
+    );
+    const renderer = await renderApp();
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const browser = renderer.root.findByProps({ testID: 'browser-screen' });
+    const repair = browser.props.onRepairRoute();
+    await Promise.resolve();
+    expect(repairIsCurrent()).toBe(true);
+
+    let close!: Promise<void>;
+    ReactTestRenderer.act(() => {
+      close = browser.props.onClose();
+    });
+    await ReactTestRenderer.act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(repairIsCurrent()).toBe(false);
+    expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findAllByProps({ testID: 'browser-screen' }),
+    ).not.toHaveLength(0);
+
+    await ReactTestRenderer.act(async () => {
+      resolveRepair();
+      await repair;
+      await close;
+    });
+
+    expect(mockCloseBrowserSession).toHaveBeenCalledTimes(2);
     expect(
       renderer.root.findAllByProps({ testID: 'browser-screen' }),
     ).toHaveLength(0);

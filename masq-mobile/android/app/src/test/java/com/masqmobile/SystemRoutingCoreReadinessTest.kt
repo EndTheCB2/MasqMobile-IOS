@@ -12,6 +12,7 @@ class SystemRoutingCoreReadinessTest {
     assertTrue(ready.ready)
     assertFalse(status(connectedNeighbors = 0).ready)
     assertFalse(status(routeStage = 0).ready)
+    assertFalse(status(routeStage = 1).ready)
     assertFalse(status(proxyPort = 0).ready)
     assertFalse(status(engineGeneration = 0).ready)
     assertFalse(status(phase = "connecting").ready)
@@ -28,7 +29,7 @@ class SystemRoutingCoreReadinessTest {
   private fun status(
       phase: String = "connected",
       connectedNeighbors: Int = 1,
-      routeStage: Int = 1,
+      routeStage: Int = 2,
       proxyPort: Int = 44_443,
       engineGeneration: Long = 3,
   ): SystemRoutingCoreReadiness =

@@ -17,8 +17,12 @@ import { masqCore } from './src/core/masqCore';
 import {
   closeBrowserSession,
   prepareBrowserSession,
+  repairPrivateBrowserRoute,
 } from './src/core/browserSession';
-import { isCoreReadyForSystemRouting } from './src/core/connectionReadiness';
+import {
+  isCoreReadyForSystemRouting,
+  isCoreRouteReady,
+} from './src/core/connectionReadiness';
 import { buildRedactedDiagnostics } from './src/core/diagnostics';
 import { classifyMasqIssue } from './src/core/issues';
 import {
@@ -60,12 +64,19 @@ function AppContent() {
     null,
   );
   const [browserOpening, setBrowserOpening] = useState(false);
+
   const [browserMode, setBrowserMode] = useState<BrowserMode | null>(null);
   const [privacyShielded, setPrivacyShielded] = useState(false);
   const browserOperation = useRef(0);
   const browserOpenInFlight = useRef(false);
   const openingBrowserMode = useRef<BrowserMode | null>(null);
+  const browserRepairInFlight = useRef<Promise<void> | null>(null);
   const controller = useMasqController();
+  const recoverablePrivateBrowserError = useRef<string | null>(null);
+  const previousCoreRouteReady = useRef(
+    isCoreRouteReady(controller.status),
+  );
+  const coreRouteReady = isCoreRouteReady(controller.status);
   const activeIssue = directBrowserError
     ? {
         action: 'none' as const,
@@ -80,6 +91,34 @@ function AppContent() {
         controller.network,
         controller.status,
       );
+
+  useEffect(() => {
+    const routeRecovered =
+      coreRouteReady && !previousCoreRouteReady.current;
+    previousCoreRouteReady.current = coreRouteReady;
+    if (!routeRecovered) {
+      return;
+    }
+    setRouteError(current => {
+      if (
+        !current ||
+        current !== recoverablePrivateBrowserError.current
+      ) {
+        return current;
+      }
+      recoverablePrivateBrowserError.current = null;
+      return null;
+    });
+  }, [coreRouteReady]);
+
+  useEffect(() => {
+    if (
+      recoverablePrivateBrowserError.current &&
+      recoverablePrivateBrowserError.current !== routeError
+    ) {
+      recoverablePrivateBrowserError.current = null;
+    }
+  }, [routeError]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', state => {
@@ -182,6 +221,7 @@ function AppContent() {
     browserOpenInFlight.current = true;
     openingBrowserMode.current = 'masq';
     setDirectBrowserError(null);
+    recoverablePrivateBrowserError.current = null;
     setRouteError(null);
     setBrowserOpening(true);
     try {
@@ -201,16 +241,46 @@ function AppContent() {
       await closeBrowserSession(masqCore).catch(() => undefined);
       if (operation === browserOperation.current) {
         setBrowserMode(null);
-        setRouteError(
+        const message =
           caught instanceof Error
             ? caught.message
-            : 'Browser proxy unavailable.',
-        );
+            : 'Browser proxy unavailable.';
+        recoverablePrivateBrowserError.current = message;
+        setRouteError(message);
       }
     } finally {
       browserOpenInFlight.current = false;
       openingBrowserMode.current = null;
       setBrowserOpening(false);
+    }
+  };
+
+  const repairMasqBrowserRoute = async () => {
+    if (browserRepairInFlight.current) {
+      return browserRepairInFlight.current;
+    }
+    const operation = browserOperation.current;
+    // Every close/background/direct-open path advances this generation before
+    // it performs native work, so it is a stable cancellation signal even on
+    // platforms whose AppState.currentState lags the delivered event.
+    const isCurrent = () => operation === browserOperation.current;
+    const repair = (async () => {
+      await repairPrivateBrowserRoute(
+        masqCore,
+        () => controller.connect(),
+        isCurrent,
+      );
+      if (isCurrent()) {
+        await controller.refresh();
+      }
+    })();
+    browserRepairInFlight.current = repair;
+    try {
+      await repair;
+    } finally {
+      if (browserRepairInFlight.current === repair) {
+        browserRepairInFlight.current = null;
+      }
     }
   };
 
@@ -335,7 +405,15 @@ function AppContent() {
   const closeBrowser = async (reason: BrowserCloseReason = 'user') => {
     const closingMode = browserMode;
     browserOperation.current += 1;
+    const pendingRepair = browserRepairInFlight.current;
     await closeBrowserSession(masqCore);
+    if (pendingRepair) {
+      // Keep the browser screen closed until a cancelled native repair has
+      // settled, then make one final acknowledged transition to blocked mode.
+      // This serializes a later Direct/MASQ open behind stale repair work.
+      await pendingRepair.catch(() => undefined);
+      await closeBrowserSession(masqCore);
+    }
     setBrowserMode(null);
     await controller.refresh().catch(() => undefined);
     if (reason === 'background') {
@@ -505,7 +583,11 @@ function AppContent() {
         />
       ) : null}
       {route === 'browser' && browserMode ? (
-        <BrowserScreen mode={browserMode} onClose={closeBrowser} />
+        <BrowserScreen
+          mode={browserMode}
+          onClose={closeBrowser}
+          onRepairRoute={repairMasqBrowserRoute}
+        />
       ) : null}
       {route === 'routing' ? (
         <TrafficRoutingScreen

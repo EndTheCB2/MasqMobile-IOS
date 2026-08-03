@@ -13,7 +13,25 @@ export const ENTRY_NODE_RETRY_CODES = [
 
 export type EntryNodeRetryCode = (typeof ENTRY_NODE_RETRY_CODES)[number];
 
+export const PRIVATE_ROUTE_RETRY_CODES = [
+  'E_PRIVATE_ROUTE_FAILED',
+  'E_PRIVATE_ROUTE_TIMEOUT',
+] as const;
+
+export type PrivateRouteRetryCode = (typeof PRIVATE_ROUTE_RETRY_CODES)[number];
+
+export const NETWORK_TRANSITION_RETRY_CODES = [
+  'E_NETWORK_HANDOVER_RETRY',
+] as const;
+
+export type NetworkTransitionRetryCode =
+  (typeof NETWORK_TRANSITION_RETRY_CODES)[number];
+
 const ENTRY_NODE_RETRY_CODE_SET = new Set<string>(ENTRY_NODE_RETRY_CODES);
+const PRIVATE_ROUTE_RETRY_CODE_SET = new Set<string>(PRIVATE_ROUTE_RETRY_CODES);
+const NETWORK_TRANSITION_RETRY_CODE_SET = new Set<string>(
+  NETWORK_TRANSITION_RETRY_CODES,
+);
 const MASQ_ERROR_CODE_PATTERN = /\b(E_[A-Z][A-Z0-9_]{1,63})\b/;
 
 export function extractMasqErrorCode(caught: unknown): string | null {
@@ -42,6 +60,31 @@ export function isEntryNodeRetryCode(
   code: string | null,
 ): code is EntryNodeRetryCode {
   return code !== null && ENTRY_NODE_RETRY_CODE_SET.has(code);
+}
+
+export function isPrivateRouteRetryCode(
+  code: string | null,
+): code is PrivateRouteRetryCode {
+  return code !== null && PRIVATE_ROUTE_RETRY_CODE_SET.has(code);
+}
+
+export function isNetworkTransitionRetryCode(
+  code: string | null,
+): code is NetworkTransitionRetryCode {
+  return code !== null && NETWORK_TRANSITION_RETRY_CODE_SET.has(code);
+}
+
+export function isConnectionRetryCode(
+  code: string | null,
+): code is
+  | EntryNodeRetryCode
+  | PrivateRouteRetryCode
+  | NetworkTransitionRetryCode {
+  return (
+    isEntryNodeRetryCode(code) ||
+    isPrivateRouteRetryCode(code) ||
+    isNetworkTransitionRetryCode(code)
+  );
 }
 
 export function codedMasqError(code: string, message: string): Error {

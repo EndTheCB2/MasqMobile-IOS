@@ -30,6 +30,19 @@ describe('MASQ issue classification', () => {
     ['E_KEYSTORE', 'Android Keystore failed', 'wallet', 'wallet'],
     ['E_RPC', 'RPC chain ID mismatch', 'rpc', 'network-profile'],
     ['E_PROXY_STATE', 'Private proxy failed', 'route', 'retry'],
+    ['E_PRIVATE_ROUTE_FAILED', 'Private route proof failed', 'route', 'retry'],
+    [
+      'E_PRIVATE_ROUTE_TIMEOUT',
+      'Private route proof timed out',
+      'route',
+      'retry',
+    ],
+    [
+      'E_CONNECTION_BUDGET_EXHAUSTED',
+      'Connection budget exhausted',
+      'route',
+      'retry',
+    ],
   ])('maps %s to an actionable category', (code, message, category, action) => {
     const result = classifyMasqIssue(
       Object.assign(new Error(message), { code }),
@@ -79,6 +92,7 @@ describe('MASQ issue classification', () => {
   it.each([
     ['E_CORE_STARTUP_FAILED', 'native-core'],
     ['E_CORE_EARLY_EXIT', 'route'],
+    ['E_NETWORK_HANDOVER_RETRY', 'route'],
   ])('classifies stable core lifecycle code %s', (code, category) => {
     expect(
       classifyMasqIssue(
@@ -125,6 +139,15 @@ describe('MASQ issue recovery', () => {
     code: null,
     message: 'Temporary problem',
   });
+  const routeReady = {
+    ...EMPTY_STATUS,
+    connectedNeighbors: 1,
+    engineAvailable: true,
+    engineGeneration: 4,
+    phase: 'connected' as const,
+    proxyPort: 44_443,
+    routeStage: 2,
+  };
 
   it('clears offline and entry-node issues after observed recovery', () => {
     expect(
@@ -134,12 +157,22 @@ describe('MASQ issue recovery', () => {
       }),
     ).toBeNull();
     expect(
-      reconcileMasqIssue(
-        issue('entry-nodes'),
-        { ...EMPTY_STATUS, connectedNeighbors: 1, phase: 'connected' },
-        online,
-      ),
+      reconcileMasqIssue(issue('entry-nodes'), routeReady, online),
     ).toBeNull();
+  });
+
+  it('keeps entry-node and permission issues through legacy stage one', () => {
+    const legacyStageOne = {
+      ...routeReady,
+      routeStage: 1,
+    };
+
+    (['entry-nodes', 'permission'] as const).forEach(category => {
+      const pending = issue(category);
+      expect(reconcileMasqIssue(pending, legacyStageOne, online)).toBe(
+        pending,
+      );
+    });
   });
 
   it('keeps a route issue until an exit route is actually ready', () => {
@@ -157,17 +190,19 @@ describe('MASQ issue recovery', () => {
       ),
     ).toBe(routeIssue);
     expect(
-      reconcileMasqIssue(
-        routeIssue,
-        {
-          ...EMPTY_STATUS,
-          connectedNeighbors: 1,
-          phase: 'connected',
-          routeStage: 2,
-        },
-        online,
-      ),
+      reconcileMasqIssue(routeIssue, routeReady, online),
     ).toBeNull();
+  });
+
+  it.each([
+    ['unavailable engine', { engineAvailable: false }],
+    ['missing engine generation', { engineGeneration: 0 }],
+    ['stale native error', { lastError: 'E_PRIVATE_ROUTE_FAILED: stale' }],
+  ])('does not clear route issues for %s', (_label, override) => {
+    const pending = issue('route');
+    expect(
+      reconcileMasqIssue(pending, { ...routeReady, ...override }, online),
+    ).toBe(pending);
   });
 
   it.each(['wallet', 'rpc', 'native-core'] as const)(

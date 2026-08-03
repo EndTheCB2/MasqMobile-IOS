@@ -79,7 +79,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::prelude::Future;
 
 pub const CRASH_KEY: &str = "PROXYSERVER";
@@ -90,6 +90,7 @@ pub const MAX_PENDING_ROUTE_BYTES_PER_STREAM: usize = 1_048_576;
 pub const MAX_PENDING_RECEIPT_OFFERS: usize = 4096;
 pub const MAX_RECEIPT_ACKNOWLEDGEMENT_RECOVERY_BATCH: usize = 64;
 pub const RECEIPT_ACKNOWLEDGEMENT_RETRY_DELAY: Duration = Duration::from_secs(30);
+pub const ROUTE_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 struct ProxyServerOutSubs {
     dispatcher: Recipient<TransmitDataMsg>,
@@ -166,7 +167,29 @@ struct StreamInfo {
     response_sequence_replay_window: ResponseSequenceReplayWindow,
     request_started_at_opt: Option<SystemTime>,
     time_to_live_opt: Option<SystemTime>,
-    route_success_reported: bool,
+    route_success_metadata_reported: bool,
+}
+
+/// Runtime-global, memory-only admission control for aggregate route-activity proofs. It stores
+/// only a monotonic timestamp: never a stream, destination, route, peer, or traffic counter.
+#[derive(Debug, Default)]
+struct RouteActivityHeartbeat {
+    last_emitted_at_opt: Option<Instant>,
+}
+
+impl RouteActivityHeartbeat {
+    fn should_emit(&mut self, now: Instant) -> bool {
+        let interval_elapsed = self.last_emitted_at_opt.map_or(true, |last_emitted_at| {
+            now.checked_duration_since(last_emitted_at)
+                .map_or(false, |elapsed| {
+                    elapsed >= ROUTE_ACTIVITY_HEARTBEAT_INTERVAL
+                })
+        });
+        if interval_elapsed {
+            self.last_emitted_at_opt = Some(now);
+        }
+        interval_elapsed
+    }
 }
 
 pub struct ProxyServer {
@@ -191,6 +214,7 @@ pub struct ProxyServer {
     receipt_acknowledgement_outbox_opt:
         Option<Arc<Mutex<Box<dyn ReceiptAcknowledgementOutboxDao>>>>,
     receipt_acknowledgement_retry_scheduled: bool,
+    route_activity_heartbeat: RouteActivityHeartbeat,
 }
 
 impl Actor for ProxyServer {
@@ -452,6 +476,7 @@ impl ProxyServer {
             pending_receipt_offers: HashMap::new(),
             receipt_acknowledgement_outbox_opt: None,
             receipt_acknowledgement_retry_scheduled: false,
+            route_activity_heartbeat: RouteActivityHeartbeat::default(),
         }
     }
 
@@ -1281,7 +1306,7 @@ impl ProxyServer {
         let mut delayed_log: DelayedLogArgs = Box::new(|_, _, _, _, _| {});
         let logger = self.logger.clone();
         let (target_hostname, stream_key, retries_left, message) = {
-            let mut stream_info = match self.stream_info_mut(&msg.stream_key) {
+            let stream_info = match self.stream_info_mut(&msg.stream_key) {
                 Some(stream_info) => stream_info,
                 None => {
                     warning!(
@@ -1771,6 +1796,14 @@ impl ProxyServer {
         &mut self,
         msg: ExpiredCoresPackage<ClientResponsePayload_0v1>,
     ) {
+        self.handle_client_response_payload_at(msg, Instant::now())
+    }
+
+    fn handle_client_response_payload_at(
+        &mut self,
+        msg: ExpiredCoresPackage<ClientResponsePayload_0v1>,
+        route_activity_at: Instant,
+    ) {
         self.handle_routing_receipt_offers(
             &msg.payload.stream_key,
             msg.payload_len,
@@ -1842,20 +1875,23 @@ impl ProxyServer {
             }
         }
         let exit_public_key_opt = Self::find_exit_node_key(&expected_services);
-        let should_report_route_success = !response.sequenced_packet.data.is_empty()
-            && exit_public_key_opt.is_some()
+        let correlated_route_activity =
+            !response.sequenced_packet.data.is_empty() && exit_public_key_opt.is_some();
+        let should_record_route_success_metadata = correlated_route_activity
             && self
                 .stream_info_mut(&response.stream_key)
                 .map(|info| {
-                    if info.route_success_reported {
+                    if info.route_success_metadata_reported {
                         false
                     } else {
-                        info.route_success_reported = true;
+                        info.route_success_metadata_reported = true;
                         true
                     }
                 })
                 .unwrap_or(false);
-        let latency_ms_opt = if should_report_route_success {
+        let should_emit_route_activity_heartbeat = correlated_route_activity
+            && self.route_activity_heartbeat.should_emit(route_activity_at);
+        let latency_ms_opt = if should_record_route_success_metadata {
             self.stream_info(&response.stream_key)
                 .and_then(|info| info.request_started_at_opt)
                 .and_then(|started_at| SystemTime::now().duration_since(started_at).ok())
@@ -1891,7 +1927,7 @@ impl ProxyServer {
                 );
             }
         }
-        if should_report_route_success {
+        if should_emit_route_activity_heartbeat {
             if self
                 .subs
                 .as_ref()
@@ -2080,7 +2116,7 @@ impl ProxyServer {
                         response_sequence_replay_window: ResponseSequenceReplayWindow::default(),
                         request_started_at_opt: Some(ibcd.timestamp),
                         time_to_live_opt: None,
-                        route_success_reported: false,
+                        route_success_metadata_reported: false,
                     },
                 );
                 debug!(
@@ -2758,7 +2794,7 @@ impl IBCDHelper for IBCDHelperReal {
 
         {
             let is_decentralized = proxy_server.is_decentralized;
-            let mut stream_info = proxy_server
+            let stream_info = proxy_server
                 .stream_info_mut(&stream_key)
                 .unwrap_or_else(|| panic!("Stream key {} disappeared!", &stream_key));
             let active_attempt_id = stream_info
@@ -3246,7 +3282,7 @@ mod tests {
                     response_sequence_replay_window: ResponseSequenceReplayWindow::default(),
                     request_started_at_opt: None,
                     time_to_live_opt: None,
-                    route_success_reported: false,
+                    route_success_metadata_reported: false,
                 },
             }
         }
@@ -3291,6 +3327,20 @@ mod tests {
         assert_eq!(CRASH_KEY, "PROXYSERVER");
         assert_eq!(STREAM_KEY_PURGE_DELAY, Duration::from_secs(30));
         assert_eq!(DNS_FAILURE_RETRIES, 3);
+        assert_eq!(ROUTE_ACTIVITY_HEARTBEAT_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn route_activity_heartbeat_is_runtime_global_and_rate_limited() {
+        let started_at = Instant::now();
+        let mut subject = RouteActivityHeartbeat::default();
+
+        assert!(subject.should_emit(started_at));
+        assert!(!subject.should_emit(
+            started_at + ROUTE_ACTIVITY_HEARTBEAT_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(subject.should_emit(started_at + ROUTE_ACTIVITY_HEARTBEAT_INTERVAL));
+        assert!(!subject.should_emit(started_at + ROUTE_ACTIVITY_HEARTBEAT_INTERVAL));
     }
 
     #[test]
@@ -7425,6 +7475,119 @@ mod tests {
     }
 
     #[test]
+    fn long_lived_stream_refreshes_route_activity_without_changing_response_accounting() {
+        let system = System::new(
+            "long_lived_stream_refreshes_route_activity_without_changing_response_accounting",
+        );
+        let (dispatcher_mock, _, _) = make_recorder();
+        let activity_and_accounting_recorder =
+            Recorder::new().system_stop_conditions(match_lazily_every_type_id!(
+                RouteUseSucceededMessage,
+                ReportServicesConsumedMessage,
+                ReportServicesConsumedMessage,
+                RouteUseSucceededMessage,
+                ReportServicesConsumedMessage
+            ));
+        let activity_and_accounting_recording_arc =
+            activity_and_accounting_recorder.get_recording();
+        let activity_and_accounting_addr = activity_and_accounting_recorder.start();
+        let cryptde = CRYPTDE_PAIR.main.as_ref();
+        let mut subject = ProxyServer::new(
+            CRYPTDE_PAIR.clone(),
+            true,
+            Some(STANDARD_CONSUMING_WALLET_BALANCE),
+            false,
+            false,
+        );
+        let stream_key = StreamKey::make_meaningless_stream_key();
+        subject.keys_and_addrs.insert(
+            stream_key.clone(),
+            SocketAddr::from_str("1.2.3.4:5678").unwrap(),
+        );
+        subject.stream_info.insert(
+            stream_key.clone(),
+            StreamInfoBuilder::new()
+                .route(RouteQueryResponse {
+                    route: make_meaningless_route(&CRYPTDE_PAIR),
+                    expected_services: ExpectedServices::RoundTrip(
+                        vec![],
+                        vec![ExpectedService::Exit(
+                            PublicKey::from(&b"heartbeat_exit"[..]),
+                            make_wallet("heartbeat exit wallet"),
+                            rate_pack(10),
+                        )],
+                    ),
+                    host: Host::new("heartbeat.example", TLS_PORT),
+                })
+                .protocol(ProxyProtocol::TLS)
+                .build(),
+        );
+        let response_package = |sequence_number| {
+            ExpiredCoresPackage::new(
+                SocketAddr::from_str("1.2.3.4:1234").unwrap(),
+                Some(make_wallet("irrelevant")),
+                return_route(cryptde),
+                ClientResponsePayload_0v1 {
+                    stream_key: stream_key.clone(),
+                    sequenced_packet: SequencedPacket::new(
+                        vec![sequence_number as u8 + 1],
+                        sequence_number,
+                        false,
+                    ),
+                },
+                0,
+            )
+        };
+        let first_response = response_package(0);
+        let suppressed_response = response_package(1);
+        let heartbeat_response = response_package(2);
+        let mut peer_actors = peer_actors_builder().dispatcher(dispatcher_mock).build();
+        peer_actors.neighborhood.route_use_succeeded =
+            recipient!(activity_and_accounting_addr, RouteUseSucceededMessage);
+        peer_actors.accountant.report_services_consumed =
+            recipient!(activity_and_accounting_addr, ReportServicesConsumedMessage);
+        let subject_addr = subject.start();
+        let started_at = Instant::now();
+
+        subject_addr.try_send(BindMessage { peer_actors }).unwrap();
+        subject_addr
+            .try_send(AssertionsMessage {
+                assertions: Box::new(move |proxy_server: &mut ProxyServer| {
+                    proxy_server.handle_client_response_payload_at(first_response, started_at);
+                    proxy_server.handle_client_response_payload_at(
+                        suppressed_response,
+                        started_at + ROUTE_ACTIVITY_HEARTBEAT_INTERVAL - Duration::from_millis(1),
+                    );
+                    proxy_server.handle_client_response_payload_at(
+                        heartbeat_response,
+                        started_at + ROUTE_ACTIVITY_HEARTBEAT_INTERVAL,
+                    );
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(system.run(), 0);
+        let recording = activity_and_accounting_recording_arc.lock().unwrap();
+        let heartbeat_indices = (0..recording.len())
+            .filter(|index| {
+                recording
+                    .get_record_opt::<RouteUseSucceededMessage>(*index)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        let accounting_indices = (0..recording.len())
+            .filter(|index| {
+                recording
+                    .get_record_opt::<ReportServicesConsumedMessage>(*index)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(heartbeat_indices, vec![0, 3]);
+        assert_eq!(accounting_indices, vec![1, 2, 4]);
+        assert_eq!(recording.len(), 5);
+    }
+
+    #[test]
     fn handle_client_response_payload_purges_stream_keys_for_terminal_response() {
         let cryptde = CRYPTDE_PAIR.main.as_ref();
         let mut subject = ProxyServer::new(
@@ -10191,7 +10354,7 @@ mod tests {
                 response_sequence_replay_window: ResponseSequenceReplayWindow::default(),
                 request_started_at_opt: None,
                 time_to_live_opt: None,
-                route_success_reported: false,
+                route_success_metadata_reported: false,
             },
         );
 
