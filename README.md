@@ -36,6 +36,9 @@ workspace through `../masq-node-mobile/node`.
 - Consumer mode only; the phone does not serve routing or exit traffic.
 - Embedded **MASQ Private** browser with fail-closed proxying and a separate, explicitly selected
   **Browse without MASQ** mode for ordinary device networking.
+- Bare public domains such as `example.com` open as HTTPS addresses. Genuine free text uses the
+  locally selected Timpi or DuckDuckGo search provider; the app stores the provider choice but not
+  the query or search history.
 - Local browser protection for known advertising/tracking resources, cross-site cookies and common
   consent managers, with Balanced/Strict presets, exact-host exceptions and verified Reject-only
   automation.
@@ -74,9 +77,11 @@ and never falls back to the device connection. **Browse without MASQ** is a sepa
 choice that first stops any active MASQ connection and system routing. A compact persistent
 `DIRECT · MASQ OFF` badge identifies the mode; destination sites see the public IP used by the
 current connection or VPN, while the
-internet provider and DNS resolver can observe normal connection metadata. Closing or
-backgrounding the browser returns its native routing state to blocked. The user must reconnect
-before opening **MASQ Private** again.
+internet provider and DNS resolver can observe normal connection metadata. During a temporary app
+switch, the active page stays mounted behind a privacy shield, retains its exact MASQ Private or
+Direct route, and can continue network activity. Explicitly closing the browser returns its native
+routing state to blocked; Android or iOS process eviction can still lose the exact page. The user
+must reconnect before opening **MASQ Private** again after a Direct session.
 
 ## Build and install on iPhone
 

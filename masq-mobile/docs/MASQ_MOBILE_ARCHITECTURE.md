@@ -56,8 +56,10 @@ Explicit Direct WebView
 A proxy configuration without a route is rejected. Android receives no `addDirect()` rule; iOS
 sets `failoverAllowed` to false. Losing the route can therefore produce an error, but it must not
 cause an invisible direct connection. Direct browsing is a separately confirmed UI action, never a
-recovery path. Browser routing mode is not persisted, and closing or backgrounding the browser
-selects `blocked`.
+recovery path. During a temporary app switch, the active WebView remains mounted behind the privacy
+shield and retains its exact MASQ Private or Direct routing lease; its page can continue network
+activity. Explicitly closing the browser selects `blocked`. Operating-system process eviction can
+still discard the page and route lease.
 
 The separately compiled Android dogfood package can additionally capture IP packets from a system
 `VpnService` TUN. A separately locked Rust library converts only IPv4 TCP/443 and virtual-DNS flows

@@ -1,6 +1,6 @@
 # MASQ Mobile Privacy Policy
 
-Effective: 27 July 2026
+Effective: 3 August 2026
 
 MASQ Mobile is an independent, open-source, consume-only client. It is not an official release of
 the MASQ Project. This direct-download preview is maintained and distributed through the
@@ -13,10 +13,11 @@ responsible for complying with local law.
 The app has no maintainer-operated account, advertising SDK, analytics SDK or cross-app tracking.
 It does not sell personal data. It stores the consumer wallet secret and network profile on the
 device. Using MASQ sends data to a blockchain RPC, a node-finder, MASQ peers and the websites the
-user chooses to visit. Free-text browser searches are sent to Timpi Search, while explicit
-normalized `.eth` addresses are loaded through the independent eth.limo HTTPS gateway. Direct
-browsing instead uses the device's normal internet connection. Those independent services may
-process or retain network data under their own policies.
+user chooses to visit. Free-text browser searches are sent to the user-selected Timpi or
+DuckDuckGo search website, while explicit normalized `.eth` addresses are loaded through the
+independent eth.limo HTTPS gateway. Direct browsing instead uses the device's normal internet
+connection. Those independent services may process or retain network data under their own
+policies.
 
 ## Data stored on the device
 
@@ -128,23 +129,34 @@ including connection destinations where applicable. HTTPS encrypts request and r
 in transit, but does not hide the public IP addresses or all destination metadata. The user must
 reconnect before opening **MASQ Private** again.
 
-The selected browser routing mode is not stored. Closing the browser or moving the app to the
-background returns the native browser network state to blocked. Local browser-protection rules can
-still filter recognized resources in direct mode, but filtering does not hide the public IP
-address or provide MASQ routing.
+The selected browser routing mode is not persisted as a new default. During a temporary app switch,
+the active page remains mounted behind a privacy shield and retains the exact MASQ Private or
+Direct route that the user selected. The hidden page can continue network activity, for example
+while an external sign-in confirmation completes. Explicitly closing the browser returns the native
+browser network state to blocked. The operating system can still evict the app and lose the page.
+Local browser-protection rules can filter recognized resources in direct mode, but filtering does
+not hide the public IP address or provide MASQ routing.
 
-### Timpi Search
+### Search providers
 
-When browser input is not recognized as a public web address, the app opens the public Timpi Search
-website with that input as the search query. In **MASQ Private**, the request follows the selected
-MASQ route and Timpi sees the exit node's IP address. In **Direct**, Timpi sees the public IP used by
-the device's current connection or VPN. MASQ Mobile does not call Timpi's private data API and does
-not separately log, synchronize or send the query to the maintainer.
+The user can select Timpi or DuckDuckGo as the provider for input that is not recognized as a public
+web address. The app stores the provider choice locally, but does not store or synchronize search
+queries or search history. It opens the selected provider's public search website with the input as
+the query. In **MASQ Private**, the request follows the selected MASQ route and the provider sees the
+exit node's IP address. In **Direct**, the provider sees the public IP used by the device's current
+connection or VPN. MASQ Mobile does not call a private search API and does not separately log,
+synchronize or send the query to the maintainer.
 
 Timpi is an independent service. Its published privacy policy states that it may process search
 queries, country-level location, temporary IP data, server-log information and information used for
 advertising. Its current terms and retention practices are controlled by Timpi:
 [Timpi privacy policy](https://timpi.io/wp-content/uploads/2025/07/Timpi-International-Ltd-Privacy-Policy.pdf).
+
+DuckDuckGo is also an independent service. Its published policy states that it does not save or
+share search or browsing history, while requests can still provide temporary technical data such as
+an IP address, browser type and language to deliver and secure the service. Its current terms and
+practices are controlled by DuckDuckGo:
+[DuckDuckGo privacy policy](https://duckduckgo.com/privacy).
 
 ### ENS websites
 
