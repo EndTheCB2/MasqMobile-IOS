@@ -638,6 +638,56 @@ describe('iOS native MASQ core linkage', () => {
     );
   });
 
+  it('persists one strict browser search provider and clears it only on full reset', () => {
+    const providerBridge = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)getBrowserSearchProvider:'),
+      bridgeSource.indexOf('- (void)getBrowserSiteSettings:'),
+    );
+    const resetPreferences = bridgeSource.slice(
+      bridgeSource.indexOf('void resetBrowserProtectionPreferences()'),
+      bridgeSource.indexOf('NSDictionary *browserProtectionResponse('),
+    );
+    const networkReset = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)resetNetworkProfile:'),
+      bridgeSource.indexOf('- (void)removeWallet:'),
+    );
+    const rememberedDataCleanup = bridgeSource.slice(
+      bridgeSource.indexOf('- (void)clearRememberedBrowserData:'),
+      bridgeSource.indexOf('- (void)getSavedConfiguration:'),
+    );
+
+    expect(nativeSpecSource).toContain(
+      'getBrowserSearchProvider(): Promise<string>',
+    );
+    expect(nativeSpecSource).toContain(
+      "setBrowserSearchProvider(provider: 'timpi' | 'duckduckgo'): Promise<string>",
+    );
+    expect(bridgeSource).toContain(
+      'NSString *const MasqBrowserSearchProviderKey =',
+    );
+    expect(bridgeSource).toContain(
+      'NSString *const MasqBrowserSearchProviderTimpi = @"timpi"',
+    );
+    expect(bridgeSource).toContain(
+      'NSString *const MasqBrowserSearchProviderDuckDuckGo = @"duckduckgo"',
+    );
+    expect(providerBridge).toContain('resolve(MasqBrowserSearchProviderTimpi)');
+    expect(providerBridge).toContain(
+      'isSupportedBrowserSearchProvider((NSString *)saved)',
+    );
+    expect(providerBridge).toContain(
+      '[defaults setObject:provider forKey:MasqBrowserSearchProviderKey]',
+    );
+    expect(providerBridge).toContain(
+      '![(NSString *)saved isEqualToString:provider]',
+    );
+    expect(resetPreferences).toContain(
+      '[defaults removeObjectForKey:MasqBrowserSearchProviderKey]',
+    );
+    expect(rememberedDataCleanup).not.toContain('MasqBrowserSearchProviderKey');
+    expect(networkReset).not.toContain('MasqBrowserSearchProviderKey');
+  });
+
   it('fails every iOS build when the fail-closed WebView patch is absent', () => {
     expect(spawnSync('bash', [webViewPatchGuardPath]).status).toBe(0);
     expect(projectSource).toContain('Verify Fail-Closed WebView Patch');

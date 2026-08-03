@@ -41,6 +41,9 @@ exit services to other nodes.
 - Opt-in Reject-only handling for supported OneTrust, Cookiebot, Didomi, Usercentrics and DPG
   Media dialogs. Unknown gates remain visible and **Accept** is never selected.
 - ENS `.eth` navigation through eth.limo HTTPS transport without search or Direct fallback.
+- A user-selectable Timpi or DuckDuckGo provider for free-text searches. The selected provider
+  receives the query and the apparent MASQ-exit or Direct-connection IP; the app stores only the
+  provider choice, not search queries or search history.
 - Temporary sessions by default, with exact-host remembered sign-in profiles only after Android
   WebView confirms multi-profile isolation support. Cross-site top-frame transitions select the
   destination profile and top-frame non-GET form navigations are blocked fail-closed.
@@ -67,11 +70,12 @@ exit services to other nodes.
   fast resume. Opening the explicit direct browser instead performs an acknowledged full teardown
   of the mesh and system tunnel while retaining the wallet and profile; MASQ can reconnect later
   in the same app process.
-- Race-free native status polling, iOS/Android network-path monitoring, foreground recovery, and
-  fail-closed browser shutdown when the app enters the background. Android removes the WebView
-  immediately and requires an exact native `blocked` acknowledgement before leaving the browser;
-  a failed acknowledgement stays on a non-browsing retry screen. Browser mode is never persisted,
-  and backgrounding always selects `blocked`.
+- Race-free native status polling, iOS/Android network-path monitoring and foreground recovery.
+  During a temporary app switch, an active WebView remains mounted behind the privacy shield and
+  retains its selected MASQ Private or Direct routing lease, without cross-mode fallback. This lets
+  external sign-in confirmations finish, but the page may continue network activity while hidden.
+  Explicit browser close ends the lease and clears temporary data; OS process eviction can still
+  lose the exact page or unfinished form.
 - Separate wallet, network-profile, and full resets, plus redacted diagnostics sharing.
 
 The iOS build intentionally remains browser-only. Whole-device routing needs a separately signed
@@ -204,12 +208,14 @@ instructions are in
 6. Start MASQ and follow the five-stage connection status.
 7. Open **MASQ Private** after its route preflight succeeds, or explicitly choose **Browse without
    MASQ** and confirm that the normal connection exposes the device IP and bypasses MASQ routing.
-8. Choose **Balanced** or **Strict**, or review the individual **Ads & trackers**,
+8. Choose Timpi or DuckDuckGo as the free-text search provider. MASQ Mobile stores the provider
+   choice but not search queries or search history.
+9. Choose **Balanced** or **Strict**, or review the individual **Ads & trackers**,
    **Cross-site cookies**, **Hide resolved banners** and **Reject optional cookies** controls.
    Exact-host protection exceptions and remembered sign-ins are opt-in.
-9. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
-   the logical ENS address in the bar.
-10. In public Android previews, only traffic from the embedded **MASQ Private** browser can use
+10. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
+    the logical ENS address in the bar.
+11. In public Android previews, only traffic from the embedded **MASQ Private** browser can use
     MASQ. Whole-device and selected-app routing remain unavailable until lifecycle, handover and
     leak tests pass.
 
@@ -298,17 +304,22 @@ self-contained unsigned Android release APK with commit-pinned actions.
   configuration, and only after the explicit direct action.
 - iOS uses separate ephemeral stores by default. Android uses separate MASQ and Direct WebView
   profiles when the runtime supports them, and offers exact-host persistence only after opt-in;
-  unsupported runtimes remain temporary. The browser closes on background, routing returns to a
-  blocked sink, and MASQ never permits proxy failover.
+  unsupported runtimes remain temporary. During a temporary app switch, the active WebView stays
+  mounted behind a privacy shield and retains the exact selected MASQ Private or Direct route, with
+  no cross-mode fallback. The hidden page can continue network activity so an external sign-in
+  confirmation can complete. Explicit close ends the session and blocks browser routing; OS process
+  eviction can still lose the exact page. MASQ never permits proxy failover.
 - Browser-protection preferences are local app settings. Protection does not send browsing
   telemetry, but destination websites still receive normal requests and can detect or react to
   blocked resources. In direct mode they also receive the public IP of the current connection or
   VPN.
 - Browser navigation accepts HTTPS only and blocks localhost, private, and link-local addresses.
-  Free text entered in the browser bar opens the public Timpi Search website through the selected
-  MASQ Private or Direct routing mode; MASQ Mobile does not embed Timpi's private data API.
+  Free text entered in the browser bar opens the selected public Timpi or DuckDuckGo search website
+  through the active MASQ Private or Direct routing mode. The provider receives the query and sees
+  the MASQ exit IP or the current public connection/VPN IP, respectively. MASQ Mobile stores only
+  the provider choice and does not store or synchronize queries or search history.
 - Normalized `.eth` addresses are rewritten locally to eth.limo HTTPS transport. Gateway failure
-  is reported and never falls back to Timpi, ordinary DNS or Direct networking.
+  is reported and never falls back to a search provider, ordinary DNS or Direct networking.
 - After import, the wallet secret is removed from React state and temporary Rust copies are
   zeroized. iOS persists it with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; Android uses
   AES-GCM with a non-exportable key held by Android Keystore.

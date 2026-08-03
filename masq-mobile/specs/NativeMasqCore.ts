@@ -30,6 +30,8 @@ export interface Spec extends TurboModule {
   setSystemTunnel(mode: string, appIdsJson: string): Promise<string>;
   prepareBrowserProtection(): Promise<string>;
   setBrowserProtection(configJson: string): Promise<string>;
+  getBrowserSearchProvider(): Promise<string>;
+  setBrowserSearchProvider(provider: 'timpi' | 'duckduckgo'): Promise<string>;
   setBrowserRoutingMode(mode: string): Promise<string>;
   getBrowserSiteSettings(mode: string, hostname: string): Promise<string>;
   setBrowserSiteSettings(

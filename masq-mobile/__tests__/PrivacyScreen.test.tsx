@@ -43,10 +43,26 @@ describe('PrivacyScreen', () => {
     expect(content).toContain('never retried automatically');
     expect(content).toContain('Browser sessions are temporary by default');
     expect(content).toContain('Remember sign-in');
+    expect(content).toContain('Temporary app switching keeps the page ready');
+    expect(content).toContain('approve a YouTube sign-in');
+    expect(content).toContain("behind MASQ Mobile's privacy shield");
+    expect(content).toContain('may continue network activity while hidden');
+    expect(content).toContain('without fallback');
+    expect(content).toContain(
+      'Explicitly closing the browser ends the routing lease',
+    );
+    expect(content).toContain('removes the app process under memory pressure');
     expect(content).toContain('ENS preview uses an HTTPS gateway');
     expect(content).toContain('never falls back to search');
     expect(content).toContain('Cookie protection is local and optional');
     expect(content).toContain('never selects Accept');
+    expect(content).toContain('Choose Timpi or DuckDuckGo for searches');
+    expect(content).toContain('receives the search query');
+    expect(content).toContain('MASQ exit IP in MASQ Private');
+    expect(content).toContain('stores only your provider choice');
+    expect(content).toContain(
+      'does not store or synchronize search queries or search history',
+    );
 
     const privacyButton = renderer.root.find(
       node =>
@@ -105,7 +121,9 @@ describe('PrivacyScreen', () => {
       expect(content).toContain('ICMP and unknown transports');
       expect(content).toContain('encrypted HEAD request to example.com');
       expect(content).toContain('no page body is downloaded');
-      expect(content).toContain('Selected package IDs and the consent timestamp');
+      expect(content).toContain(
+        'Selected package IDs and the consent timestamp',
+      );
       expect(content).toContain('shared-UID apps can share routing');
       expect(content).toContain('attached restricted profiles');
       expect(content).toContain('work profiles are separate');

@@ -2040,4 +2040,69 @@ describe('Android native MASQ core integration', () => {
     expect(moduleSource).toContain('.put("nativeRequestBlocking", false)');
     expect(moduleSource).toContain('.put("youtubeBestEffortAvailable", false)');
   });
+
+  it('persists one strict browser search provider and clears it only on full reset', () => {
+    const providerBridge = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun getBrowserSearchProvider(promise: Promise)',
+      ),
+      moduleSource.indexOf(
+        'override fun getBrowserSiteSettings(mode: String, hostname: String, promise: Promise)',
+      ),
+    );
+    const browserStorageCleanup = moduleSource.slice(
+      moduleSource.indexOf(
+        'private fun clearRememberedBrowserStorage(clearProtectionExceptions: Boolean)',
+      ),
+      moduleSource.indexOf('private fun persistentBrowserProfileName('),
+    );
+    const fullReset = moduleSource.slice(
+      moduleSource.indexOf('override fun reset(promise: Promise)'),
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+    );
+    const networkReset = moduleSource.slice(
+      moduleSource.indexOf(
+        'override fun resetNetworkProfile(promise: Promise)',
+      ),
+      moduleSource.indexOf('override fun removeWallet(promise: Promise)'),
+    );
+    const rememberedDataCleanup = moduleSource.slice(
+      moduleSource.indexOf('override fun clearRememberedBrowserData('),
+      moduleSource.indexOf('override fun getSavedConfiguration('),
+    );
+
+    expect(nativeSpec).toContain('getBrowserSearchProvider(): Promise<string>');
+    expect(nativeSpec).toContain(
+      "setBrowserSearchProvider(provider: 'timpi' | 'duckduckgo'): Promise<string>",
+    );
+    expect(coreFacade).toContain('type BrowserSearchProvider');
+    expect(coreFacade).toContain(
+      "serialized !== 'timpi' && serialized !== 'duckduckgo'",
+    );
+    expect(providerBridge).toContain('provider !in BROWSER_SEARCH_PROVIDERS');
+    expect(providerBridge).toContain(
+      'preferences.edit().putString(BROWSER_SEARCH_PROVIDER_KEY, provider).commit()',
+    );
+    expect(providerBridge).toContain('readBrowserSearchProvider() != provider');
+    expect(moduleSource).toContain(
+      'private const val DEFAULT_BROWSER_SEARCH_PROVIDER = "timpi"',
+    );
+    expect(moduleSource).toContain(
+      'private val BROWSER_SEARCH_PROVIDERS = setOf("timpi", "duckduckgo")',
+    );
+    expect(fullReset).toContain(
+      'clearRememberedBrowserStorage(clearProtectionExceptions = true)',
+    );
+    expect(browserStorageCleanup).toContain('if (clearProtectionExceptions)');
+    expect(browserStorageCleanup).toContain(
+      'editor.remove(BROWSER_SEARCH_PROVIDER_KEY)',
+    );
+    expect(rememberedDataCleanup).toContain(
+      'clearRememberedBrowserStorage(clearProtectionExceptions = false)',
+    );
+    expect(rememberedDataCleanup).not.toContain('BROWSER_SEARCH_PROVIDER_KEY');
+    expect(networkReset).not.toContain('BROWSER_SEARCH_PROVIDER_KEY');
+  });
 });

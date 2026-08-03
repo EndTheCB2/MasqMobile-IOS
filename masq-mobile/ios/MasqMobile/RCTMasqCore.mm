@@ -27,6 +27,10 @@ NSString *const MasqBrowserRejectOptionalCookiesKey =
     @"MASQBrowserRejectOptionalCookies";
 NSString *const MasqBrowserYouTubeBestEffortKey =
     @"MASQBrowserYouTubeBestEffort";
+NSString *const MasqBrowserSearchProviderKey =
+    @"MASQBrowserSearchProviderV1";
+NSString *const MasqBrowserSearchProviderTimpi = @"timpi";
+NSString *const MasqBrowserSearchProviderDuckDuckGo = @"duckduckgo";
 NSString *const MasqBrowserRememberedMasqSitesKey =
     @"MASQBrowserRememberedMasqSitesV1";
 NSString *const MasqBrowserRememberedDirectSitesKey =
@@ -52,6 +56,11 @@ NSObject *browserProtectionLock() {
     lock = [NSObject new];
   });
   return lock;
+}
+
+BOOL isSupportedBrowserSearchProvider(NSString *provider) {
+  return [provider isEqualToString:MasqBrowserSearchProviderTimpi] ||
+         [provider isEqualToString:MasqBrowserSearchProviderDuckDuckGo];
 }
 
 NSObject *coreLifecycleLock() {
@@ -439,6 +448,7 @@ void resetBrowserProtectionPreferences() {
     [defaults removeObjectForKey:MasqBrowserHideCookieBannersKey];
     [defaults removeObjectForKey:MasqBrowserRejectOptionalCookiesKey];
     [defaults removeObjectForKey:MasqBrowserYouTubeBestEffortKey];
+    [defaults removeObjectForKey:MasqBrowserSearchProviderKey];
     [defaults removeObjectForKey:MasqBrowserRememberedMasqSitesKey];
     [defaults removeObjectForKey:MasqBrowserRememberedDirectSitesKey];
     [defaults removeObjectForKey:MasqBrowserProtectionDisabledSitesKey];
@@ -1780,6 +1790,43 @@ NSString *_Nullable financialResultError(NSString *_Nullable result) {
               resolve(serialized);
             });
       });
+}
+
+- (void)getBrowserSearchProvider:(RCTPromiseResolveBlock)resolve
+                           reject:(RCTPromiseRejectBlock)reject {
+  id saved = [NSUserDefaults.standardUserDefaults
+      objectForKey:MasqBrowserSearchProviderKey];
+  if (!saved) {
+    resolve(MasqBrowserSearchProviderTimpi);
+    return;
+  }
+  if (![saved isKindOfClass:[NSString class]] ||
+      !isSupportedBrowserSearchProvider((NSString *)saved)) {
+    reject(@"E_BROWSER_SEARCH_PROVIDER_STORAGE",
+           @"The saved iOS browser search provider is invalid.", nil);
+    return;
+  }
+  resolve(saved);
+}
+
+- (void)setBrowserSearchProvider:(NSString *)provider
+                         resolve:(RCTPromiseResolveBlock)resolve
+                          reject:(RCTPromiseRejectBlock)reject {
+  if (!isSupportedBrowserSearchProvider(provider)) {
+    reject(@"E_BROWSER_SEARCH_PROVIDER_CONFIG",
+           @"Choose Timpi or DuckDuckGo as the browser search provider.", nil);
+    return;
+  }
+  NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+  [defaults setObject:provider forKey:MasqBrowserSearchProviderKey];
+  id saved = [defaults objectForKey:MasqBrowserSearchProviderKey];
+  if (![saved isKindOfClass:[NSString class]] ||
+      ![(NSString *)saved isEqualToString:provider]) {
+    reject(@"E_BROWSER_SEARCH_PROVIDER_STORAGE",
+           @"iOS could not save the browser search provider.", nil);
+    return;
+  }
+  resolve(provider);
 }
 
 - (void)getBrowserSiteSettings:(NSString *)mode

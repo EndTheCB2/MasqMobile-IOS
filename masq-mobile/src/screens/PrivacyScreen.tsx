@@ -57,6 +57,10 @@ export function PrivacyScreen({
           }
         />
         <Disclosure
+          title="Temporary app switching keeps the page ready"
+          text="While a browser session is open, briefly switching to another app—for example to approve a YouTube sign-in—keeps the same page alive behind MASQ Mobile's privacy shield. The page retains its selected MASQ Private or Direct route without fallback and may continue network activity while hidden so the confirmation can complete. Explicitly closing the browser ends the routing lease. If iOS or Android removes the app process under memory pressure, the exact page or unfinished form may still be lost."
+        />
+        <Disclosure
           title="ENS preview uses an HTTPS gateway"
           text="Normalized ASCII or punycode .eth addresses are translated locally to the matching eth.limo HTTPS gateway address. The original .eth name stays visible in the address bar. eth.limo and its infrastructure can process the requested name, path and normal connection metadata. In MASQ Private it sees the exit IP; in Direct it sees the current public IP. A gateway failure never falls back to search, ordinary DNS or Direct browsing."
         />
@@ -65,8 +69,8 @@ export function PrivacyScreen({
           text="Balanced and Strict protection use versioned rules stored with the app. Supported consent managers are automated only when Reject optional cookies is enabled, and the app never selects Accept. Turning protection off for a site can restore compatibility but allows that site's cookies, ads and trackers under its own policy. MASQ records no browsing telemetry."
         />
         <Disclosure
-          title="Free-text searches use Timpi"
-          text="Text that is not recognized as a public web address is sent to the public Timpi Search website. In MASQ Private, Timpi sees the exit node's IP address; in Direct, it sees the public IP of your current connection or VPN. Timpi may process search queries, approximate location and service logs under its own privacy policy. The app does not separately log or synchronize your searches."
+          title="Choose Timpi or DuckDuckGo for searches"
+          text="Text that is not recognized as a public web address is sent to your selected public search provider: Timpi or DuckDuckGo. That provider receives the search query and sees the apparent IP address: the MASQ exit IP in MASQ Private, or the public IP of your current connection or VPN in Direct. The provider may process the request under its own privacy policy. MASQ Mobile stores only your provider choice; it does not store or synchronize search queries or search history."
         />
         {Platform.OS === 'android' && systemRoutingSupported ? (
           <Disclosure

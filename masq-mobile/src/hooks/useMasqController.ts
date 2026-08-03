@@ -126,7 +126,7 @@ export function isNativeMasqRecoveryInProgress(status: CoreStatus): boolean {
   );
 }
 
-export function useMasqController() {
+export function useMasqController(browserSessionActive = false) {
   const [status, setStatus] = useState<CoreStatus>(EMPTY_STATUS);
   const [network, setNetwork] = useState<NetworkStatus>(UNKNOWN_NETWORK);
   const [draft, setDraft] = useState<SetupDraft>(DEFAULT_SETUP);
@@ -176,6 +176,8 @@ export function useMasqController() {
   const profileReadyRef = useRef(false);
   const statusRef = useRef(status);
   const networkRef = useRef(network);
+  const browserSessionActiveRef = useRef(browserSessionActive);
+  browserSessionActiveRef.current = browserSessionActive;
 
   useEffect(() => {
     statusRef.current = status;
@@ -540,145 +542,139 @@ export function useMasqController() {
     [cancelConnectionAttempt, requireProfileReady, run],
   );
 
-  const connectWithFailurePolicy = useCallback(
-    () => {
-      if (!profileReadyRef.current) {
-        return Promise.reject(new Error(PROFILE_NOT_READY_MESSAGE));
-      }
-      desiredConnected.current = true;
-      const flight = connectFlight.current;
-      if (flight.isRunning) {
-        // The one native flight owns success/failure accounting; every waiter shares its result.
-        return flight.run(() => masqCore.getStatus());
-      }
+  const connectWithFailurePolicy = useCallback(() => {
+    if (!profileReadyRef.current) {
+      return Promise.reject(new Error(PROFILE_NOT_READY_MESSAGE));
+    }
+    desiredConnected.current = true;
+    const flight = connectFlight.current;
+    if (flight.isRunning) {
+      // The one native flight owns success/failure accounting; every waiter shares its result.
+      return flight.run(() => masqCore.getStatus());
+    }
 
-      connectAttemptEpoch.current += 1;
-      lastConnectAttemptNetworkGeneration.current =
-        networkRef.current.generation;
-      nativeRecoveryObservationGeneration.current =
-        networkRef.current.generation;
-      const controller = new AbortController();
-      connectAbort.current = controller;
-      activeConnectController.current = controller;
-      return flight.run(() =>
-        run(async () => {
-          setStatus(current => ({
-            ...current,
-            phase: 'connecting',
-            lastError: null,
-          }));
+    connectAttemptEpoch.current += 1;
+    lastConnectAttemptNetworkGeneration.current = networkRef.current.generation;
+    nativeRecoveryObservationGeneration.current = networkRef.current.generation;
+    const controller = new AbortController();
+    connectAbort.current = controller;
+    activeConnectController.current = controller;
+    return flight.run(() =>
+      run(async () => {
+        setStatus(current => ({
+          ...current,
+          phase: 'connecting',
+          lastError: null,
+        }));
+        try {
           try {
-            try {
-              const connected = await startWithEntryNodeRefresh(
-                attemptBudget =>
-                  startAndAwaitMasqConnection(
-                    () => masqCore.start(),
-                    () => masqCore.getStatus(),
-                    {
-                      deadlineAtMs: attemptBudget.deadlineAtMs,
-                      timeoutMs: attemptBudget.readinessTimeoutMs,
-                      onStatus: next => {
-                        statusRef.current = next;
-                        setStatus(next);
-                        setEntryNodeRefresh(current => {
-                          if (isCoreRouteReady(next)) {
-                            return null;
-                          }
-                          return current
-                            ? { ...current, stage: 'handshake' }
-                            : current;
-                        });
-                      },
-                      signal: controller.signal,
-                      verifyRoute: () => masqCore.preflightBrowserProxy(),
+            const connected = await startWithEntryNodeRefresh(
+              attemptBudget =>
+                startAndAwaitMasqConnection(
+                  () => masqCore.start(),
+                  () => masqCore.getStatus(),
+                  {
+                    deadlineAtMs: attemptBudget.deadlineAtMs,
+                    timeoutMs: attemptBudget.readinessTimeoutMs,
+                    onStatus: next => {
+                      statusRef.current = next;
+                      setStatus(next);
+                      setEntryNodeRefresh(current => {
+                        if (isCoreRouteReady(next)) {
+                          return null;
+                        }
+                        return current
+                          ? { ...current, stage: 'handshake' }
+                          : current;
+                      });
                     },
-                  ),
-                {
-                  onAttempt: progress => {
-                    setStatus(current => ({
-                      ...current,
-                      phase: 'connecting',
-                      lastError: null,
-                    }));
-                    setEntryNodeRefresh(progress);
+                    signal: controller.signal,
+                    verifyRoute: () => masqCore.preflightBrowserProxy(),
                   },
-                  signal: controller.signal,
-                },
-              );
-              automaticReconnectFailures.current = 0;
-              automaticReconnectNotBefore.current = 0;
-              try {
-                const refreshedProfile =
-                  await masqCore.getSavedConfiguration();
-                if (
-                  refreshedProfile &&
-                  isValidSavedConfig(refreshedProfile) &&
-                  activeConnectController.current === controller
-                ) {
-                  setDraft(current => ({
+                ),
+              {
+                onAttempt: progress => {
+                  setStatus(current => ({
                     ...current,
-                    ...refreshedProfile,
-                    neighbors: [...refreshedProfile.neighbors],
-                    walletSecret: '',
+                    phase: 'connecting',
+                    lastError: null,
                   }));
+                  setEntryNodeRefresh(progress);
+                },
+                signal: controller.signal,
+              },
+            );
+            automaticReconnectFailures.current = 0;
+            automaticReconnectNotBefore.current = 0;
+            try {
+              const refreshedProfile = await masqCore.getSavedConfiguration();
+              if (
+                refreshedProfile &&
+                isValidSavedConfig(refreshedProfile) &&
+                activeConnectController.current === controller
+              ) {
+                setDraft(current => ({
+                  ...current,
+                  ...refreshedProfile,
+                  neighbors: [...refreshedProfile.neighbors],
+                  walletSecret: '',
+                }));
+              }
+            } catch {
+              // A successful live route remains authoritative if a later profile read fails.
+            }
+            return connected;
+          } catch (caught) {
+            const currentIssue = classifyMasqIssue(
+              caught,
+              networkRef.current,
+              statusRef.current,
+            );
+            const networkHandoverRetry =
+              extractMasqErrorCode(caught) === 'E_NETWORK_HANDOVER_RETRY';
+            const retryableWithoutShutdown =
+              networkHandoverRetry ||
+              currentIssue?.category === 'offline' ||
+              shouldAutomaticallyRetryMasqIssue(currentIssue);
+            if (
+              retryableWithoutShutdown &&
+              !isAbortError(caught) &&
+              activeConnectController.current === controller
+            ) {
+              const failures = automaticReconnectFailures.current + 1;
+              automaticReconnectFailures.current = failures;
+              automaticReconnectNotBefore.current =
+                Date.now() + automaticReconnectDelayMs(failures);
+            }
+            if (
+              !retryableWithoutShutdown &&
+              !isAbortError(caught) &&
+              activeConnectController.current === controller
+            ) {
+              desiredConnected.current = false;
+              try {
+                const stopped = await masqCore.shutdown();
+                if (activeConnectController.current === controller) {
+                  setStatus(stopped);
                 }
               } catch {
-                // A successful live route remains authoritative if a later profile read fails.
+                // The original connection diagnostic remains authoritative.
               }
-              return connected;
-            } catch (caught) {
-              const currentIssue = classifyMasqIssue(
-                caught,
-                networkRef.current,
-                statusRef.current,
-              );
-              const networkHandoverRetry =
-                extractMasqErrorCode(caught) === 'E_NETWORK_HANDOVER_RETRY';
-              const retryableWithoutShutdown =
-                networkHandoverRetry ||
-                currentIssue?.category === 'offline' ||
-                shouldAutomaticallyRetryMasqIssue(currentIssue);
-              if (
-                retryableWithoutShutdown &&
-                !isAbortError(caught) &&
-                activeConnectController.current === controller
-              ) {
-                const failures = automaticReconnectFailures.current + 1;
-                automaticReconnectFailures.current = failures;
-                automaticReconnectNotBefore.current =
-                  Date.now() + automaticReconnectDelayMs(failures);
-              }
-              if (
-                !retryableWithoutShutdown &&
-                !isAbortError(caught) &&
-                activeConnectController.current === controller
-              ) {
-                desiredConnected.current = false;
-                try {
-                  const stopped = await masqCore.shutdown();
-                  if (activeConnectController.current === controller) {
-                    setStatus(stopped);
-                  }
-                } catch {
-                  // The original connection diagnostic remains authoritative.
-                }
-              }
-              throw caught;
             }
-          } finally {
-            if (connectAbort.current === controller) {
-              connectAbort.current = null;
-            }
-            if (activeConnectController.current === controller) {
-              activeConnectController.current = null;
-            }
-            setEntryNodeRefresh(null);
+            throw caught;
           }
-        }),
-      );
-    },
-    [run],
-  );
+        } finally {
+          if (connectAbort.current === controller) {
+            connectAbort.current = null;
+          }
+          if (activeConnectController.current === controller) {
+            activeConnectController.current = null;
+          }
+          setEntryNodeRefresh(null);
+        }
+      }),
+    );
+  }, [run]);
 
   const connect = useCallback(async () => {
     return connectWithFailurePolicy();
@@ -1075,9 +1071,7 @@ export function useMasqController() {
           // owns the first recovery opportunity. Its state publication trails
           // the callback briefly, so observe one bounded window even while the
           // immediate status still says `ready`.
-          if (
-            nativeRecoveryObservationGeneration.current !== next.generation
-          ) {
+          if (nativeRecoveryObservationGeneration.current !== next.generation) {
             nativeRecoveryObservationGeneration.current = next.generation;
             automaticReconnectFailures.current = 0;
             automaticReconnectNotBefore.current =
@@ -1120,7 +1114,14 @@ export function useMasqController() {
     const subscription = AppState.addEventListener('change', nextState => {
       const resumeEpoch = ++appStateResumeEpoch.current;
       if (nextState !== 'active') {
-        masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
+        // An already-mounted browser keeps its selected MASQ/direct routing
+        // lease while the privacy shield covers the UI. This lets an external
+        // confirmation app return to the exact WebView and redirect flow.
+        // With no mounted browser (including a pending open), remain
+        // fail-closed and explicitly block browser traffic.
+        if (!browserSessionActiveRef.current) {
+          masqCore.setBrowserRoutingMode('blocked').catch(() => 'blocked');
+        }
         return;
       }
 
@@ -1159,24 +1160,20 @@ export function useMasqController() {
           connectFlight.current.isRunning ||
           observedConnectAttempt !== connectAttemptEpoch.current;
         if (nextNetwork.available && connectionAttemptObserved) {
-          lastConnectAttemptNetworkGeneration.current =
-            nextNetwork.generation;
-          nativeRecoveryObservationGeneration.current =
-            nextNetwork.generation;
+          lastConnectAttemptNetworkGeneration.current = nextNetwork.generation;
+          nativeRecoveryObservationGeneration.current = nextNetwork.generation;
         }
         const freshNetworkOpportunity =
           !connectionAttemptObserved &&
           lastConnectAttemptNetworkGeneration.current !==
-          nextNetwork.generation;
+            nextNetwork.generation;
         if (
           desiredConnected.current &&
           nextNetwork.available &&
           freshNetworkOpportunity &&
-          nativeRecoveryObservationGeneration.current !==
-            nextNetwork.generation
+          nativeRecoveryObservationGeneration.current !== nextNetwork.generation
         ) {
-          nativeRecoveryObservationGeneration.current =
-            nextNetwork.generation;
+          nativeRecoveryObservationGeneration.current = nextNetwork.generation;
           automaticReconnectFailures.current = 0;
           automaticReconnectNotBefore.current =
             Date.now() + NATIVE_RECOVERY_OBSERVATION_MS;

@@ -1623,9 +1623,7 @@ describe('useMasqController entry-node connection lifecycle', () => {
         code: 'E_CORE_STARTUP_FAILED',
       }),
     );
-    jest
-      .spyOn(masqCore, 'setBrowserRoutingMode')
-      .mockResolvedValue('blocked');
+    jest.spyOn(masqCore, 'setBrowserRoutingMode').mockResolvedValue('blocked');
     jest.spyOn(masqCore, 'stop').mockResolvedValue(CONFIGURED_STATUS);
     const renderer = await renderController(value => {
       current = value;
@@ -1675,6 +1673,53 @@ describe('useMasqController entry-node connection lifecycle', () => {
       neighbors: REFRESHED_PROFILE.neighbors,
       walletSecret: '',
     });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('does not block a mounted browser session while the app is backgrounded', async () => {
+    let appStateListener!: (state: AppStateStatus) => void;
+    jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_type, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      });
+    const connectedStatus: CoreStatus = {
+      ...CONFIGURED_STATUS,
+      connectedNeighbors: 1,
+      engineGeneration: 77,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 3,
+      routeStage: 2,
+    };
+    jest
+      .spyOn(masqCore, 'getSavedConfiguration')
+      .mockResolvedValue(SAVED_PROFILE);
+    jest.spyOn(masqCore, 'getStatus').mockResolvedValue(connectedStatus);
+    const setBrowserRoutingMode = jest.spyOn(masqCore, 'setBrowserRoutingMode');
+    const renderer = await renderController(value => {
+      current = value;
+    }, true);
+    setBrowserRoutingMode.mockClear();
+
+    await ReactTestRenderer.act(async () => {
+      appStateListener('inactive');
+      appStateListener('background');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setBrowserRoutingMode).not.toHaveBeenCalled();
+
+    await ReactTestRenderer.act(async () => {
+      appStateListener('active');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setBrowserRoutingMode).not.toHaveBeenCalled();
+    expect(current.status).toEqual(connectedStatus);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
@@ -1830,9 +1875,10 @@ describe('useMasqController entry-node connection lifecycle', () => {
 
 async function renderController(
   onRender: (value: ReturnType<typeof useMasqController>) => void,
+  browserSessionActive = false,
 ) {
   function Harness() {
-    onRender(useMasqController());
+    onRender(useMasqController(browserSessionActive));
     return null;
   }
 

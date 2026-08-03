@@ -593,6 +593,46 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         ))
   }
 
+  override fun getBrowserSearchProvider(promise: Promise) {
+    try {
+      promise.resolve(readBrowserSearchProvider())
+    } catch (error: RuntimeException) {
+      promise.reject(
+          "E_BROWSER_SEARCH_PROVIDER_STORAGE",
+          "The saved Android browser search provider is invalid.",
+          error,
+      )
+    }
+  }
+
+  override fun setBrowserSearchProvider(provider: String, promise: Promise) {
+    if (provider !in BROWSER_SEARCH_PROVIDERS) {
+      promise.reject(
+          "E_BROWSER_SEARCH_PROVIDER_CONFIG",
+          "Choose Timpi or DuckDuckGo as the browser search provider.",
+      )
+      return
+    }
+    try {
+      val saved =
+          preferences.edit().putString(BROWSER_SEARCH_PROVIDER_KEY, provider).commit()
+      if (!saved || readBrowserSearchProvider() != provider) {
+        promise.reject(
+            "E_BROWSER_SEARCH_PROVIDER_STORAGE",
+            "Android could not save the browser search provider.",
+        )
+        return
+      }
+      promise.resolve(provider)
+    } catch (error: RuntimeException) {
+      promise.reject(
+          "E_BROWSER_SEARCH_PROVIDER_STORAGE",
+          "Android could not save the browser search provider.",
+          error,
+      )
+    }
+  }
+
   override fun getBrowserSiteSettings(mode: String, hostname: String, promise: Promise) {
     val site = validateBrowserSite(mode, hostname, promise) ?: return
     try {
@@ -2881,6 +2921,16 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
     }
   }
 
+  private fun readBrowserSearchProvider(): String {
+    val provider =
+        preferences.getString(BROWSER_SEARCH_PROVIDER_KEY, null)
+            ?: DEFAULT_BROWSER_SEARCH_PROVIDER
+    if (provider !in BROWSER_SEARCH_PROVIDERS) {
+      throw IllegalStateException("The saved browser search provider is unsupported.")
+    }
+    return provider
+  }
+
   private fun browserSiteSettingsJson(mode: String, hostname: String): String {
     val prefix = browserSitePreferencePrefix(mode, hostname)
     val persistentSupported = browserProfilesSupported()
@@ -2910,6 +2960,9 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
               (clearProtectionExceptions || key.endsWith("remember-sign-in"))
         }
         .forEach { key -> editor.remove(key) }
+    if (clearProtectionExceptions) {
+      editor.remove(BROWSER_SEARCH_PROVIDER_KEY)
+    }
     if (!editor.commit()) {
       throw IllegalStateException("Remembered browser settings could not be deleted.")
     }
@@ -4053,6 +4106,8 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
         "browser-protection.reject-optional-cookies"
     private const val YOUTUBE_BEST_EFFORT_KEY =
         "browser-protection.youtube-best-effort"
+    private const val BROWSER_SEARCH_PROVIDER_KEY = "browser.search-provider"
+    private const val DEFAULT_BROWSER_SEARCH_PROVIDER = "timpi"
     private const val ACTIVE_BROWSER_PROFILE_KEY = "browser-profile.active"
     private const val ACTIVE_BROWSER_MODE_KEY = "browser-profile.mode"
     private const val ACTIVE_BROWSER_PROFILE_PERSISTENT_KEY =
@@ -4097,6 +4152,7 @@ class MasqCoreModule(reactContext: ReactApplicationContext) : NativeMasqCoreSpec
             "rejectOptionalCookies",
             "youtubeBestEffort",
         )
+    private val BROWSER_SEARCH_PROVIDERS = setOf("timpi", "duckduckgo")
     private val BROWSER_SITE_LABEL_PATTERN =
         Regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
     private const val VPN_PERMISSION_REQUEST = 4108

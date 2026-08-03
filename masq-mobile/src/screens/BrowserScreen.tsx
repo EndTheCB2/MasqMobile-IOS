@@ -40,7 +40,12 @@ import {
   type BrowserNavigationMetric,
   type BrowserNavigationOutcome,
 } from '../core/browserPerformance';
-import { resolveBrowserInputTarget } from '../core/browserInput';
+import {
+  browserSearchProviderName,
+  DEFAULT_BROWSER_SEARCH_PROVIDER,
+  resolveBrowserInputTarget,
+  type BrowserSearchProvider,
+} from '../core/browserInput';
 import { decideBrowserRecovery } from '../core/browserRecovery';
 import {
   browserSiteHostname,
@@ -157,6 +162,7 @@ export function BrowserScreen({
   const loadOperation = useRef(0);
   const temporarySession = useRef(true);
   const protectionOperation = useRef(0);
+  const searchProviderOperation = useRef(0);
   const siteSettingsOperation = useRef(0);
   const [input, setInput] = useState('');
   const [url, setUrl] = useState<string | null>(null);
@@ -169,6 +175,13 @@ export function BrowserScreen({
   const [protectionBusy, setProtectionBusy] = useState(true);
   const [protectionError, setProtectionError] = useState<string | null>(null);
   const [protectionExpanded, setProtectionExpanded] = useState(false);
+  const [searchProvider, setSearchProvider] = useState<BrowserSearchProvider>(
+    DEFAULT_BROWSER_SEARCH_PROVIDER,
+  );
+  const [searchProviderBusy, setSearchProviderBusy] = useState(true);
+  const [searchProviderError, setSearchProviderError] = useState<string | null>(
+    null,
+  );
   const [siteSettings, setSiteSettings] = useState<BrowserSiteSettings | null>(
     null,
   );
@@ -248,33 +261,36 @@ export function BrowserScreen({
     [cancelLoadWatchdog, mode],
   );
 
-  const beginActiveLoad = useCallback((nextUrl?: string) => {
-    // A redirect or a second navigation can start before Android delivers the
-    // completion event for the previous document. Give the newest document a
-    // fresh watchdog and fence late completion events by their canonical URL.
-    cancelLoadWatchdog();
-    const id = ++loadOperation.current;
-    activeLoad.current = {
-      id,
-      startedAtMs: browserMonotonicNow(),
-      url: canonicalBrowserLoadUrl(nextUrl),
-    };
-    setError(null);
-    setLoading(true);
-    loadWatchdogTimer.current = setTimeout(() => {
-      const current = activeLoad.current;
-      if (!current || current.id !== id) {
-        return;
-      }
-      webView.current?.stopLoading();
-      finishActiveLoad('timed_out');
-      setError(
-        mode === 'masq'
-          ? 'The page did not finish loading through MASQ in time. The stalled load was stopped; retry to use a fresh browser request.'
-          : 'The page did not finish loading in time. The stalled load was stopped; check the connection and retry.',
-      );
-    }, browserLoadWatchdogMs(mode));
-  }, [cancelLoadWatchdog, finishActiveLoad, mode]);
+  const beginActiveLoad = useCallback(
+    (nextUrl?: string) => {
+      // A redirect or a second navigation can start before Android delivers the
+      // completion event for the previous document. Give the newest document a
+      // fresh watchdog and fence late completion events by their canonical URL.
+      cancelLoadWatchdog();
+      const id = ++loadOperation.current;
+      activeLoad.current = {
+        id,
+        startedAtMs: browserMonotonicNow(),
+        url: canonicalBrowserLoadUrl(nextUrl),
+      };
+      setError(null);
+      setLoading(true);
+      loadWatchdogTimer.current = setTimeout(() => {
+        const current = activeLoad.current;
+        if (!current || current.id !== id) {
+          return;
+        }
+        webView.current?.stopLoading();
+        finishActiveLoad('timed_out');
+        setError(
+          mode === 'masq'
+            ? 'The page did not finish loading through MASQ in time. The stalled load was stopped; retry to use a fresh browser request.'
+            : 'The page did not finish loading in time. The stalled load was stopped; check the connection and retry.',
+        );
+      }, browserLoadWatchdogMs(mode));
+    },
+    [cancelLoadWatchdog, finishActiveLoad, mode],
+  );
 
   const stopAndReleaseWebView = useCallback((clearTemporaryCache: boolean) => {
     const current = webView.current;
@@ -323,14 +339,64 @@ export function BrowserScreen({
     }
   }, [isMasq]);
 
+  const loadSearchProvider = useCallback(async () => {
+    const operation = ++searchProviderOperation.current;
+    setSearchProviderBusy(true);
+    setSearchProviderError(null);
+    try {
+      const savedProvider = await masqCore.getBrowserSearchProvider();
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(savedProvider);
+      }
+    } catch {
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(DEFAULT_BROWSER_SEARCH_PROVIDER);
+        setSearchProviderError(
+          'The saved search engine could not be loaded. Timpi is used for this session.',
+        );
+      }
+    } finally {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderBusy(false);
+      }
+    }
+  }, []);
+
+  const chooseSearchProvider = async (next: BrowserSearchProvider) => {
+    if (searchProviderBusy || next === searchProvider) {
+      return;
+    }
+    const operation = ++searchProviderOperation.current;
+    setSearchProviderBusy(true);
+    setSearchProviderError(null);
+    try {
+      const savedProvider = await masqCore.setBrowserSearchProvider(next);
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(savedProvider);
+      }
+    } catch {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderError(
+          'The search engine choice could not be saved. Try again.',
+        );
+      }
+    } finally {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderBusy(false);
+      }
+    }
+  };
+
   useEffect(() => {
     prepareProtection().catch(() => undefined);
+    loadSearchProvider().catch(() => undefined);
     return () => {
       protectionOperation.current += 1;
+      searchProviderOperation.current += 1;
       siteSettingsOperation.current += 1;
       cancelScheduledRetry();
     };
-  }, [cancelScheduledRetry, prepareProtection]);
+  }, [cancelScheduledRetry, loadSearchProvider, prepareProtection]);
 
   useLayoutEffect(() => {
     temporarySession.current = !siteSettings?.rememberSignIn;
@@ -343,6 +409,25 @@ export function BrowserScreen({
     },
     [cancelLoadWatchdog, stopAndReleaseWebView],
   );
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state !== 'active') {
+        // Mobile WebViews can pause network activity while another app handles
+        // a sign-in confirmation. Keep the WebView mounted, but pause our own
+        // timeout/retry timers so they cannot replace or stop that page while
+        // it is hidden behind App's privacy shield.
+        cancelLoadWatchdog();
+        cancelScheduledRetry();
+        return;
+      }
+      const pausedLoad = activeLoad.current;
+      if (pausedLoad) {
+        beginActiveLoad(pausedLoad.url ?? undefined);
+      }
+    });
+    return () => subscription.remove();
+  }, [beginActiveLoad, cancelLoadWatchdog, cancelScheduledRetry]);
 
   const closeBrowser = useCallback(
     async (reason?: BrowserCloseReason) => {
@@ -390,15 +475,6 @@ export function BrowserScreen({
       stopAndReleaseWebView,
     ],
   );
-
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', state => {
-      if (state !== 'active' && closeState === 'open') {
-        closeBrowser('background').catch(() => undefined);
-      }
-    });
-    return () => subscription.remove();
-  }, [closeBrowser, closeState]);
 
   useEffect(() => {
     if (Platform.OS !== 'android') {
@@ -473,15 +549,10 @@ export function BrowserScreen({
         }
       }
     },
-    [
-      cancelScheduledRetry,
-      finishActiveLoad,
-      mode,
-      stopAndReleaseWebView,
-    ],
+    [cancelScheduledRetry, finishActiveLoad, mode, stopAndReleaseWebView],
   );
 
-  const navigate = async () => {
+  const navigate = async (submittedInput: string = input) => {
     if (!protection || protectionBusy) {
       setError(
         isMasq
@@ -491,7 +562,9 @@ export function BrowserScreen({
       return;
     }
     try {
-      await openTarget(resolveBrowserInputTarget(input));
+      await openTarget(
+        resolveBrowserInputTarget(submittedInput, searchProvider),
+      );
     } catch (caught) {
       setError(browserAddressError(caught));
     }
@@ -896,13 +969,22 @@ export function BrowserScreen({
           }
           autoCapitalize="none"
           autoCorrect={false}
-          editable={Boolean(protection) && !protectionBusy && !siteSettingsBusy}
+          editable={
+            Boolean(protection) &&
+            !protectionBusy &&
+            !searchProviderBusy &&
+            !siteSettingsBusy
+          }
           keyboardType="default"
           onChangeText={setInput}
-          onSubmitEditing={() => navigate().catch(() => undefined)}
-          placeholder="Search with Timpi or enter a website"
+          onSubmitEditing={event =>
+            navigate(event?.nativeEvent?.text ?? input).catch(() => undefined)
+          }
+          placeholder={`Search with ${browserSearchProviderName(
+            searchProvider,
+          )} or enter a website`}
           placeholderTextColor="#61788B"
-          returnKeyType="search"
+          returnKeyType="go"
           selectTextOnFocus
           style={styles.address}
           value={input}
@@ -943,6 +1025,41 @@ export function BrowserScreen({
         </Pressable>
         {protectionExpanded ? (
           <>
+            <View style={styles.searchEngineSettings}>
+              <View style={styles.searchEngineHeading}>
+                <Text style={styles.siteSettingsTitle}>Search engine</Text>
+                {searchProviderBusy ? (
+                  <ActivityIndicator color={colors.violet} size="small" />
+                ) : null}
+              </View>
+              <View style={styles.protectionOptions}>
+                <SearchProviderButton
+                  disabled={searchProviderBusy}
+                  label="Timpi"
+                  onPress={() =>
+                    chooseSearchProvider('timpi').catch(() => undefined)
+                  }
+                  selected={searchProvider === 'timpi'}
+                />
+                <SearchProviderButton
+                  disabled={searchProviderBusy}
+                  label="DuckDuckGo"
+                  onPress={() =>
+                    chooseSearchProvider('duckduckgo').catch(() => undefined)
+                  }
+                  selected={searchProvider === 'duckduckgo'}
+                />
+              </View>
+              <Text style={styles.protectionHint}>
+                Free-text searches use this provider. Website addresses and ENS
+                names always open directly.
+              </Text>
+              {searchProviderError ? (
+                <Text accessibilityRole="alert" style={styles.protectionError}>
+                  {searchProviderError}
+                </Text>
+              ) : null}
+            </View>
             {protection ? (
               <View style={styles.protectionOptions}>
                 <PresetButton
@@ -1288,16 +1405,21 @@ export function BrowserScreen({
             <Text style={styles.startHint}>
               {protection
                 ? isMasq
-                  ? 'Search with Timpi or enter a public HTTPS address to browse through MASQ.'
-                  : 'Search with Timpi or enter a public HTTPS address using your normal internet connection. Direct browsing is identified by the compact badge above.'
+                  ? `Search with ${browserSearchProviderName(
+                      searchProvider,
+                    )} or enter a public HTTPS address to browse through MASQ.`
+                  : `Search with ${browserSearchProviderName(
+                      searchProvider,
+                    )} or enter a public HTTPS address using your normal internet connection. Direct browsing is identified by the compact badge above.`
                 : isMasq
                 ? 'Resolve browser protection above before opening a website.'
                 : 'Resolve browser safeguards above before opening a website.'}
             </Text>
             {protection ? (
               <Text style={styles.searchProvider}>
-                Free-text searches open Timpi Search. ENS .eth websites use the
-                HTTPS eth.limo gateway.
+                Free-text searches open{' '}
+                {browserSearchProviderName(searchProvider)}. ENS .eth websites
+                use the HTTPS eth.limo gateway.
               </Text>
             ) : null}
           </View>
@@ -1373,6 +1495,35 @@ function PresetButton({
       disabled={disabled}
       onPress={onPress}
       style={[styles.presetButton, disabled && styles.disabled]}
+    >
+      <Text style={styles.presetButtonText}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function SearchProviderButton({
+  disabled,
+  label,
+  onPress,
+  selected,
+}: {
+  disabled: boolean;
+  label: string;
+  onPress: () => void;
+  selected: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={`Use ${label} search`}
+      accessibilityRole="radio"
+      accessibilityState={{ checked: selected, disabled }}
+      disabled={disabled}
+      onPress={onPress}
+      style={[
+        styles.presetButton,
+        selected && styles.searchProviderButtonSelected,
+        disabled && styles.disabled,
+      ]}
     >
       <Text style={styles.presetButtonText}>{label}</Text>
     </Pressable>
@@ -1526,6 +1677,19 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 7,
     marginTop: 9,
+  },
+  searchEngineSettings: {
+    borderBottomColor: colors.line,
+    borderBottomWidth: 1,
+    paddingBottom: 9,
+  },
+  searchEngineHeading: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  searchProviderButtonSelected: {
+    backgroundColor: colors.violet,
   },
   protectionOption: {
     alignItems: 'center',

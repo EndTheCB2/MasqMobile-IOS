@@ -14,6 +14,10 @@ import {
   type BrowserSiteSettings,
 } from './browserSiteSettings';
 import {
+  DEFAULT_BROWSER_SEARCH_PROVIDER,
+  type BrowserSearchProvider,
+} from './browserInput';
+import {
   EMPTY_STATUS,
   type CoreStatus,
   type DebtSettlementQuote,
@@ -109,6 +113,10 @@ export interface MasqCore {
   setBrowserProtection(
     preferences: BrowserProtectionPreferences,
   ): Promise<BrowserProtectionConfiguration>;
+  getBrowserSearchProvider(): Promise<BrowserSearchProvider>;
+  setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider>;
   setBrowserRoutingMode(mode: BrowserRoutingMode): Promise<BrowserRoutingMode>;
   getBrowserSiteSettings(
     mode: BrowserSiteMode,
@@ -268,6 +276,21 @@ class NativeCore implements MasqCore {
     );
   }
 
+  async getBrowserSearchProvider(): Promise<BrowserSearchProvider> {
+    return decodeBrowserSearchProvider(
+      await NativeMasqCore!.getBrowserSearchProvider(),
+    );
+  }
+
+  async setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider> {
+    const requested = decodeBrowserSearchProvider(provider);
+    return decodeBrowserSearchProvider(
+      await NativeMasqCore!.setBrowserSearchProvider(requested),
+    );
+  }
+
   async setBrowserRoutingMode(
     mode: BrowserRoutingMode,
   ): Promise<BrowserRoutingMode> {
@@ -319,6 +342,8 @@ class NativeCore implements MasqCore {
 }
 
 class MissingNativeCore implements MasqCore {
+  private browserSearchProvider: BrowserSearchProvider =
+    DEFAULT_BROWSER_SEARCH_PROVIDER;
   private status: CoreStatus = {
     ...EMPTY_STATUS,
     phase: 'blocked',
@@ -378,6 +403,7 @@ class MissingNativeCore implements MasqCore {
 
   async reset(): Promise<CoreStatus> {
     this.status = { ...EMPTY_STATUS };
+    this.browserSearchProvider = DEFAULT_BROWSER_SEARCH_PROVIDER;
     return this.status;
   }
 
@@ -456,6 +482,17 @@ class MissingNativeCore implements MasqCore {
     };
   }
 
+  async getBrowserSearchProvider(): Promise<BrowserSearchProvider> {
+    return this.browserSearchProvider;
+  }
+
+  async setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider> {
+    this.browserSearchProvider = decodeBrowserSearchProvider(provider);
+    return this.browserSearchProvider;
+  }
+
   async setBrowserRoutingMode(
     mode: BrowserRoutingMode,
   ): Promise<BrowserRoutingMode> {
@@ -522,6 +559,17 @@ function decodeBrowserRoutingMode(serialized: string): BrowserRoutingMode {
   ) {
     throw new Error(
       'The native core returned an invalid browser routing mode.',
+    );
+  }
+  return serialized;
+}
+
+export function decodeBrowserSearchProvider(
+  serialized: string,
+): BrowserSearchProvider {
+  if (serialized !== 'timpi' && serialized !== 'duckduckgo') {
+    throw new Error(
+      'The native core returned an invalid browser search provider.',
     );
   }
   return serialized;

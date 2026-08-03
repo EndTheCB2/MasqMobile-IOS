@@ -71,11 +71,11 @@ function AppContent() {
   const browserOpenInFlight = useRef(false);
   const openingBrowserMode = useRef<BrowserMode | null>(null);
   const browserRepairInFlight = useRef<Promise<void> | null>(null);
-  const controller = useMasqController();
-  const recoverablePrivateBrowserError = useRef<string | null>(null);
-  const previousCoreRouteReady = useRef(
-    isCoreRouteReady(controller.status),
+  const controller = useMasqController(
+    route === 'browser' && browserMode !== null,
   );
+  const recoverablePrivateBrowserError = useRef<string | null>(null);
+  const previousCoreRouteReady = useRef(isCoreRouteReady(controller.status));
   const coreRouteReady = isCoreRouteReady(controller.status);
   const activeIssue = directBrowserError
     ? {
@@ -93,17 +93,13 @@ function AppContent() {
       );
 
   useEffect(() => {
-    const routeRecovered =
-      coreRouteReady && !previousCoreRouteReady.current;
+    const routeRecovered = coreRouteReady && !previousCoreRouteReady.current;
     previousCoreRouteReady.current = coreRouteReady;
     if (!routeRecovered) {
       return;
     }
     setRouteError(current => {
-      if (
-        !current ||
-        current !== recoverablePrivateBrowserError.current
-      ) {
+      if (!current || current !== recoverablePrivateBrowserError.current) {
         return current;
       }
       recoverablePrivateBrowserError.current = null;
@@ -125,9 +121,10 @@ function AppContent() {
       setPrivacyShielded(state !== 'active');
       if (state !== 'active') {
         browserOperation.current += 1;
-        // An active BrowserScreen immediately unmounts its WebView and owns the
-        // acknowledged close/retry lifecycle. This listener handles only a
-        // session that is still opening and has no WebView yet.
+        // An active BrowserScreen remains mounted behind the privacy shield so
+        // an external sign-in confirmation can return to the same page. This
+        // listener handles only a session that is still opening and therefore
+        // has no WebView or browser-routing lease yet.
         if (route === 'browser' && browserMode) {
           return;
         }
@@ -564,7 +561,9 @@ function AppContent() {
                 ? 'https://sepolia.basescan.org/tx/'
                 : 'https://basescan.org/tx/';
             Linking.openURL(`${explorer}${transactionHash}`).catch(() =>
-              setRouteError('The BaseScan transaction link could not be opened.'),
+              setRouteError(
+                'The BaseScan transaction link could not be opened.',
+              ),
             );
           }}
           status={controller.status}

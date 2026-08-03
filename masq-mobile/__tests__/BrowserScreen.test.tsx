@@ -21,6 +21,8 @@ const mockClearFormData = jest.fn();
 const mockClearHistory = jest.fn();
 const mockPrepareBrowserProtection = jest.fn();
 const mockSetBrowserProtection = jest.fn();
+const mockGetBrowserSearchProvider = jest.fn();
+const mockSetBrowserSearchProvider = jest.fn();
 const TEST_PLATFORM_OS = Platform.OS;
 const HARDWARE_BACK_EVENT = {
   timeStamp: 0,
@@ -80,12 +82,22 @@ describe('BrowserScreen recovery lifecycle', () => {
         ...preferences,
       }),
     );
+    mockGetBrowserSearchProvider.mockReset().mockResolvedValue('timpi');
+    mockSetBrowserSearchProvider
+      .mockReset()
+      .mockImplementation(async (provider: 'timpi' | 'duckduckgo') => provider);
     jest
       .spyOn(masqCore, 'prepareBrowserProtection')
       .mockImplementation(mockPrepareBrowserProtection);
     jest
       .spyOn(masqCore, 'setBrowserProtection')
       .mockImplementation(mockSetBrowserProtection);
+    jest
+      .spyOn(masqCore, 'getBrowserSearchProvider')
+      .mockImplementation(mockGetBrowserSearchProvider);
+    jest
+      .spyOn(masqCore, 'setBrowserSearchProvider')
+      .mockImplementation(mockSetBrowserSearchProvider);
   });
 
   afterEach(() => {
@@ -211,35 +223,56 @@ describe('BrowserScreen recovery lifecycle', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('closes an active WebView fail-closed when the app is backgrounded', async () => {
-    const appStateChanges: Array<(state: AppStateStatus) => void> = [];
-    jest
-      .spyOn(AppState, 'addEventListener')
-      .mockImplementation((_event, listener) => {
-        appStateChanges.push(listener);
-        return { remove: jest.fn() };
+  it.each(['masq', 'direct'] as const)(
+    'keeps the active %s WebView mounted across background and resume',
+    async mode => {
+      const appStateChanges: Array<(state: AppStateStatus) => void> = [];
+      jest
+        .spyOn(AppState, 'addEventListener')
+        .mockImplementation((_event, listener) => {
+          appStateChanges.push(listener);
+          return { remove: jest.fn() };
+        });
+      const onClose = jest.fn().mockResolvedValue(undefined);
+      const renderer = await renderBrowser(mode, onClose);
+      const address = renderer.root.findByType(TextInput);
+      ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+      await submitAddress(address);
+      const mountedWebView = renderer.root.findByProps({
+        testID: 'private-webview',
       });
-    const onClose = jest.fn().mockResolvedValue(undefined);
-    const renderer = await renderBrowser('direct', onClose);
-    const address = renderer.root.findByType(TextInput);
-    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
-    await submitAddress(address);
-    expect(
-      renderer.root.findAllByProps({ testID: 'private-webview' }),
-    ).not.toHaveLength(0);
+      ReactTestRenderer.act(() => {
+        mountedWebView.props.onNavigationStateChange({
+          canGoBack: true,
+          url: 'https://example.com/account/confirmation',
+        });
+      });
 
-    await ReactTestRenderer.act(async () => {
-      appStateChanges.forEach(listener => listener('background'));
-      await waitForBrowserCloseFrame();
-    });
+      await ReactTestRenderer.act(async () => {
+        appStateChanges.forEach(listener => listener('inactive'));
+        appStateChanges.forEach(listener => listener('background'));
+        await Promise.resolve();
+        appStateChanges.forEach(listener => listener('active'));
+        await Promise.resolve();
+      });
 
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(onClose).toHaveBeenCalledWith('background');
-    expect(
-      renderer.root.findAllByProps({ testID: 'private-webview' }),
-    ).toHaveLength(0);
-    ReactTestRenderer.act(() => renderer.unmount());
-  });
+      expect(onClose).not.toHaveBeenCalled();
+      expect(renderer.root.findByProps({ testID: 'private-webview' })).toBe(
+        mountedWebView,
+      );
+      expect(mountedWebView.props.source).toEqual({
+        uri: 'https://example.com/',
+      });
+      expect(renderer.root.findByType(TextInput).props.value).toBe(
+        'https://example.com/account/confirmation',
+      );
+      expect(mockStopLoading).not.toHaveBeenCalled();
+      expect(mockClearCache).not.toHaveBeenCalled();
+      expect(mockClearFormData).not.toHaveBeenCalled();
+      expect(mockClearHistory).not.toHaveBeenCalled();
+      ReactTestRenderer.act(() => renderer.unmount());
+    },
+  );
 
   it('cancels a scheduled retry when the user navigates elsewhere', async () => {
     const renderer = await renderBrowser();
@@ -347,7 +380,7 @@ describe('BrowserScreen recovery lifecycle', () => {
     expect(address.props.placeholder).toBe(
       'Search with Timpi or enter a website',
     );
-    expect(address.props.returnKeyType).toBe('search');
+    expect(address.props.returnKeyType).toBe('go');
 
     ReactTestRenderer.act(() => {
       address.props.onChangeText('private mobile browser');
@@ -361,6 +394,101 @@ describe('BrowserScreen recovery lifecycle', () => {
     });
     ReactTestRenderer.act(() => renderer.unmount());
   });
+
+  it('loads a saved DuckDuckGo choice and uses it only for free text', async () => {
+    mockGetBrowserSearchProvider.mockResolvedValue('duckduckgo');
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+
+    expect(address.props.placeholder).toBe(
+      'Search with DuckDuckGo or enter a website',
+    );
+    ReactTestRenderer.act(() => {
+      address.props.onChangeText('private mobile browser');
+    });
+    await submitAddress(address);
+
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({
+      uri: 'https://duckduckgo.com/?q=private%20mobile%20browser',
+    });
+
+    ReactTestRenderer.act(() => {
+      renderer.root.findByType(TextInput).props.onChangeText('voorbeeld.com');
+    });
+    await submitAddress(renderer.root.findByType(TextInput));
+    expect(
+      renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+    ).toEqual({ uri: 'https://voorbeeld.com/' });
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('persists a compact search-engine choice without reloading the page', async () => {
+    const renderer = await renderBrowser();
+    const address = renderer.root.findByType(TextInput);
+    ReactTestRenderer.act(() => address.props.onChangeText('example.com'));
+    await submitAddress(address);
+    const mountedWebView = renderer.root.findByProps({
+      testID: 'private-webview',
+    });
+    expandProtectionSettings(renderer);
+    const timpi = renderer.root.findByProps({
+      accessibilityLabel: 'Use Timpi search',
+    });
+    const duckDuckGo = renderer.root.findByProps({
+      accessibilityLabel: 'Use DuckDuckGo search',
+    });
+
+    expect(timpi.props.accessibilityState.checked).toBe(true);
+    expect(duckDuckGo.props.accessibilityState.checked).toBe(false);
+    await ReactTestRenderer.act(async () => {
+      duckDuckGo.props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockSetBrowserSearchProvider).toHaveBeenCalledWith('duckduckgo');
+    expect(
+      renderer.root.findByProps({
+        accessibilityLabel: 'Use DuckDuckGo search',
+      }).props.accessibilityState.checked,
+    ).toBe(true);
+    expect(renderer.root.findByType(TextInput).props.placeholder).toBe(
+      'Search with DuckDuckGo or enter a website',
+    );
+    expect(renderer.root.findByProps({ testID: 'private-webview' })).toBe(
+      mountedWebView,
+    );
+    expect(mockReload).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it.each(['masq', 'direct'] as const)(
+    'opens a submitted bare domain directly in %s mode',
+    async mode => {
+      const renderer = await renderBrowser(mode);
+      const address = renderer.root.findByType(TextInput);
+
+      // Android and iOS can deliver the final IME text in this event before
+      // React has committed the matching onChangeText state update.
+      await ReactTestRenderer.act(async () => {
+        address.props.onSubmitEditing({
+          nativeEvent: { text: 'voorbeeld.com' },
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(
+        renderer.root.findByProps({ testID: 'private-webview' }).props.source,
+      ).toEqual({ uri: 'https://voorbeeld.com/' });
+      expect(renderer.root.findByType(TextInput).props.value).toBe(
+        'https://voorbeeld.com/',
+      );
+      ReactTestRenderer.act(() => renderer.unmount());
+    },
+  );
 
   it('opens ENS names through eth.limo while keeping the logical address visible', async () => {
     const renderer = await renderBrowser();
