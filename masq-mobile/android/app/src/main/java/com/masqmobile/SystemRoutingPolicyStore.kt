@@ -32,6 +32,7 @@ enum class SystemRoutingDiagnostic(val wireCode: String) {
   TRANSLATOR_RETURNED("translator_returned"),
   CORE_ROUTE_NOT_READY("core_route_not_ready"),
   POLICY_REVISION_CONFLICT("policy_revision_conflict"),
+  PACKAGE_SCOPE_CHANGED("package_scope_changed"),
   PACKAGE_NOT_INSTALLED("package_not_installed"),
   OWN_PACKAGE_UNSUPPORTED("own_package_unsupported"),
   FAIL_CLOSED_UNSUPPORTED("fail_closed_unsupported"),

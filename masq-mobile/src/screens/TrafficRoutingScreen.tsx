@@ -193,11 +193,14 @@ export function TrafficRoutingScreen({
               transports—is blocked while capture is valid. Activation opens
               an encrypted connection to example.com through the MASQ exit
               and requests only response headers; no page body is downloaded. MASQ
-              packages installed when the route is created are excluded, but
-              Android snapshots package UIDs at that moment. Turn routing off
-              before installing, removing, enabling, disabling, or updating
-              apps, then reapply it. If the service or process dies, traffic
-              can return to the direct connection. Always-on VPN and “Block
+              packages installed when the route is created are excluded, and
+              Android snapshots package UIDs at that moment. When a scoped app
+              is installed, removed, enabled, disabled, or updated, this build
+              pauses translation and safely rebuilds that UID scope. Wait until
+              the status returns to MASQ before using the affected app; turn
+              routing off if Android cannot confirm the rebuilt scope. If the
+              service or process dies, traffic can return to the direct
+              connection. Always-on VPN and “Block
               connections without VPN” are unsupported. The loopback proxy is
               unauthenticated; a malicious local app that discovers its
               temporary port could consume the MASQ route and wallet funds.

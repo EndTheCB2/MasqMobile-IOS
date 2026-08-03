@@ -62,5 +62,13 @@
           android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
           android:value="false" />
       </service>
+      <receiver
+        android:name=".MasqPackageReplacementReceiver"
+        android:enabled="true"
+        android:exported="false">
+        <intent-filter>
+          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+        </intent-filter>
+      </receiver>
     </application>
 </manifest>

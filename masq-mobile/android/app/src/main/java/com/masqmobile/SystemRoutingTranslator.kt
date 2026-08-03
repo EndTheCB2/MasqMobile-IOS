@@ -452,6 +452,21 @@ internal class SystemRoutingTranslator(
     }
   }
 
+  /**
+   * Requests a prompt native stop without waiting for the exact run to return.
+   *
+   * Package-scope broadcasts use this before their serialized rebuild reaches the control
+   * executor. The existing TUN stays open as a blocker, and [stopAndAwait] remains the only method
+   * allowed to release ownership or authorize descriptor replacement.
+   */
+  fun requestStopWithoutRelease(): Boolean {
+    val run =
+        synchronized(lock) {
+          ownedRun?.takeUnless { it.future.isDone }
+        } ?: return false
+    return runCatching { nativeApi.requestStop() }.getOrDefault(false)
+  }
+
   fun stopAndAwait(revision: Long?, timeoutMs: Long): TranslatorStopResult {
     require(timeoutMs >= 0)
     val deadline = nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)

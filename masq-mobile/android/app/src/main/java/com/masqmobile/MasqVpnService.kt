@@ -4,8 +4,10 @@ import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
@@ -18,6 +20,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
@@ -74,6 +77,8 @@ class MasqVpnService : VpnService() {
   private val runtimeLock = Any()
   private val routeEventDispatchLock = Any()
   private val routeRecoveryState = SystemRoutingRouteRecoveryState()
+  private val packageChangeDrain = SystemRoutingPackageChangeDrain()
+  private val packageScopeRebuildRetryAttempts = AtomicInteger(0)
   private val acknowledgementOwnershipLock = Any()
   private val ownedStartRequests = mutableSetOf<Long>()
   private val ownedStopRequests = mutableSetOf<Long>()
@@ -86,6 +91,14 @@ class MasqVpnService : VpnService() {
   @Volatile private var translatorEngineGeneration: Long? = null
   @Volatile private var destroyed = false
   @Volatile private var adoptedTerminalLeaseEpoch: Long? = null
+  @Volatile private var packageChangeReceiverRegistered = false
+
+  private val packageChangeReceiver =
+      object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+          observePackageScopeChange(intent ?: return)
+        }
+      }
 
   override fun onCreate() {
     super.onCreate()
@@ -108,7 +121,255 @@ class MasqVpnService : VpnService() {
                   NotificationManager.IMPORTANCE_LOW,
               ))
     }
+    registerPackageChangeReceiver()
     scheduleCompanionSessionWatchdog()
+  }
+
+  private fun registerPackageChangeReceiver() {
+    if (!BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED) return
+    runCatching {
+          ContextCompat.registerReceiver(
+              this,
+              packageChangeReceiver,
+              IntentFilter().apply {
+                addAction(Intent.ACTION_PACKAGE_ADDED)
+                addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addAction(Intent.ACTION_PACKAGE_REPLACED)
+                addAction(Intent.ACTION_PACKAGE_CHANGED)
+                addDataScheme("package")
+              },
+              // PACKAGE_* broadcasts are protected system broadcasts. EXPORTED is required for
+              // delivery from the Package Manager's privileged process on current Android.
+              ContextCompat.RECEIVER_EXPORTED,
+          )
+        }
+        .onSuccess { packageChangeReceiverRegistered = true }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun installedUid(packageId: String): Int? =
+      runCatching { packageManager.getApplicationInfo(packageId, 0).uid }.getOrNull()
+
+  private fun observePackageScopeChange(intent: Intent) {
+    if (destroyed || !BuildConfig.MASQ_SYSTEM_TUNNEL_ENABLED) return
+    val packageId = intent.data?.schemeSpecificPart?.takeIf(String::isNotBlank) ?: return
+    val changedUid =
+        intent.getIntExtra(Intent.EXTRA_UID, -1).takeIf { it >= 0 }
+    val load =
+        runCatching { policyStore.loadForServiceStart() }
+            .getOrElse {
+              SystemRoutingPolicyLoadResult.BlockRequired(
+                  SystemRoutingDiagnostic.POLICY_READ_FAILED)
+            }
+    val desiredPolicy = (load as? SystemRoutingPolicyLoadResult.Ready)?.policy
+    val capturedPolicy = appliedPolicy
+    val capturedScopeAffected =
+        capturedPolicy?.let {
+          systemRoutingPackageChangeAffectsPolicy(
+              policy = it,
+              packageId = packageId,
+              changedUid = changedUid,
+              installedUid = ::installedUid,
+          )
+        } == true
+    val desiredScopeAffected =
+        desiredPolicy?.let {
+          systemRoutingPackageChangeAffectsPolicy(
+              policy = it,
+              packageId = packageId,
+              changedUid = changedUid,
+              installedUid = ::installedUid,
+          )
+        } == true
+    if (!capturedScopeAffected && !desiredScopeAffected) return
+    packageScopeRebuildRetryAttempts.set(0)
+
+    if (capturedScopeAffected) {
+      synchronized(runtimeLock) {
+        if (tunnelDescriptor != null && appliedPolicy == capturedPolicy) {
+          // The PFD deliberately remains open, but it no longer proves the exact package-to-UID
+          // scope. Every activation authority check observes this invalidation before it can
+          // publish ACTIVE.
+          localTunCaptureValid = false
+        }
+      }
+      translator.requestStopWithoutRelease()
+      synchronized(routeEventDispatchLock) {
+        routeRecoveryState
+            .observeRouteLoss(captureOrRecoveryNeedsBlocking = true)
+            ?.let(routeRecoveryState::completeRouteLoss)
+      }
+    }
+    publish(
+        load = load,
+        transition = SystemRoutingTransition.BLOCKED,
+        translatorReady = false,
+        coreRouteReady = false,
+        diagnostic = SystemRoutingDiagnostic.PACKAGE_SCOPE_CHANGED,
+        tunPresentOverride = false,
+    )
+    updateNotification("Android app scope changed; captured traffic is paused for a safe rebuild.")
+
+    val permanentRemoval =
+        intent.action == Intent.ACTION_PACKAGE_REMOVED &&
+            !intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)
+    if (!packageChangeDrain.observe(permanentRemoval)) return
+    try {
+      controlExecutor.execute(::drainPackageScopeChanges)
+    } catch (_: RuntimeException) {
+      packageChangeDrain.cancel()
+    }
+  }
+
+  private fun drainPackageScopeChanges() {
+    while (!destroyed) {
+      val batch = packageChangeDrain.nextBatch() ?: return
+      runCatching { handlePackageScopeChange(batch) }
+          .onFailure {
+            val load =
+                runCatching { policyStore.loadForServiceStart() }
+                    .getOrElse {
+                      SystemRoutingPolicyLoadResult.BlockRequired(
+                          SystemRoutingDiagnostic.POLICY_READ_FAILED)
+                    }
+            publish(
+                load = load,
+                transition = SystemRoutingTransition.BLOCKED,
+                translatorReady = false,
+                coreRouteReady = false,
+                diagnostic = SystemRoutingDiagnostic.INTERNAL_ERROR,
+                tunPresentOverride = false,
+            )
+          }
+      if (!packageChangeDrain.complete(batch)) return
+    }
+    packageChangeDrain.cancel()
+  }
+
+  private fun handlePackageScopeChange(batch: SystemRoutingPackageChangeBatch) {
+    if (destroyed) return
+    val load = policyStore.loadForServiceStart()
+    val policy = (load as? SystemRoutingPolicyLoadResult.Ready)?.policy
+    if (policy == null) {
+      val close = stopAndCloseAllTunnelsSafely()
+      publish(
+          load = load,
+          transition = SystemRoutingTransition.BLOCKED,
+          translatorReady = false,
+          coreRouteReady = false,
+          diagnostic =
+              when (close) {
+                TunnelCloseResult.Closed -> SystemRoutingDiagnostic.PACKAGE_SCOPE_CHANGED
+                TunnelCloseResult.CloseFailed -> SystemRoutingDiagnostic.TUNNEL_CLOSE_FAILED
+                is TunnelCloseResult.StopFailed -> close.diagnostic
+              },
+          tunPresentOverride = false,
+      )
+      return
+    }
+
+    val appliedRevision = appliedPolicy?.revision ?: policy.revision
+    val stopResult = stopTranslatorSafely(appliedRevision)
+    if (stopResult != TranslatorStopResult.SafeToClose) {
+      publish(
+          load = load,
+          transition = SystemRoutingTransition.BLOCKED,
+          translatorReady = false,
+          coreRouteReady = false,
+          diagnostic = stopDiagnostic(stopResult),
+          tunPresentOverride = false,
+      )
+      updateNotification("Captured traffic remains paused while Android stops the old app scope.")
+      return
+    }
+
+    val currentLoad = policyStore.loadForServiceStart()
+    if (currentLoad !is SystemRoutingPolicyLoadResult.Ready ||
+        currentLoad.policy != policy) {
+      publish(
+          load = currentLoad,
+          transition = SystemRoutingTransition.BLOCKED,
+          translatorReady = false,
+          coreRouteReady = false,
+          diagnostic = SystemRoutingDiagnostic.POLICY_REVISION_CONFLICT,
+          tunPresentOverride = false,
+      )
+      return
+    }
+
+    when (
+        val rebuilt =
+            rebuildInvalidatedTun(
+                policy = policy,
+                retireMissingSelectedScope = batch.retireMissingSelectedScope,
+            )) {
+      RebuildInvalidatedTunResult.Ready -> {
+        packageScopeRebuildRetryAttempts.set(0)
+        publish(
+            load = currentLoad,
+            transition = SystemRoutingTransition.BLOCKED,
+            translatorReady = false,
+            coreRouteReady = false,
+            diagnostic = SystemRoutingDiagnostic.CORE_ROUTE_NOT_READY,
+        )
+        updateNotification("Captured traffic is blocked until the community route reconnects.")
+        ensureCompanionSessionForDesiredRouting(currentLoad)
+      }
+      is RebuildInvalidatedTunResult.Failed -> {
+        publish(
+            load = currentLoad,
+            transition = SystemRoutingTransition.BLOCKED,
+            translatorReady = false,
+            coreRouteReady = false,
+            diagnostic = rebuilt.diagnostic,
+            tunPresentOverride = false,
+        )
+        updateNotification(
+            if (rebuilt.diagnostic == SystemRoutingDiagnostic.PACKAGE_NOT_INSTALLED) {
+              "A selected app is unavailable; routing will retry when it returns."
+            } else {
+              "Android could not safely rebuild the changed app scope."
+            })
+      }
+      is RebuildInvalidatedTunResult.RetainedBlocker -> {
+        publish(
+            load = currentLoad,
+            transition = SystemRoutingTransition.BLOCKED,
+            translatorReady = false,
+            coreRouteReady = false,
+            diagnostic = rebuilt.diagnostic,
+            tunPresentOverride = false,
+        )
+        updateNotification("The old app scope remains blocked while Android finishes updating it.")
+        schedulePackageScopeRebuildRetry()
+      }
+    }
+  }
+
+  private fun schedulePackageScopeRebuildRetry() {
+    val attempt = packageScopeRebuildRetryAttempts.incrementAndGet()
+    if (attempt > PACKAGE_SCOPE_REBUILD_RETRY_DELAYS_MS.size) return
+    runCatching {
+      handoffRetryExecutor.schedule(
+          {
+            if (destroyed) return@schedule
+            val scopeStillInvalid =
+                synchronized(runtimeLock) {
+                  tunnelDescriptor != null && !localTunCaptureValid
+                }
+            if (!scopeStillInvalid || !packageChangeDrain.observe(false)) {
+              return@schedule
+            }
+            try {
+              controlExecutor.execute(::drainPackageScopeChanges)
+            } catch (_: RuntimeException) {
+              packageChangeDrain.cancel()
+            }
+          },
+          PACKAGE_SCOPE_REBUILD_RETRY_DELAYS_MS[attempt - 1],
+          TimeUnit.MILLISECONDS,
+      )
+    }
   }
 
   private fun scheduleCompanionSessionWatchdog() {
@@ -1362,50 +1623,12 @@ class MasqVpnService : VpnService() {
         EnsureTunResult.ConflictingAppliedPolicy
       }
     }
-    val packageDiagnostic = validateInstalledPackages(policy)
-    if (packageDiagnostic != null) return EnsureTunResult.Failed(packageDiagnostic)
-
+    val configured = configureTunBuilder(policy)
+    if (configured is ConfigureTunBuilderResult.Failed) {
+      return EnsureTunResult.Failed(configured.diagnostic)
+    }
+    val builder: Builder = (configured as ConfigureTunBuilderResult.Ready).builder
     return try {
-      // Package existence is deliberately rechecked directly before Builder applies the scope.
-      val immediatelyValidated = validateInstalledPackages(policy)
-      if (immediatelyValidated != null) return EnsureTunResult.Failed(immediatelyValidated)
-      val builder =
-          Builder()
-              .setSession("MASQ private route")
-              .setMtu(TUNNEL_MTU)
-              .setBlocking(false)
-      // Capture both families fail closed. The native policy closes unsupported
-      // IPv6 flows before session accounting, prompting TCP Happy Eyeballs to
-      // fall back without allowing IPv6 to bypass the protected app scope.
-      MasqTunNetworkConfiguration.addresses.forEach { prefix ->
-        builder.addAddress(prefix.address, prefix.prefixLength)
-      }
-      MasqTunNetworkConfiguration.routes.forEach { prefix ->
-        builder.addRoute(prefix.address, prefix.prefixLength)
-      }
-      MasqTunNetworkConfiguration.dnsServers.forEach(builder::addDnsServer)
-      when (policy.desiredMode) {
-        SystemRoutingMode.WHOLE_DEVICE ->
-            MASQ_CONTROL_PLANE_PACKAGE_IDS.forEach { packageId ->
-              try {
-                builder.addDisallowedApplication(packageId)
-              } catch (_: PackageManager.NameNotFoundException) {
-                // The companion public/dogfood package is optional; the running
-                // package is always present and remains excluded.
-              }
-            }
-        SystemRoutingMode.SELECTED_APPS ->
-            policy.selectedApps.forEach(builder::addAllowedApplication)
-        SystemRoutingMode.OFF ->
-            return EnsureTunResult.Failed(SystemRoutingDiagnostic.INVALID_START_MODE)
-      }
-      builder.setConfigureIntent(
-          PendingIntent.getActivity(
-              this,
-              0,
-              Intent(this, MainActivity::class.java),
-              PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-          ))
       synchronized(runtimeLock) {
         if (destroyed || revoked) {
           return@synchronized EnsureTunResult.Failed(
@@ -1440,6 +1663,161 @@ class MasqVpnService : VpnService() {
       EnsureTunResult.Failed(SystemRoutingDiagnostic.VPN_INTERFACE_UNAVAILABLE)
     }
   }
+
+  private fun configureTunBuilder(
+      policy: DesiredSystemRoutingPolicy,
+  ): ConfigureTunBuilderResult {
+    notificationPermissionDiagnostic(policy)?.let {
+      return ConfigureTunBuilderResult.Failed(it)
+    }
+    validateInstalledPackages(policy)?.let {
+      return ConfigureTunBuilderResult.Failed(it)
+    }
+    return try {
+      // Recheck immediately before the Builder resolves package names to UIDs. A later package
+      // broadcast invalidates the resulting descriptor and schedules another drain.
+      validateInstalledPackages(policy)?.let {
+        return ConfigureTunBuilderResult.Failed(it)
+      }
+      val builder =
+          Builder()
+              .setSession("MASQ private route")
+              .setMtu(TUNNEL_MTU)
+              .setBlocking(false)
+      // Capture both families fail closed. The native policy closes unsupported
+      // IPv6 flows before session accounting, prompting TCP Happy Eyeballs to
+      // fall back without allowing IPv6 to bypass the protected app scope.
+      MasqTunNetworkConfiguration.addresses.forEach { prefix ->
+        builder.addAddress(prefix.address, prefix.prefixLength)
+      }
+      MasqTunNetworkConfiguration.routes.forEach { prefix ->
+        builder.addRoute(prefix.address, prefix.prefixLength)
+      }
+      MasqTunNetworkConfiguration.dnsServers.forEach(builder::addDnsServer)
+      when (policy.desiredMode) {
+        SystemRoutingMode.WHOLE_DEVICE ->
+            MASQ_CONTROL_PLANE_PACKAGE_IDS.forEach { packageId ->
+              try {
+                builder.addDisallowedApplication(packageId)
+              } catch (_: PackageManager.NameNotFoundException) {
+                // The companion public/dogfood package is optional; the running package is always
+                // installed and remains excluded.
+              }
+            }
+        SystemRoutingMode.SELECTED_APPS ->
+            policy.selectedApps.forEach(builder::addAllowedApplication)
+        SystemRoutingMode.OFF ->
+            return ConfigureTunBuilderResult.Failed(
+                SystemRoutingDiagnostic.INVALID_START_MODE)
+      }
+      builder.setConfigureIntent(
+          PendingIntent.getActivity(
+              this,
+              0,
+              Intent(this, MainActivity::class.java),
+              PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+          ))
+      ConfigureTunBuilderResult.Ready(builder)
+    } catch (_: PackageManager.NameNotFoundException) {
+      ConfigureTunBuilderResult.Failed(SystemRoutingDiagnostic.PACKAGE_NOT_INSTALLED)
+    } catch (_: Exception) {
+      ConfigureTunBuilderResult.Failed(SystemRoutingDiagnostic.VPN_INTERFACE_UNAVAILABLE)
+    }
+  }
+
+  private fun rebuildInvalidatedTun(
+      policy: DesiredSystemRoutingPolicy,
+      retireMissingSelectedScope: Boolean,
+  ): RebuildInvalidatedTunResult {
+    val oldDescriptor =
+        synchronized(runtimeLock) {
+          if (destroyed || revoked) {
+            return RebuildInvalidatedTunResult.Failed(
+                if (revoked) {
+                  SystemRoutingDiagnostic.PERMISSION_REVOKED
+                } else {
+                  SystemRoutingDiagnostic.VPN_INTERFACE_UNAVAILABLE
+                })
+          }
+          if (localTunCaptureValid && appliedPolicy == policy) {
+            return RebuildInvalidatedTunResult.Ready
+          }
+          tunnelDescriptor
+        }
+
+    val configured = configureTunBuilder(policy)
+    if (configured is ConfigureTunBuilderResult.Failed) {
+      val mayRetainReplacementBlocker =
+          configured.diagnostic == SystemRoutingDiagnostic.PACKAGE_NOT_INSTALLED &&
+              policy.desiredMode == SystemRoutingMode.SELECTED_APPS &&
+              !retireMissingSelectedScope &&
+              oldDescriptor != null
+      if (mayRetainReplacementBlocker) {
+        return RebuildInvalidatedTunResult.RetainedBlocker(configured.diagnostic)
+      }
+      return retireInvalidatedTun(configured.diagnostic)
+    }
+    val builder = (configured as ConfigureTunBuilderResult.Ready).builder
+
+    if (oldDescriptor == null) {
+      return when (val ensured = ensureBlockingTun(policy)) {
+        EnsureTunResult.Ready -> RebuildInvalidatedTunResult.Ready
+        EnsureTunResult.ConflictingAppliedPolicy ->
+            RebuildInvalidatedTunResult.RetainedBlocker(
+                SystemRoutingDiagnostic.POLICY_REVISION_CONFLICT)
+        is EnsureTunResult.Failed -> RebuildInvalidatedTunResult.Failed(ensured.diagnostic)
+      }
+    }
+
+    val currentLoad = policyStore.loadForServiceStart()
+    if (currentLoad !is SystemRoutingPolicyLoadResult.Ready ||
+        currentLoad.policy != policy) {
+      return RebuildInvalidatedTunResult.RetainedBlocker(
+          SystemRoutingDiagnostic.POLICY_REVISION_CONFLICT)
+    }
+    val replacement =
+        try {
+          synchronized(runtimeLock) {
+            if (destroyed || revoked || tunnelDescriptor !== oldDescriptor) {
+              return@synchronized null
+            }
+            notificationPermissionDiagnostic(policy)?.let {
+              return@synchronized null
+            }
+            // Android activates this interface and deactivates the previous VPN as one handoff.
+            // The old PFD stays owned until establish succeeds, so failure leaves a stopped-
+            // translator blocker instead of creating a direct-network gap.
+            val descriptor = builder.establish() ?: return@synchronized null
+            tunnelDescriptor = descriptor
+            appliedPolicy = policy
+            localTunCaptureValid = true
+            descriptor
+          }
+        } catch (_: Exception) {
+          null
+        }
+    if (replacement == null) {
+      return RebuildInvalidatedTunResult.RetainedBlocker(
+          SystemRoutingDiagnostic.VPN_INTERFACE_UNAVAILABLE)
+    }
+    runCatching { oldDescriptor.close() }
+        .onFailure {
+          Log.w(MASQ_RECOVERY_LOG_TAG, "The deactivated package-scope TUN did not close cleanly.")
+        }
+    return RebuildInvalidatedTunResult.Ready
+  }
+
+  private fun retireInvalidatedTun(
+      diagnostic: SystemRoutingDiagnostic,
+  ): RebuildInvalidatedTunResult =
+      when (val close = stopAndCloseAllTunnelsSafely()) {
+        TunnelCloseResult.Closed -> RebuildInvalidatedTunResult.Failed(diagnostic)
+        TunnelCloseResult.CloseFailed ->
+            RebuildInvalidatedTunResult.RetainedBlocker(
+                SystemRoutingDiagnostic.TUNNEL_CLOSE_FAILED)
+        is TunnelCloseResult.StopFailed ->
+            RebuildInvalidatedTunResult.RetainedBlocker(close.diagnostic)
+      }
 
   @Suppress("DEPRECATION")
   private fun validateInstalledPackages(
@@ -1934,6 +2312,11 @@ class MasqVpnService : VpnService() {
 
   override fun onDestroy() {
     activeInstance.compareAndSet(this, null)
+    if (packageChangeReceiverRegistered) {
+      runCatching { unregisterReceiver(packageChangeReceiver) }
+      packageChangeReceiverRegistered = false
+    }
+    packageChangeDrain.cancel()
     var retainResult: TerminalLeaseRetainResult? = null
     val terminalSnapshot =
         synchronized(runtimeLock) {
@@ -2121,6 +2504,21 @@ class MasqVpnService : VpnService() {
     data class Failed(val diagnostic: SystemRoutingDiagnostic) : EnsureTunResult
   }
 
+  private sealed interface ConfigureTunBuilderResult {
+    data class Ready(val builder: Builder) : ConfigureTunBuilderResult
+
+    data class Failed(val diagnostic: SystemRoutingDiagnostic) : ConfigureTunBuilderResult
+  }
+
+  private sealed interface RebuildInvalidatedTunResult {
+    data object Ready : RebuildInvalidatedTunResult
+
+    data class RetainedBlocker(val diagnostic: SystemRoutingDiagnostic) :
+        RebuildInvalidatedTunResult
+
+    data class Failed(val diagnostic: SystemRoutingDiagnostic) : RebuildInvalidatedTunResult
+  }
+
   private sealed interface TunnelCloseResult {
     data object Closed : TunnelCloseResult
 
@@ -2165,6 +2563,7 @@ class MasqVpnService : VpnService() {
     private const val CORE_PREFLIGHT_TIMEOUT_MS = 20_000L
     private const val HANDOFF_RETRY_DELAY_MS = 1_000L
     private const val COMPANION_SESSION_WATCHDOG_INTERVAL_MS = 10_000L
+    private val PACKAGE_SCOPE_REBUILD_RETRY_DELAYS_MS = longArrayOf(250L, 1_000L, 3_000L)
     private const val DOGFOOD_ROUTING_LIMITS =
         "Community preview: only captured IPv4 TCP/443 and virtual DNS are translated through MASQ. " +
             "All other captured IP traffic, including other TCP ports, non-DNS UDP, IPv6, ICMP " +

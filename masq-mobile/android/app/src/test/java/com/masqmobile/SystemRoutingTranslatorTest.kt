@@ -55,6 +55,26 @@ class SystemRoutingTranslatorTest {
   }
 
   @Test
+  fun nonblockingStopRequestPausesTrafficBeforeSerializedCleanupReleasesOwnership() {
+    val native = FakeNative()
+    val translator = translator(native)
+    translator.start(81, 3, 8080, 1500) { _, _, _, _ -> }
+    assertTrue(native.started.await(1, TimeUnit.SECONDS))
+    val ownership = checkNotNull(translator.ownership())
+
+    assertTrue(translator.requestStopWithoutRelease())
+    assertTrue(native.returned.await(1, TimeUnit.SECONDS))
+    assertTrue(translator.owns(ownership))
+
+    assertEquals(
+        TranslatorStopResult.SafeToClose,
+        translator.stopAndAwait(81, 1_000),
+    )
+    assertFalse(translator.owns(ownership))
+    assertFalse(translator.requestStopWithoutRelease())
+  }
+
+  @Test
   fun stopTimeoutKeepsFutureAndDescriptorOwned() {
     val native = FakeNative(ignoreStop = true)
     val translator = translator(native)

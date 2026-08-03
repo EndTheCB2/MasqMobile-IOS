@@ -113,7 +113,8 @@ describe('TrafficRoutingScreen native support gate', () => {
     expect(rendered).toContain(
       'MASQ packages installed when the route is created are excluded',
     );
-    expect(rendered).toContain('Turn routing off before installing');
+    expect(rendered).toContain('safely rebuilds that UID scope');
+    expect(rendered).toContain('status returns to MASQ');
     expect(rendered).toContain('loopback proxy is unauthenticated');
     expect(rendered).toContain('must allow notifications before activation');
     expect(rendered).toContain('traffic can return to the direct connection');

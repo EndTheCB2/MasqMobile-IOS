@@ -38,6 +38,9 @@ describe('Android native MASQ core integration', () => {
   const sessionService = read(
     'android/app/src/main/java/com/masqmobile/MasqSessionService.kt',
   );
+  const packageReplacementReceiver = read(
+    'android/app/src/main/java/com/masqmobile/MasqPackageReplacementReceiver.kt',
+  );
   const backgroundRecovery = read(
     'android/app/src/main/java/com/masqmobile/MasqBackgroundSessionRecovery.kt',
   );
@@ -46,6 +49,9 @@ describe('Android native MASQ core integration', () => {
   );
   const packetTranslator = read(
     'android/app/src/main/java/com/masqmobile/SystemRoutingTranslator.kt',
+  );
+  const packageLifecycle = read(
+    'android/app/src/main/java/com/masqmobile/SystemRoutingPackageLifecycle.kt',
   );
   const terminalCoordinator = read(
     'android/app/src/main/java/com/masqmobile/SystemRoutingTerminalCoordinator.kt',
@@ -402,7 +408,7 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
     expect(gradle).toContain('applicationIdSuffix ".dogfood"');
     expect(gradle).toContain('versionNameSuffix "-dogfood"');
-    expect(gradle).toContain('versionCode 6016');
+    expect(gradle).toContain('versionCode 6017');
     expect(gradle).toContain(
       'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
     );
@@ -507,6 +513,35 @@ describe('Android native MASQ core integration', () => {
     expect(packetTranslator).toContain('TranslatorStartResult.NativeBusy');
     expect(packetTranslator).toContain(
       'snapshot.generation == run.expectedNativeGeneration',
+    );
+  });
+
+  it('pauses and atomically rebuilds package-scoped Android tunnels', () => {
+    expect(vpnService).toContain('Intent.ACTION_PACKAGE_ADDED');
+    expect(vpnService).toContain('Intent.ACTION_PACKAGE_REMOVED');
+    expect(vpnService).toContain('Intent.ACTION_PACKAGE_REPLACED');
+    expect(vpnService).toContain('Intent.ACTION_PACKAGE_CHANGED');
+    expect(vpnService).toContain('ContextCompat.RECEIVER_EXPORTED');
+    expect(vpnService).toContain('unregisterReceiver(packageChangeReceiver)');
+    expect(packageLifecycle).toContain(
+      'systemRoutingPackageChangeAffectsPolicy(',
+    );
+    expect(packageLifecycle).toContain('class SystemRoutingPackageChangeDrain');
+
+    const invalidation = vpnService.slice(
+      vpnService.indexOf('private fun observePackageScopeChange('),
+      vpnService.indexOf('private fun drainPackageScopeChanges()'),
+    );
+    expect(invalidation.indexOf('localTunCaptureValid = false')).toBeLessThan(
+      invalidation.indexOf('translator.requestStopWithoutRelease()'),
+    );
+
+    const rebuild = vpnService.slice(
+      vpnService.indexOf('private fun rebuildInvalidatedTun('),
+      vpnService.indexOf('private fun retireInvalidatedTun('),
+    );
+    expect(rebuild.indexOf('builder.establish()')).toBeLessThan(
+      rebuild.indexOf('oldDescriptor.close()'),
     );
   });
 
@@ -1143,6 +1178,22 @@ describe('Android native MASQ core integration', () => {
       'class MasqSessionService : VpnService()',
     );
     expect(sessionService).toContain('MasqCoreJni.nativeShutdown()');
+  });
+
+  it('restores only durable consumer intent after this APK is replaced', () => {
+    expect(manifest).toContain(
+      'android:name=".MasqPackageReplacementReceiver"',
+    );
+    expect(manifest).toContain(
+      'android:name="android.intent.action.MY_PACKAGE_REPLACED"',
+    );
+    expect(packageReplacementReceiver).toContain(
+      'intent?.action != Intent.ACTION_MY_PACKAGE_REPLACED',
+    );
+    expect(packageReplacementReceiver).toContain(
+      'MasqSessionService.ensureRunningIfDesired(context.applicationContext)',
+    );
+    expect(packageReplacementReceiver).not.toContain('setDesired(');
   });
 
   it('cleans up Android native executors and pending tunnel acknowledgements', () => {

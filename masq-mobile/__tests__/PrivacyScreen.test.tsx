@@ -127,7 +127,8 @@ describe('PrivacyScreen', () => {
       expect(content).toContain('shared-UID apps can share routing');
       expect(content).toContain('attached restricted profiles');
       expect(content).toContain('work profiles are separate');
-      expect(content).toContain('Turn routing off before installing');
+      expect(content).toContain('automatically rebuilds the UID scope');
+      expect(content).toContain('only after routing returns to MASQ');
       expect(content).toContain('must grant notification permission');
       expect(content).toContain('turning routing off never requires');
       expect(content).toContain('service/app-process death can restore direct');
