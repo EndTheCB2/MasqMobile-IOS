@@ -1,5 +1,10 @@
 import type { CoreStatus, NetworkStatus } from './types';
-import type { MasqIssue } from './issues';
+import {
+  SAFE_UNKNOWN_ISSUE_SUMMARY,
+  safeDiagnosticIssueSummary,
+  type MasqIssue,
+} from './issues';
+import { extractMasqErrorCode } from './errorCodes';
 
 export function buildRedactedDiagnostics(
   status: CoreStatus,
@@ -7,6 +12,14 @@ export function buildRedactedDiagnostics(
   error: string | null,
   issue?: MasqIssue | null,
 ) {
+  const safeSummary = issue
+    ? safeDiagnosticIssueSummary(issue)
+    : error
+    ? SAFE_UNKNOWN_ISSUE_SUMMARY
+    : null;
+  const safeCode = issue?.code
+    ? extractMasqErrorCode({ code: issue.code })
+    : null;
   return {
     reportVersion: 2,
     app: 'MASQ Mobile',
@@ -21,8 +34,9 @@ export function buildRedactedDiagnostics(
     exitCountry: status.exitCountry,
     network,
     issueCategory: issue?.category ?? null,
-    issueCode: issue?.code ?? null,
-    lastError: error ? redactDiagnosticText(error) : null,
+    issueCode: safeCode,
+    issueSummary: safeSummary,
+    lastError: safeSummary,
     generatedAt: new Date().toISOString(),
     redacted: true,
   };

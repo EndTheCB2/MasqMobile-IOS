@@ -15,6 +15,12 @@ pub struct EngineHandle {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryConnectionOutcome {
+    RetriedInPlace,
+    RestartRequired,
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineSnapshot {
     pub started: bool,
@@ -22,6 +28,9 @@ pub struct EngineSnapshot {
     pub proxy_port: Option<u16>,
     pub route_stage: u8,
     pub route_hops: usize,
+    pub route_proof_generation: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
     pub last_exit_code: Option<i32>,
     pub running_for: Duration,
     pub last_connection_error: Option<String>,
@@ -95,6 +104,9 @@ impl EngineHandle {
             proxy_port: snapshot.proxy_port.or(Some(self.proxy_port)),
             route_stage: snapshot.route_stage,
             route_hops: usize::from(snapshot.route_hops),
+            route_proof_generation: snapshot.route_proof_generation,
+            bytes_up: snapshot.bytes_up,
+            bytes_down: snapshot.bytes_down,
             last_exit_code: snapshot.last_exit_code,
             running_for: self.started_at.elapsed(),
             last_connection_error: snapshot.last_connection_error,
@@ -106,10 +118,26 @@ impl EngineHandle {
         self.min_hops = min_hops;
     }
 
-    pub fn retry_connection(&mut self, entry_nodes: &[String]) -> Result<(), String> {
-        node_lib::mobile_runtime::retry_connection(entry_nodes)?;
-        self.started_at = Instant::now();
-        Ok(())
+    pub fn retry_connection(
+        &mut self,
+        entry_nodes: &[String],
+    ) -> Result<RetryConnectionOutcome, String> {
+        if self.runtime_thread_has_ended() {
+            self.reap_if_finished();
+            return Ok(RetryConnectionOutcome::RestartRequired);
+        }
+
+        match node_lib::mobile_runtime::retry_connection(entry_nodes) {
+            Ok(()) => {
+                self.started_at = Instant::now();
+                Ok(RetryConnectionOutcome::RetriedInPlace)
+            }
+            Err(_error) if self.runtime_thread_has_ended() => {
+                self.reap_if_finished();
+                Ok(RetryConnectionOutcome::RestartRequired)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn stop(&mut self) {
@@ -118,6 +146,7 @@ impl EngineHandle {
             let _ = thread.join();
         }
         let _ = node_lib::mobile_runtime::wait_for_actor_arbiters(Duration::from_secs(10));
+        let _ = node_lib::mobile_runtime::wait_for_stream_connect_jobs(Duration::from_secs(10));
     }
 
     pub fn stop_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
@@ -158,7 +187,21 @@ impl EngineHandle {
                     .to_owned(),
             );
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !node_lib::mobile_runtime::wait_for_stream_connect_jobs(remaining) {
+            return Err(
+                "The embedded MASQ transport workers did not stop in time. Direct browsing remains blocked."
+                    .to_owned(),
+            );
+        }
         main_thread_error.map_or(Ok(()), Err)
+    }
+
+    fn runtime_thread_has_ended(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(true)
     }
 
     pub fn reap_if_finished(&mut self) {
@@ -171,6 +214,24 @@ impl EngineHandle {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl EngineHandle {
+    /// Supplies a fully reappable handle for state-transition tests without
+    /// opening a socket or starting the process-global embedded actor system.
+    pub(crate) fn finished_for_state_transition_test() -> Self {
+        let thread = thread::spawn(|| 0);
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        Self {
+            thread: Some(thread),
+            proxy_port: 0,
+            min_hops: 1,
+            started_at: Instant::now(),
         }
     }
 }
@@ -300,5 +361,26 @@ mod tests {
             )
         );
         engine.stop();
+    }
+
+    #[test]
+    fn retry_requests_a_restart_only_after_the_runtime_thread_has_finished() {
+        let thread = thread::spawn(|| 0);
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        let mut engine = EngineHandle {
+            thread: Some(thread),
+            proxy_port: 0,
+            min_hops: 1,
+            started_at: Instant::now(),
+        };
+
+        let outcome = engine
+            .retry_connection(&[])
+            .expect("a finished runtime should be safely reaped");
+
+        assert_eq!(outcome, RetryConnectionOutcome::RestartRequired);
+        assert!(engine.thread.is_none());
     }
 }

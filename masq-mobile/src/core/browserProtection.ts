@@ -19,6 +19,7 @@ export type BrowserProtectionPreset = 'balanced' | 'strict';
 export interface BrowserProtectionRules {
   version: number;
   adSelectors: string[];
+  requestHosts: string[];
   rejectSelectors: string[];
   resolvedBannerSelectors: string[];
 }
@@ -33,6 +34,20 @@ const LAST_KNOWN_GOOD_RULES: BrowserProtectionRules = {
     'iframe[src*="doubleclick.net"]',
     'iframe[src*="googlesyndication.com"]',
     'iframe[src*="googleadservices.com"]',
+  ],
+  requestHosts: [
+    'doubleclick.net',
+    'googlesyndication.com',
+    'googleadservices.com',
+    'googletagservices.com',
+    'amazon-adsystem.com',
+    'adnxs.com',
+    'criteo.com',
+    'criteo.net',
+    'taboola.com',
+    'outbrain.com',
+    'scorecardresearch.com',
+    'quantserve.com',
   ],
   rejectSelectors: [
     '#onetrust-reject-all-handler',
@@ -155,6 +170,16 @@ export function browserProtectionPreset(
         rejectOptionalCookies: false,
         youtubeBestEffort,
       };
+}
+
+export function browserRequestBlockingHosts(
+  configuration: BrowserProtectionConfiguration,
+  protectionDisabled = false,
+): string[] {
+  if (protectionDisabled || !configuration.blockAdsAndTrackers) {
+    return [];
+  }
+  return [...ACTIVE_BROWSER_PROTECTION_RULES.requestHosts];
 }
 
 export function buildBrowserCosmeticProtectionScript(
@@ -355,6 +380,7 @@ export function loadBrowserProtectionRules(
     const record = candidate as Record<string, unknown>;
     const expectedKeys = [
       'adSelectors',
+      'requestHosts',
       'rejectSelectors',
       'resolvedBannerSelectors',
       'version',
@@ -368,6 +394,7 @@ export function loadBrowserProtectionRules(
       throw new Error('Browser protection rule metadata is invalid.');
     }
     const adSelectors = validSelectorList(record.adSelectors, false);
+    const requestHosts = validRequestHostList(record.requestHosts);
     const rejectSelectors = validSelectorList(record.rejectSelectors, true);
     const resolvedBannerSelectors = validSelectorList(
       record.resolvedBannerSelectors,
@@ -376,6 +403,7 @@ export function loadBrowserProtectionRules(
     return {
       version: record.version,
       adSelectors,
+      requestHosts,
       rejectSelectors,
       resolvedBannerSelectors,
     };
@@ -383,12 +411,36 @@ export function loadBrowserProtectionRules(
     return {
       version: LAST_KNOWN_GOOD_RULES.version,
       adSelectors: [...LAST_KNOWN_GOOD_RULES.adSelectors],
+      requestHosts: [...LAST_KNOWN_GOOD_RULES.requestHosts],
       rejectSelectors: [...LAST_KNOWN_GOOD_RULES.rejectSelectors],
       resolvedBannerSelectors: [
         ...LAST_KNOWN_GOOD_RULES.resolvedBannerSelectors,
       ],
     };
   }
+}
+
+function validRequestHostList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64) {
+    throw new Error('Browser protection request-host list is invalid.');
+  }
+  const hosts = value.map(candidate => {
+    if (typeof candidate !== 'string') {
+      throw new Error('Browser protection request host must be a string.');
+    }
+    const host = candidate.toLowerCase();
+    if (
+      host !== candidate ||
+      host.length > 253 ||
+      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+        host,
+      )
+    ) {
+      throw new Error('Browser protection request host is invalid.');
+    }
+    return host;
+  });
+  return [...new Set(hosts)];
 }
 
 function validSelectorList(value: unknown, rejectOnly: boolean): string[] {

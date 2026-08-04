@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   AppState,
+  BackHandler,
   Linking,
+  Platform,
   Share,
   StatusBar,
   StyleSheet,
@@ -15,12 +17,21 @@ import { masqCore } from './src/core/masqCore';
 import {
   closeBrowserSession,
   prepareBrowserSession,
+  repairPrivateBrowserRoute,
 } from './src/core/browserSession';
+import {
+  isCoreReadyForSystemRouting,
+  isCoreRouteReady,
+} from './src/core/connectionReadiness';
 import { buildRedactedDiagnostics } from './src/core/diagnostics';
 import { classifyMasqIssue } from './src/core/issues';
-import { useMasqController } from './src/hooks/useMasqController';
+import {
+  PROFILE_NOT_READY_MESSAGE,
+  useMasqController,
+} from './src/hooks/useMasqController';
 import {
   BrowserScreen,
+  type BrowserCloseReason,
   type BrowserMode,
 } from './src/screens/BrowserScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
@@ -53,12 +64,19 @@ function AppContent() {
     null,
   );
   const [browserOpening, setBrowserOpening] = useState(false);
+
   const [browserMode, setBrowserMode] = useState<BrowserMode | null>(null);
   const [privacyShielded, setPrivacyShielded] = useState(false);
   const browserOperation = useRef(0);
   const browserOpenInFlight = useRef(false);
   const openingBrowserMode = useRef<BrowserMode | null>(null);
-  const controller = useMasqController();
+  const browserRepairInFlight = useRef<Promise<void> | null>(null);
+  const controller = useMasqController(
+    route === 'browser' && browserMode !== null,
+  );
+  const recoverablePrivateBrowserError = useRef<string | null>(null);
+  const previousCoreRouteReady = useRef(isCoreRouteReady(controller.status));
+  const coreRouteReady = isCoreRouteReady(controller.status);
   const activeIssue = directBrowserError
     ? {
         action: 'none' as const,
@@ -75,15 +93,45 @@ function AppContent() {
       );
 
   useEffect(() => {
+    const routeRecovered = coreRouteReady && !previousCoreRouteReady.current;
+    previousCoreRouteReady.current = coreRouteReady;
+    if (!routeRecovered) {
+      return;
+    }
+    setRouteError(current => {
+      if (!current || current !== recoverablePrivateBrowserError.current) {
+        return current;
+      }
+      recoverablePrivateBrowserError.current = null;
+      return null;
+    });
+  }, [coreRouteReady]);
+
+  useEffect(() => {
+    if (
+      recoverablePrivateBrowserError.current &&
+      recoverablePrivateBrowserError.current !== routeError
+    ) {
+      recoverablePrivateBrowserError.current = null;
+    }
+  }, [routeError]);
+
+  useEffect(() => {
     const subscription = AppState.addEventListener('change', state => {
       setPrivacyShielded(state !== 'active');
       if (state !== 'active') {
         browserOperation.current += 1;
+        // An active BrowserScreen remains mounted behind the privacy shield so
+        // an external sign-in confirmation can return to the same page. This
+        // listener handles only a session that is still opening and therefore
+        // has no WebView or browser-routing lease yet.
+        if (route === 'browser' && browserMode) {
+          return;
+        }
         closeBrowserSession(masqCore).catch(() => undefined);
         setBrowserMode(null);
-        if (route === 'browser' || browserOpening) {
-          const interruptedMode =
-            browserMode ?? openingBrowserMode.current;
+        if (browserOpening) {
+          const interruptedMode = browserMode ?? openingBrowserMode.current;
           setRoute('home');
           if (interruptedMode === 'masq') {
             setDirectBrowserError(null);
@@ -102,8 +150,32 @@ function AppContent() {
     return () => subscription.remove();
   }, [browserMode, browserOpening, route]);
 
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (route === 'setup' || route === 'routing' || route === 'privacy') {
+          setRoute('home');
+          return true;
+        }
+        // BrowserScreen owns WebView history and fail-closed session shutdown.
+        // Returning false lets its later listener handle the same event. Home
+        // also returns false so Android keeps its normal app-exit behavior.
+        return false;
+      },
+    );
+    return () => subscription.remove();
+  }, [route]);
+
   const openSetup = () => {
     setDirectBrowserError(null);
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     if (
       ['connecting', 'connected', 'paused', 'stopping'].includes(
         controller.status.phase,
@@ -120,6 +192,10 @@ function AppContent() {
 
   const connect = () => {
     setDirectBrowserError(null);
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     setRouteError(null);
     controller.connect().catch(() => undefined);
   };
@@ -131,6 +207,10 @@ function AppContent() {
   };
 
   const openMasqBrowser = async () => {
+    if (!controller.profileReady) {
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     if (browserOpenInFlight.current) {
       return;
     }
@@ -138,6 +218,7 @@ function AppContent() {
     browserOpenInFlight.current = true;
     openingBrowserMode.current = 'masq';
     setDirectBrowserError(null);
+    recoverablePrivateBrowserError.current = null;
     setRouteError(null);
     setBrowserOpening(true);
     try {
@@ -157,16 +238,46 @@ function AppContent() {
       await closeBrowserSession(masqCore).catch(() => undefined);
       if (operation === browserOperation.current) {
         setBrowserMode(null);
-        setRouteError(
+        const message =
           caught instanceof Error
             ? caught.message
-            : 'Browser proxy unavailable.',
-        );
+            : 'Browser proxy unavailable.';
+        recoverablePrivateBrowserError.current = message;
+        setRouteError(message);
       }
     } finally {
       browserOpenInFlight.current = false;
       openingBrowserMode.current = null;
       setBrowserOpening(false);
+    }
+  };
+
+  const repairMasqBrowserRoute = async () => {
+    if (browserRepairInFlight.current) {
+      return browserRepairInFlight.current;
+    }
+    const operation = browserOperation.current;
+    // Every close/background/direct-open path advances this generation before
+    // it performs native work, so it is a stable cancellation signal even on
+    // platforms whose AppState.currentState lags the delivered event.
+    const isCurrent = () => operation === browserOperation.current;
+    const repair = (async () => {
+      await repairPrivateBrowserRoute(
+        masqCore,
+        () => controller.connect(),
+        isCurrent,
+      );
+      if (isCurrent()) {
+        await controller.refresh();
+      }
+    })();
+    browserRepairInFlight.current = repair;
+    try {
+      await repair;
+    } finally {
+      if (browserRepairInFlight.current === repair) {
+        browserRepairInFlight.current = null;
+      }
     }
   };
 
@@ -236,6 +347,11 @@ function AppContent() {
   };
 
   const confirmDirectBrowser = () => {
+    if (!controller.profileReady) {
+      setDirectBrowserError(null);
+      setRouteError(PROFILE_NOT_READY_MESSAGE);
+      return;
+    }
     Alert.alert(
       'Browse without MASQ?',
       'This stops any active MASQ connection and system routing, then uses your normal internet connection. Websites see the public IP used by your current connection or VPN. Your internet provider and DNS service can see normal connection metadata. MASQ hops and exit-country settings do not apply.',
@@ -245,6 +361,25 @@ function AppContent() {
           text: 'Browse directly',
           onPress: () => {
             openDirectBrowser().catch(() => undefined);
+          },
+        },
+      ],
+    );
+  };
+
+  const confirmInitializationRecovery = () => {
+    Alert.alert(
+      'Reset invalid network profile?',
+      'Use this only if Retry keeps failing. MASQ stops active routing and removes the saved chain, RPC, entry nodes and route preferences. Your consumer wallet remains on this device. Browsing stays blocked until MASQ Mobile confirms the reset.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset network profile',
+          style: 'destructive',
+          onPress: () => {
+            setDirectBrowserError(null);
+            setRouteError(null);
+            controller.recoverNetworkProfile().catch(() => undefined);
           },
         },
       ],
@@ -264,11 +399,33 @@ function AppContent() {
     });
   };
 
-  const closeBrowser = async () => {
+  const closeBrowser = async (reason: BrowserCloseReason = 'user') => {
+    const closingMode = browserMode;
     browserOperation.current += 1;
-    await closeBrowserSession(masqCore).catch(() => undefined);
+    const pendingRepair = browserRepairInFlight.current;
+    await closeBrowserSession(masqCore);
+    if (pendingRepair) {
+      // Keep the browser screen closed until a cancelled native repair has
+      // settled, then make one final acknowledged transition to blocked mode.
+      // This serializes a later Direct/MASQ open behind stale repair work.
+      await pendingRepair.catch(() => undefined);
+      await closeBrowserSession(masqCore);
+    }
     setBrowserMode(null);
     await controller.refresh().catch(() => undefined);
+    if (reason === 'background') {
+      if (closingMode === 'masq') {
+        setDirectBrowserError(null);
+        setRouteError(
+          'MASQ Private was closed while the app was in the background. Reopen it to run a new route check.',
+        );
+      } else {
+        setRouteError(null);
+        setDirectBrowserError(
+          'The direct browser was closed while the app was in the background. Reopen it explicitly to start a new session.',
+        );
+      }
+    }
     setRoute('home');
   };
 
@@ -341,17 +498,37 @@ function AppContent() {
         <HomeScreen
           busy={controller.busy || browserOpening}
           connectionProgress={controller.connectionProgress}
+          profileReady={controller.profileReady}
+          initializationState={controller.initializationState}
+          profileRecoveryAvailable={controller.profileRecoveryAvailable}
           network={controller.network}
           entryNodeRefresh={controller.entryNodeRefresh}
           issue={activeIssue}
           walletBalance={controller.walletBalance}
+          debtSummary={controller.debtSummary}
+          debtSettlementQuote={controller.debtSettlementQuote}
+          debtSettlementStatus={controller.debtSettlementStatus}
+          debtSettlementBusy={controller.debtSettlementBusy}
+          debtSettlementError={controller.debtSettlementError}
           systemTunnel={controller.systemTunnel}
           onConnect={connect}
+          onRetryInitialization={() => {
+            setDirectBrowserError(null);
+            setRouteError(null);
+            controller.retryInitialization().catch(() => undefined);
+          }}
+          onRecoverNetworkProfile={confirmInitializationRecovery}
           onDisconnect={disconnect}
           onOpenBrowser={openMasqBrowser}
           onOpenDirectBrowser={confirmDirectBrowser}
           onOpenSetup={openSetup}
-          onOpenTrafficRouting={() => setRoute('routing')}
+          onOpenTrafficRouting={() => {
+            if (!controller.profileReady) {
+              setRouteError(PROFILE_NOT_READY_MESSAGE);
+              return;
+            }
+            setRoute('routing');
+          }}
           onOpenPrivacy={() => setRoute('privacy')}
           onReset={confirmReset}
           onResetNetwork={confirmNetworkReset}
@@ -365,6 +542,30 @@ function AppContent() {
           onRefreshWalletBalance={() =>
             controller.refreshWalletBalance().catch(() => undefined)
           }
+          onRefreshDebtSummary={() =>
+            controller.refreshDebtSummary().catch(() => undefined)
+          }
+          onReviewDebtSettlement={() =>
+            controller.reviewDebtSettlement().catch(() => undefined)
+          }
+          onConfirmDebtSettlement={() =>
+            controller.confirmDebtSettlement().catch(() => undefined)
+          }
+          onRetryDebtSettlement={() =>
+            controller.retryDebtSettlement().catch(() => undefined)
+          }
+          onDismissDebtSettlement={controller.dismissDebtSettlement}
+          onOpenSettlementTransaction={transactionHash => {
+            const explorer =
+              controller.status.chain === 'base-sepolia'
+                ? 'https://sepolia.basescan.org/tx/'
+                : 'https://basescan.org/tx/';
+            Linking.openURL(`${explorer}${transactionHash}`).catch(() =>
+              setRouteError(
+                'The BaseScan transaction link could not be opened.',
+              ),
+            );
+          }}
           status={controller.status}
         />
       ) : null}
@@ -381,12 +582,16 @@ function AppContent() {
         />
       ) : null}
       {route === 'browser' && browserMode ? (
-        <BrowserScreen mode={browserMode} onClose={closeBrowser} />
+        <BrowserScreen
+          mode={browserMode}
+          onClose={closeBrowser}
+          onRepairRoute={repairMasqBrowserRoute}
+        />
       ) : null}
       {route === 'routing' ? (
         <TrafficRoutingScreen
           busy={controller.systemTunnelBusy}
-          connected={controller.status.phase === 'connected'}
+          connected={isCoreReadyForSystemRouting(controller.status)}
           routableApps={controller.routableApps}
           status={controller.systemTunnel}
           onApply={controller.updateSystemTunnel}
@@ -405,6 +610,7 @@ function AppContent() {
           onOpenSupport={() =>
             openExternalLink(SUPPORT_URL).catch(() => undefined)
           }
+          systemRoutingSupported={controller.systemTunnel.supported}
         />
       ) : null}
       {privacyShielded ? (

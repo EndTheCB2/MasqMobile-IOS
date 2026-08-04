@@ -63,8 +63,19 @@ export CARGO_TARGET_X86_64_LINUX_ANDROID_AR="$LLVM_AR"
 
 # Keep Android's Cargo cache away from checkout paths containing spaces. Older
 # native dependency builds can otherwise reuse empty host-generated archives.
+# Some vendored C dependencies also compile their build directory into the
+# shared library, so a target below a user home would leak builder identity even
+# when rustc path remapping is enabled.
 export CARGO_TARGET_DIR="${MASQ_ANDROID_CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/masq-mobile-android-cargo-target-v2}"
 mkdir -p "$CARGO_TARGET_DIR"
+CARGO_TARGET_DIR="$(cd "$CARGO_TARGET_DIR" && pwd -P)"
+case "$CARGO_TARGET_DIR/" in
+  "$HOME/"* | "$ROOT_DIR/"* | /Users/* | /home/*)
+    echo "error: MASQ_ANDROID_CARGO_TARGET_DIR must use a privacy-neutral temporary path outside a user home or checkout." >&2
+    exit 1
+    ;;
+esac
+export CARGO_TARGET_DIR
 
 # Rust panic locations otherwise retain the builder's absolute home and checkout
 # paths. Encoded flags preserve paths containing spaces as one rustc argument.
@@ -113,7 +124,8 @@ rustup run "$TUNNEL_TOOLCHAIN" cargo ndk \
 # their Rust code statically and does not declare them in DT_NEEDED. Remove only
 # the two audited copies; any new or required shared dependency fails below.
 find "$OUTPUT_DIR" -type f \
-  \( -name 'libsysinfo-*.so' -o -name 'libtun2proxy-*.so' \) \
+  \( -name 'libsysinfo.so' -o -name 'libsysinfo-*.so' -o \
+     -name 'libtun2proxy.so' -o -name 'libtun2proxy-*.so' \) \
   -delete
 
 node "$ROOT_DIR/scripts/verify-android-native-elf.js" --jni-dir "$OUTPUT_DIR"

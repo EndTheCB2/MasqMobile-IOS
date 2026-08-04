@@ -2,6 +2,7 @@ import {
   BROWSER_PROTECTION_RULES_VERSION,
   browserProtectionPreset,
   browserProtectionPreferences,
+  browserRequestBlockingHosts,
   buildBrowserCosmeticProtectionScript,
   decodeBrowserProtectionConfiguration,
   DEFAULT_BROWSER_PROTECTION_PREFERENCES,
@@ -139,6 +140,46 @@ describe('browser protection boundary', () => {
     expect(script).toContain(
       `__masqGenericCosmeticProtectionV${BROWSER_PROTECTION_RULES_VERSION}`,
     );
+  });
+
+  it('provides a bounded reviewed request host list only while blocking is active', () => {
+    const hosts = browserRequestBlockingHosts(CONFIGURATION);
+    expect(hosts.length).toBeGreaterThan(0);
+    expect(hosts.length).toBeLessThanOrEqual(64);
+    expect(hosts).toContain('doubleclick.net');
+    expect(new Set(hosts).size).toBe(hosts.length);
+    expect(
+      browserRequestBlockingHosts({
+        ...CONFIGURATION,
+        blockAdsAndTrackers: false,
+      }),
+    ).toEqual([]);
+    expect(browserRequestBlockingHosts(CONFIGURATION, true)).toEqual([]);
+  });
+
+  it('falls back when request hosts could overmatch or exceed the native bound', () => {
+    const baseRules = {
+      version: BROWSER_PROTECTION_RULES_VERSION,
+      adSelectors: ['[data-ad-slot]'],
+      rejectSelectors: ['#deny-all'],
+      resolvedBannerSelectors: ['#banner'],
+    };
+
+    expect(
+      loadBrowserProtectionRules({
+        ...baseRules,
+        requestHosts: ['doubleclick.net.evil.example', '*.example.com'],
+      }).requestHosts,
+    ).toContain('doubleclick.net');
+    expect(
+      loadBrowserProtectionRules({
+        ...baseRules,
+        requestHosts: Array.from(
+          { length: 65 },
+          (_, index) => `tracker${index}.example`,
+        ),
+      }).requestHosts,
+    ).toHaveLength(12);
   });
 
   it('offers explicit balanced and strict presets', () => {

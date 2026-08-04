@@ -8,6 +8,11 @@ if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
   exit 2
 fi
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: APK privacy check requires ripgrep (rg)." >&2
+  exit 1
+fi
+
 find_build_tool() {
   local tool="$1"
   local sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
@@ -55,7 +60,7 @@ scan_binary_strings() {
   local expression="$1"
   local description="$2"
 
-  if LC_ALL=C rg "$expression" "$APK_STRINGS" >/dev/null; then
+  if LC_ALL=C rg --no-config "$expression" "$APK_STRINGS" >/dev/null; then
     echo "error: APK privacy check found $description." >&2
     return 1
   fi
@@ -65,7 +70,7 @@ scan_archive_names() {
   local expression="$1"
   local description="$2"
 
-  if unzip -Z1 "$APK_PATH" | LC_ALL=C rg "$expression" >/dev/null; then
+  if unzip -Z1 "$APK_PATH" | LC_ALL=C rg --no-config "$expression" >/dev/null; then
     echo "error: APK privacy check found $description." >&2
     return 1
   fi
@@ -116,20 +121,20 @@ fi
   echo "error: distributable APK must not be debuggable." >&2
   exit 1
 }
-if rg 'android:(debuggable|testOnly)="true"' "$MANIFEST_XML" >/dev/null; then
+if rg --no-config 'android:(debuggable|testOnly)="true"' "$MANIFEST_XML" >/dev/null; then
   echo "error: distributable APK contains a debug or test-only manifest flag." >&2
   exit 1
 fi
 
 for abi in arm64-v8a x86_64; do
   for library in libmasq_mobile_core.so libmasq_packet_tunnel.so; do
-    if ! unzip -Z1 "$APK_PATH" | rg "^lib/$abi/$library$" >/dev/null; then
+    if ! unzip -Z1 "$APK_PATH" | rg --no-config "^lib/$abi/$library$" >/dev/null; then
       echo "error: APK is missing a required MASQ native library." >&2
       exit 1
     fi
   done
 done
-if unzip -Z1 "$APK_PATH" | rg '^lib/(armeabi|armeabi-v7a|x86)/' >/dev/null; then
+if unzip -Z1 "$APK_PATH" | rg --no-config '^lib/(armeabi|armeabi-v7a|x86)/' >/dev/null; then
   echo "error: APK contains an unsupported 32-bit native architecture." >&2
   exit 1
 fi
@@ -137,7 +142,7 @@ fi
 
 CERTIFICATE_REPORT="$TEMP_DIR/certificate.txt"
 "$APKSIGNER" verify --verbose --print-certs --Werr "$APK_PATH" >"$CERTIFICATE_REPORT"
-if rg -i 'CN=Android Debug|Android Debug' "$CERTIFICATE_REPORT" >/dev/null; then
+if rg --no-config -i 'CN=Android Debug|Android Debug' "$CERTIFICATE_REPORT" >/dev/null; then
   echo "error: APK uses an Android debug signing certificate." >&2
   exit 1
 fi

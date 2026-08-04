@@ -4,7 +4,7 @@ use jni::JNIEnv;
 use zeroize::Zeroizing;
 
 use crate::core::MobileCore;
-use crate::CORE;
+use crate::{refresh_route_proof_status, CORE};
 
 fn status_after(operation: impl FnOnce(&mut MobileCore) -> Result<(), String>) -> String {
     let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -12,6 +12,15 @@ fn status_after(operation: impl FnOnce(&mut MobileCore) -> Result<(), String>) -
         core.record_error(error);
     }
     core.status_json()
+}
+
+fn value_after(operation: impl FnOnce(&mut MobileCore) -> Result<String, String>) -> String {
+    let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match operation(&mut core) {
+        Ok(value) => value,
+        Err(error) => serde_json::to_string(&serde_json::json!({ "error": error }))
+            .expect("native error serialization is infallible"),
+    }
 }
 
 fn java_string(env: &mut JNIEnv<'_>, value: String) -> jstring {
@@ -145,7 +154,22 @@ pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativePreflightProxy(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) -> jstring {
-    let status = status_after(MobileCore::preflight_proxy);
+    let status = CORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .preflight_proxy_status_json();
+    java_string(&mut env, status)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeRefreshRouteProof(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    // Periodic refresh failures are observations, not global core failures.
+    // Deliberately bypass the generic mutating status wrapper, whose
+    // explicit-operation contract promotes every Err to phase=error.
+    let status = refresh_route_proof_status();
     java_string(&mut env, status)
 }
 
@@ -157,4 +181,61 @@ pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeSetProxyEnabled(
 ) -> jstring {
     let status = status_after(|core| core.set_proxy_enabled(enabled != 0));
     java_string(&mut env, status)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeGetDebtSummary(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let value = value_after(|core| core.debt_summary_json());
+    java_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativePrepareDebtSettlement(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let value = value_after(MobileCore::prepare_debt_settlement_json);
+    java_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeConfirmDebtSettlement(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    quote_id: JString<'_>,
+    maximum_masq_wei: JString<'_>,
+    maximum_estimated_l2_fee_wei: JString<'_>,
+) -> jstring {
+    let quote_id = rust_string(&mut env, quote_id);
+    let maximum_masq_wei = rust_string(&mut env, maximum_masq_wei);
+    let maximum_estimated_l2_fee_wei = rust_string(&mut env, maximum_estimated_l2_fee_wei);
+    let value = value_after(|core| {
+        core.confirm_debt_settlement_json(
+            &quote_id?,
+            &maximum_masq_wei?,
+            &maximum_estimated_l2_fee_wei?,
+        )
+    });
+    java_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeRetryDebtSettlement(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let value = value_after(MobileCore::retry_debt_settlement_json);
+    java_string(&mut env, value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_masqmobile_MasqCoreJni_nativeGetDebtSettlementStatus(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let value = value_after(|core| core.debt_settlement_status_json());
+    java_string(&mut env, value)
 }

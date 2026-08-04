@@ -488,7 +488,7 @@ impl StreamHandlerPool {
     fn send_packet_on_open_stream(
         &self,
         msg: DispatcherNodeQueryResponse,
-        _peer_addr: SocketAddr,
+        peer_addr: SocketAddr,
         _sw_key: StreamWriterKey,
         tx_box: &dyn SenderWrapper<SequencedPacket>,
     ) -> Result<bool, String> {
@@ -527,6 +527,25 @@ impl StreamHandlerPool {
             }
             Ok(_) => {
                 debug!(self.logger, "Queued {} bytes for transmission", packet_len);
+                if crate::mobile_runtime::is_embedded()
+                    && crate::mobile_runtime::snapshot().route_stage == 0
+                    && matches!(&msg.context.endpoint, Endpoint::Key(_))
+                    && !msg.context.last_data
+                {
+                    // An explicit mobile retry may deliberately reuse an open
+                    // clandestine stream. There is no new connector success
+                    // callback in that case, so acknowledge the still-live TCP
+                    // transport before the refreshed Debut is processed.
+                    let connection_progress_message = ConnectionProgressMessage {
+                        peer_addr: peer_addr.ip(),
+                        event: ConnectionProgressEvent::TcpConnectionSuccessful,
+                    };
+                    self.connection_progress_sub_opt
+                        .as_ref()
+                        .expect("Neighborhood is unbound")
+                        .try_send(connection_progress_message)
+                        .expect("Neighborhood is dead");
+                }
             }
         };
         if msg.context.last_data {
@@ -714,6 +733,9 @@ impl StreamStartSuccessHandler {
 
     pub fn handle(self, connection_info: ConnectionInfo) {
         debug!(self.logger, "Connection attempt succeeded; peer redacted");
+        crate::mobile_runtime::report_entry_handshake_milestone(
+            crate::mobile_runtime::EntryHandshakeMilestone::TcpConnected,
+        );
         let origin_port = connection_info.local_addr.port();
         self.add_stream_sub
             .try_send(AddStreamMsg {
@@ -1977,6 +1999,53 @@ mod tests {
         assert_eq!(
             sender_wrapper_unbounded_send_params.deref(),
             &[SequencedPacket::new(b"hello".to_vec(), 0, true),]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reused_mobile_entry_stream_reports_tcp_progress_for_a_retry_packet() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let system = System::new("reused_mobile_entry_stream_reports_tcp_progress");
+        let (neighborhood, _, recording_arc) = make_recorder();
+        let peer_addr = SocketAddr::from_str("5.4.3.1:8000").unwrap();
+        let sender_wrapper = SenderWrapperMock::new(peer_addr).unbounded_send_result(Ok(()));
+        let mut subject = StreamHandlerPool::new(vec![], false);
+        subject.connection_progress_sub_opt = Some(
+            neighborhood
+                .start()
+                .recipient::<ConnectionProgressMessage>(),
+        );
+        subject.stream_writers.insert(
+            StreamWriterKey::from(peer_addr),
+            Some(Box::new(sender_wrapper)),
+        );
+
+        subject.handle_dispatcher_node_query_response(DispatcherNodeQueryResponse {
+            result: Some(NodeQueryResponseMetadata {
+                public_key: PublicKey::from(vec![1, 2, 3, 4]),
+                node_addr_opt: Some(NodeAddr::new(&peer_addr.ip(), &[peer_addr.port()])),
+                rate_pack: ZERO_RATE_PACK.clone(),
+            }),
+            context: TransmitDataMsg {
+                endpoint: Endpoint::Key(PublicKey::from(vec![1, 2, 3, 4])),
+                last_data: false,
+                sequence_number_opt: Some(0),
+                data: b"retry-debut".to_vec(),
+            },
+        });
+
+        System::current().stop_with_code(0);
+        system.run();
+        crate::mobile_runtime::finish(0);
+
+        assert_eq!(
+            Recording::get::<ConnectionProgressMessage>(&recording_arc, 0),
+            ConnectionProgressMessage {
+                peer_addr: peer_addr.ip(),
+                event: ConnectionProgressEvent::TcpConnectionSuccessful,
+            }
         );
     }
 

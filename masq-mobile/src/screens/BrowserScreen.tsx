@@ -2,6 +2,7 @@ import {
   useCallback,
   useRef,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type ComponentType,
@@ -9,6 +10,8 @@ import {
 } from 'react';
 import {
   ActivityIndicator,
+  AppState,
+  BackHandler,
   Platform,
   Pressable,
   StyleSheet,
@@ -24,11 +27,25 @@ import { decideBrowserNavigation } from '../core/browserNavigation';
 import {
   browserProtectionPreferences,
   browserProtectionPreset,
+  browserRequestBlockingHosts,
   buildBrowserCosmeticProtectionScript,
   type BrowserProtectionConfiguration,
   type BrowserProtectionPreferences,
 } from '../core/browserProtection';
-import { resolveBrowserInputTarget } from '../core/browserInput';
+import {
+  browserLoadWatchdogMs,
+  browserMonotonicNow,
+  buildBrowserNavigationMetric,
+  reportBrowserNavigationMetric,
+  type BrowserNavigationMetric,
+  type BrowserNavigationOutcome,
+} from '../core/browserPerformance';
+import {
+  browserSearchProviderName,
+  DEFAULT_BROWSER_SEARCH_PROVIDER,
+  resolveBrowserInputTarget,
+  type BrowserSearchProvider,
+} from '../core/browserInput';
 import { decideBrowserRecovery } from '../core/browserRecovery';
 import {
   browserSiteHostname,
@@ -43,10 +60,12 @@ import { masqCore } from '../core/masqCore';
 import { colors, radii } from '../ui/theme';
 
 export type BrowserMode = 'masq' | 'direct';
+export type BrowserCloseReason = 'user' | 'background';
 
 interface Props {
   mode: BrowserMode;
-  onClose: () => void;
+  onClose: (reason?: BrowserCloseReason) => Promise<void> | void;
+  onRepairRoute?: () => Promise<void>;
 }
 
 interface ShouldStartLoadRequest extends WebViewNavigation {
@@ -56,6 +75,7 @@ interface ShouldStartLoadRequest extends WebViewNavigation {
 }
 
 interface BrowserWebViewProps {
+  androidBlockedResourceHosts?: string[];
   allowFileAccess: boolean;
   allowFileAccessFromFileURLs: boolean;
   allowUniversalAccessFromFileURLs: boolean;
@@ -81,9 +101,11 @@ interface BrowserWebViewProps {
   onHttpError: (event: {
     nativeEvent: { statusCode: number; description: string; url: string };
   }) => void;
-  onLoad: () => void;
-  onLoadEnd: () => void;
-  onLoadStart: () => void;
+  onLoad: (event?: { nativeEvent?: { url?: string } }) => void;
+  onLoadEnd: (event?: { nativeEvent?: { url?: string } }) => void;
+  onLoadStart: (event?: {
+    nativeEvent?: { loading?: boolean; url?: string };
+  }) => void;
   onNavigationStateChange: (event: WebViewNavigation) => void;
   onShouldStartLoadWithRequest: (request: ShouldStartLoadRequest) => boolean;
   originWhitelist: string[];
@@ -102,14 +124,45 @@ const BrowserWebView = WebView as unknown as ComponentType<
 const MAX_TRANSIENT_RETRIES = 2;
 const MAX_HTTPS_REDIRECT_UPGRADES = 4;
 const FORM_SUBMISSION_NAVIGATIONS = new Set(['formsubmit', 'formresubmit']);
+type BrowserCloseState = 'open' | 'closing' | 'failed';
 
-export function BrowserScreen({ mode, onClose }: Props) {
+function canonicalBrowserLoadUrl(value?: string): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const canonical = parsed.href;
+    const fragment = canonical.indexOf('#');
+    return fragment >= 0 ? canonical.slice(0, fragment) : canonical;
+  } catch {
+    return value;
+  }
+}
+
+export function BrowserScreen({
+  mode,
+  onClose,
+  onRepairRoute = () => Promise.resolve(),
+}: Props) {
   const isMasq = mode === 'masq';
   const webView = useRef<WebView>(null);
+  const closeInFlight = useRef(false);
+  const closeReason = useRef<BrowserCloseReason>('user');
   const retryCount = useRef(0);
   const httpsRedirectUpgrades = useRef(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryOperation = useRef(0);
+  const loadWatchdogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeLoad = useRef<{
+    id: number;
+    startedAtMs: number;
+    url: string | null;
+  } | null>(null);
+  const loadOperation = useRef(0);
+  const temporarySession = useRef(true);
   const protectionOperation = useRef(0);
+  const searchProviderOperation = useRef(0);
   const siteSettingsOperation = useRef(0);
   const [input, setInput] = useState('');
   const [url, setUrl] = useState<string | null>(null);
@@ -122,16 +175,40 @@ export function BrowserScreen({ mode, onClose }: Props) {
   const [protectionBusy, setProtectionBusy] = useState(true);
   const [protectionError, setProtectionError] = useState<string | null>(null);
   const [protectionExpanded, setProtectionExpanded] = useState(false);
+  const [searchProvider, setSearchProvider] = useState<BrowserSearchProvider>(
+    DEFAULT_BROWSER_SEARCH_PROVIDER,
+  );
+  const [searchProviderBusy, setSearchProviderBusy] = useState(true);
+  const [searchProviderError, setSearchProviderError] = useState<string | null>(
+    null,
+  );
   const [siteSettings, setSiteSettings] = useState<BrowserSiteSettings | null>(
     null,
   );
   const [siteSettingsBusy, setSiteSettingsBusy] = useState(false);
   const [webViewGeneration, setWebViewGeneration] = useState(0);
+  const [closeState, setCloseState] = useState<BrowserCloseState>('open');
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const [lastLoadMetric, setLastLoadMetric] =
+    useState<BrowserNavigationMetric | null>(null);
+  const requestBlockingHosts = useMemo(
+    () =>
+      protection
+        ? browserRequestBlockingHosts(
+            protection,
+            Boolean(siteSettings?.protectionDisabled),
+          )
+        : [],
+    [protection, siteSettings?.protectionDisabled],
+  );
+  const requestBlockingActive =
+    Boolean(protection?.nativeRequestBlocking) ||
+    (Platform.OS === 'android' && requestBlockingHosts.length > 0);
   const protectionStatusText = siteSettings?.protectionDisabled
     ? 'Off for this site'
     : protectionBusy && !protection
     ? 'Preparing before navigation'
-    : protection?.nativeRequestBlocking
+    : requestBlockingActive
     ? 'Network and page filtering'
     : protection
     ? isMasq
@@ -139,12 +216,101 @@ export function BrowserScreen({ mode, onClose }: Props) {
       : 'Page filtering'
     : 'Navigation paused';
 
-  const cancelScheduledRetry = () => {
+  const cancelScheduledRetry = useCallback(() => {
+    retryOperation.current += 1;
     if (retryTimer.current) {
       clearTimeout(retryTimer.current);
       retryTimer.current = null;
     }
-  };
+  }, []);
+
+  const cancelLoadWatchdog = useCallback(() => {
+    if (loadWatchdogTimer.current) {
+      clearTimeout(loadWatchdogTimer.current);
+      loadWatchdogTimer.current = null;
+    }
+  }, []);
+
+  const finishActiveLoad = useCallback(
+    (outcome: BrowserNavigationOutcome, completedUrl?: string) => {
+      const current = activeLoad.current;
+      if (!current) {
+        return null;
+      }
+      const canonicalCompletedUrl = canonicalBrowserLoadUrl(completedUrl);
+      if (
+        current.url &&
+        canonicalCompletedUrl &&
+        current.url !== canonicalCompletedUrl
+      ) {
+        return null;
+      }
+      activeLoad.current = null;
+      cancelLoadWatchdog();
+      const metric = buildBrowserNavigationMetric(
+        mode,
+        outcome,
+        current.startedAtMs,
+        browserMonotonicNow(),
+      );
+      setLastLoadMetric(metric);
+      setLoading(false);
+      reportBrowserNavigationMetric(metric);
+      return metric;
+    },
+    [cancelLoadWatchdog, mode],
+  );
+
+  const beginActiveLoad = useCallback(
+    (nextUrl?: string) => {
+      // A redirect or a second navigation can start before Android delivers the
+      // completion event for the previous document. Give the newest document a
+      // fresh watchdog and fence late completion events by their canonical URL.
+      cancelLoadWatchdog();
+      const id = ++loadOperation.current;
+      activeLoad.current = {
+        id,
+        startedAtMs: browserMonotonicNow(),
+        url: canonicalBrowserLoadUrl(nextUrl),
+      };
+      setError(null);
+      setLoading(true);
+      loadWatchdogTimer.current = setTimeout(() => {
+        const current = activeLoad.current;
+        if (!current || current.id !== id) {
+          return;
+        }
+        webView.current?.stopLoading();
+        finishActiveLoad('timed_out');
+        setError(
+          mode === 'masq'
+            ? 'The page did not finish loading through MASQ in time. The stalled load was stopped; retry to use a fresh browser request.'
+            : 'The page did not finish loading in time. The stalled load was stopped; check the connection and retry.',
+        );
+      }, browserLoadWatchdogMs(mode));
+    },
+    [cancelLoadWatchdog, finishActiveLoad, mode],
+  );
+
+  const stopAndReleaseWebView = useCallback((clearTemporaryCache: boolean) => {
+    const current = webView.current;
+    current?.stopLoading();
+    if (Platform.OS === 'android' && clearTemporaryCache) {
+      current?.clearFormData?.();
+      current?.clearHistory?.();
+      current?.clearCache(true);
+    }
+  }, []);
+
+  const remountActiveWebView = useCallback(() => {
+    cancelScheduledRetry();
+    retryCount.current = 0;
+    httpsRedirectUpgrades.current = 0;
+    finishActiveLoad('cancelled');
+    stopAndReleaseWebView(false);
+    setCanGoBack(false);
+    setWebViewGeneration(current => current + 1);
+  }, [cancelScheduledRetry, finishActiveLoad, stopAndReleaseWebView]);
 
   const prepareProtection = useCallback(async () => {
     const operation = ++protectionOperation.current;
@@ -173,14 +339,163 @@ export function BrowserScreen({ mode, onClose }: Props) {
     }
   }, [isMasq]);
 
+  const loadSearchProvider = useCallback(async () => {
+    const operation = ++searchProviderOperation.current;
+    setSearchProviderBusy(true);
+    setSearchProviderError(null);
+    try {
+      const savedProvider = await masqCore.getBrowserSearchProvider();
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(savedProvider);
+      }
+    } catch {
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(DEFAULT_BROWSER_SEARCH_PROVIDER);
+        setSearchProviderError(
+          'The saved search engine could not be loaded. Timpi is used for this session.',
+        );
+      }
+    } finally {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderBusy(false);
+      }
+    }
+  }, []);
+
+  const chooseSearchProvider = async (next: BrowserSearchProvider) => {
+    if (searchProviderBusy || next === searchProvider) {
+      return;
+    }
+    const operation = ++searchProviderOperation.current;
+    setSearchProviderBusy(true);
+    setSearchProviderError(null);
+    try {
+      const savedProvider = await masqCore.setBrowserSearchProvider(next);
+      if (operation === searchProviderOperation.current) {
+        setSearchProvider(savedProvider);
+      }
+    } catch {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderError(
+          'The search engine choice could not be saved. Try again.',
+        );
+      }
+    } finally {
+      if (operation === searchProviderOperation.current) {
+        setSearchProviderBusy(false);
+      }
+    }
+  };
+
   useEffect(() => {
     prepareProtection().catch(() => undefined);
+    loadSearchProvider().catch(() => undefined);
     return () => {
       protectionOperation.current += 1;
+      searchProviderOperation.current += 1;
       siteSettingsOperation.current += 1;
       cancelScheduledRetry();
     };
-  }, [prepareProtection]);
+  }, [cancelScheduledRetry, loadSearchProvider, prepareProtection]);
+
+  useLayoutEffect(() => {
+    temporarySession.current = !siteSettings?.rememberSignIn;
+  }, [siteSettings?.rememberSignIn]);
+
+  useLayoutEffect(
+    () => () => {
+      cancelLoadWatchdog();
+      stopAndReleaseWebView(temporarySession.current);
+    },
+    [cancelLoadWatchdog, stopAndReleaseWebView],
+  );
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state !== 'active') {
+        // Mobile WebViews can pause network activity while another app handles
+        // a sign-in confirmation. Keep the WebView mounted, but pause our own
+        // timeout/retry timers so they cannot replace or stop that page while
+        // it is hidden behind App's privacy shield.
+        cancelLoadWatchdog();
+        cancelScheduledRetry();
+        return;
+      }
+      const pausedLoad = activeLoad.current;
+      if (pausedLoad) {
+        beginActiveLoad(pausedLoad.url ?? undefined);
+      }
+    });
+    return () => subscription.remove();
+  }, [beginActiveLoad, cancelLoadWatchdog, cancelScheduledRetry]);
+
+  const closeBrowser = useCallback(
+    async (reason?: BrowserCloseReason) => {
+      if (closeInFlight.current) {
+        return;
+      }
+      const requestedReason = reason ?? closeReason.current;
+      closeReason.current = requestedReason;
+      closeInFlight.current = true;
+      protectionOperation.current += 1;
+      siteSettingsOperation.current += 1;
+      cancelScheduledRetry();
+      cancelLoadWatchdog();
+      finishActiveLoad('cancelled');
+      stopAndReleaseWebView(!siteSettings?.rememberSignIn);
+      // Rendering the close state unmounts the WebView before native blocking is
+      // awaited. A rejected acknowledgement never restores the page.
+      setCloseState('closing');
+      setCloseError(null);
+      try {
+        // Yield one UI frame so React Native commits the close state and calls
+        // the native WebView destroy hook before Android deletes the temporary
+        // profile and its proxy connection pool.
+        await new Promise<void>(resolve =>
+          requestAnimationFrame(() => resolve()),
+        );
+        await onClose(requestedReason);
+      } catch (caught) {
+        setCloseState('failed');
+        setCloseError(
+          caught instanceof Error
+            ? caught.message
+            : 'Browser traffic could not be confirmed blocked.',
+        );
+      } finally {
+        closeInFlight.current = false;
+      }
+    },
+    [
+      cancelScheduledRetry,
+      cancelLoadWatchdog,
+      finishActiveLoad,
+      onClose,
+      siteSettings?.rememberSignIn,
+      stopAndReleaseWebView,
+    ],
+  );
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        if (closeState !== 'open') {
+          return true;
+        }
+        if (canGoBack) {
+          webView.current?.goBack();
+          return true;
+        }
+        closeBrowser().catch(() => undefined);
+        return true;
+      },
+    );
+    return () => subscription.remove();
+  }, [canGoBack, closeBrowser, closeState]);
 
   const cosmeticProtectionScript = useMemo(
     () =>
@@ -203,10 +518,11 @@ export function BrowserScreen({ mode, onClose }: Props) {
         // Unmount the previous WebView before native code changes the active
         // profile. The destination is mounted only after the exact profile and
         // protection exception have been selected.
+        finishActiveLoad('cancelled');
+        stopAndReleaseWebView(false);
         setUrl(null);
         setSiteSettings(null);
         setCanGoBack(false);
-        setLoading(false);
         setIsEnsTarget(target.isEns);
         setInput(target.displayUrl);
         const settings = await masqCore.getBrowserSiteSettings(mode, hostname);
@@ -233,10 +549,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
         }
       }
     },
-    [mode],
+    [cancelScheduledRetry, finishActiveLoad, mode, stopAndReleaseWebView],
   );
 
-  const navigate = async () => {
+  const navigate = async (submittedInput: string = input) => {
     if (!protection || protectionBusy) {
       setError(
         isMasq
@@ -246,7 +562,9 @@ export function BrowserScreen({ mode, onClose }: Props) {
       return;
     }
     try {
-      await openTarget(resolveBrowserInputTarget(input));
+      await openTarget(
+        resolveBrowserInputTarget(submittedInput, searchProvider),
+      );
     } catch (caught) {
       setError(browserAddressError(caught));
     }
@@ -257,15 +575,39 @@ export function BrowserScreen({ mode, onClose }: Props) {
     setInput(displayBrowserUrl(event.url));
   };
 
+  const reloadAfterRouteRepair = async (operation: number) => {
+    if (isMasq) {
+      setError('Checking and repairing the private MASQ route…');
+      setLoading(true);
+      try {
+        await onRepairRoute();
+      } catch {
+        if (operation !== retryOperation.current || closeInFlight.current) {
+          return;
+        }
+        setLoading(false);
+        setError(
+          'The private route could not be repaired safely. Return to MASQ and retry the connection.',
+        );
+        return;
+      }
+    }
+    if (operation !== retryOperation.current || closeInFlight.current) {
+      return;
+    }
+    setError(null);
+    setLoading(true);
+    webView.current?.reload();
+  };
+
   const retryPage = () => {
     if (!protection || protectionBusy) {
       return;
     }
     cancelScheduledRetry();
     retryCount.current = 0;
-    setError(null);
-    setLoading(true);
-    webView.current?.reload();
+    const operation = retryOperation.current;
+    reloadAfterRouteRepair(operation).catch(() => undefined);
   };
 
   const handleLoadError = (
@@ -274,7 +616,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
     domain: string,
   ) => {
     cancelScheduledRetry();
-    setLoading(false);
+    finishActiveLoad('failed');
     const recovery = decideBrowserRecovery(
       { code, description, domain },
       retryCount.current,
@@ -288,11 +630,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
         : recovery.message,
     );
     if (recovery.retry && recovery.delayMs !== null) {
+      const operation = retryOperation.current;
       retryTimer.current = setTimeout(() => {
         retryTimer.current = null;
-        setError(null);
-        setLoading(true);
-        webView.current?.reload();
+        reloadAfterRouteRepair(operation).catch(() => undefined);
       }, recovery.delayMs);
     }
   };
@@ -373,13 +714,8 @@ export function BrowserScreen({ mode, onClose }: Props) {
         return;
       }
       setProtection(applied);
-      cancelScheduledRetry();
-      retryCount.current = 0;
-      httpsRedirectUpgrades.current = 0;
-      setCanGoBack(false);
       setError(null);
-      setLoading(Boolean(url));
-      setWebViewGeneration(current => current + 1);
+      remountActiveWebView();
     } catch (caught) {
       if (operation === protectionOperation.current) {
         setProtectionError(
@@ -430,7 +766,10 @@ export function BrowserScreen({ mode, onClose }: Props) {
       if (updated.protectionDisabled !== siteSettings.protectionDisabled) {
         await prepareProtection();
       }
-      setWebViewGeneration(current => current + 1);
+      if (operation !== siteSettingsOperation.current) {
+        return;
+      }
+      remountActiveWebView();
     } catch (caught) {
       if (operation === siteSettingsOperation.current) {
         setProtectionError(
@@ -454,15 +793,28 @@ export function BrowserScreen({ mode, onClose }: Props) {
     setSiteSettingsBusy(true);
     setProtectionError(null);
     try {
+      // The busy state removes the WebView from the tree. AndroidX refuses to
+      // delete a profile while any living WebView still owns it, so wait until
+      // React Native has committed that unmount before invoking native cleanup.
+      await new Promise<void>(resolve =>
+        requestAnimationFrame(() => resolve()),
+      );
+      if (operation !== siteSettingsOperation.current) {
+        return;
+      }
       const updated = await masqCore.clearBrowserSiteData(
         mode,
         siteSettings.hostname,
       );
-      if (operation === siteSettingsOperation.current) {
-        setSiteSettings(updated);
-        await prepareProtection();
-        setWebViewGeneration(current => current + 1);
+      if (operation !== siteSettingsOperation.current) {
+        return;
       }
+      setSiteSettings(updated);
+      await prepareProtection();
+      if (operation !== siteSettingsOperation.current) {
+        return;
+      }
+      remountActiveWebView();
     } catch (caught) {
       if (operation === siteSettingsOperation.current) {
         setProtectionError(
@@ -486,12 +838,20 @@ export function BrowserScreen({ mode, onClose }: Props) {
     setSiteSettingsBusy(true);
     setProtectionError(null);
     try {
+      // See forgetCurrentSite: every remembered profile must be detached from
+      // its WebView before ProfileStore.deleteProfile is allowed to run.
+      await new Promise<void>(resolve =>
+        requestAnimationFrame(() => resolve()),
+      );
+      if (operation !== siteSettingsOperation.current) {
+        return;
+      }
       await masqCore.clearRememberedBrowserData();
       if (operation === siteSettingsOperation.current) {
         setSiteSettings(current =>
           current ? { ...current, rememberSignIn: false } : current,
         );
-        setWebViewGeneration(current => current + 1);
+        remountActiveWebView();
       }
     } catch (caught) {
       if (operation === siteSettingsOperation.current) {
@@ -508,6 +868,46 @@ export function BrowserScreen({ mode, onClose }: Props) {
     }
   };
 
+  if (closeState !== 'open') {
+    const closeFailed = closeState === 'failed';
+    return (
+      <View
+        accessibilityViewIsModal
+        style={[styles.screen, styles.closeState]}
+        testID="browser-close-state"
+      >
+        {closeFailed ? null : (
+          <ActivityIndicator color={colors.violet} size="large" />
+        )}
+        <Text style={styles.closeStateTitle}>
+          {closeFailed
+            ? 'Browser close needs confirmation'
+            : 'Closing browser safely'}
+        </Text>
+        <Text style={styles.closeStateText}>
+          {closeFailed
+            ? 'The page stays closed. Retry the close confirmation; browsing will not resume.'
+            : 'The page is closed while MASQ confirms that browser traffic is blocked.'}
+        </Text>
+        {closeError ? (
+          <Text accessibilityRole="alert" style={styles.closeStateError}>
+            {closeError}
+          </Text>
+        ) : null}
+        {closeFailed ? (
+          <Pressable
+            accessibilityLabel="Retry closing browser"
+            accessibilityRole="button"
+            onPress={() => closeBrowser().catch(() => undefined)}
+            style={styles.closeStateButton}
+          >
+            <Text style={styles.closeStateButtonText}>Retry close</Text>
+          </Pressable>
+        ) : null}
+      </View>
+    );
+  }
+
   return (
     <View style={styles.screen}>
       <View style={styles.topBar}>
@@ -516,10 +916,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
             isMasq ? 'Close private browser' : 'Close direct browser'
           }
           accessibilityRole="button"
-          onPress={() => {
-            cancelScheduledRetry();
-            onClose();
-          }}
+          onPress={() => closeBrowser().catch(() => undefined)}
           style={styles.iconButton}
         >
           <Text style={styles.close}>×</Text>
@@ -572,13 +969,22 @@ export function BrowserScreen({ mode, onClose }: Props) {
           }
           autoCapitalize="none"
           autoCorrect={false}
-          editable={Boolean(protection) && !protectionBusy && !siteSettingsBusy}
+          editable={
+            Boolean(protection) &&
+            !protectionBusy &&
+            !searchProviderBusy &&
+            !siteSettingsBusy
+          }
           keyboardType="default"
           onChangeText={setInput}
-          onSubmitEditing={() => navigate().catch(() => undefined)}
-          placeholder="Search with Timpi or enter a website"
+          onSubmitEditing={event =>
+            navigate(event?.nativeEvent?.text ?? input).catch(() => undefined)
+          }
+          placeholder={`Search with ${browserSearchProviderName(
+            searchProvider,
+          )} or enter a website`}
           placeholderTextColor="#61788B"
-          returnKeyType="search"
+          returnKeyType="go"
           selectTextOnFocus
           style={styles.address}
           value={input}
@@ -619,6 +1025,41 @@ export function BrowserScreen({ mode, onClose }: Props) {
         </Pressable>
         {protectionExpanded ? (
           <>
+            <View style={styles.searchEngineSettings}>
+              <View style={styles.searchEngineHeading}>
+                <Text style={styles.siteSettingsTitle}>Search engine</Text>
+                {searchProviderBusy ? (
+                  <ActivityIndicator color={colors.violet} size="small" />
+                ) : null}
+              </View>
+              <View style={styles.protectionOptions}>
+                <SearchProviderButton
+                  disabled={searchProviderBusy}
+                  label="Timpi"
+                  onPress={() =>
+                    chooseSearchProvider('timpi').catch(() => undefined)
+                  }
+                  selected={searchProvider === 'timpi'}
+                />
+                <SearchProviderButton
+                  disabled={searchProviderBusy}
+                  label="DuckDuckGo"
+                  onPress={() =>
+                    chooseSearchProvider('duckduckgo').catch(() => undefined)
+                  }
+                  selected={searchProvider === 'duckduckgo'}
+                />
+              </View>
+              <Text style={styles.protectionHint}>
+                Free-text searches use this provider. Website addresses and ENS
+                names always open directly.
+              </Text>
+              {searchProviderError ? (
+                <Text accessibilityRole="alert" style={styles.protectionError}>
+                  {searchProviderError}
+                </Text>
+              ) : null}
+            </View>
             {protection ? (
               <View style={styles.protectionOptions}>
                 <PresetButton
@@ -737,11 +1178,12 @@ export function BrowserScreen({ mode, onClose }: Props) {
                 ) : (
                   <Text style={styles.protectionHint}>
                     Remembered sign-in stores WebView cookies and website data
-                    in the selected MASQ or Direct profile. Cross-site links
-                    and redirects switch profiles. Android blocks top-frame
-                    non-GET forms that could bypass that switch. MASQ never
-                    reads passwords or session tokens. Some providers,
-                    including Google, may refuse embedded sign-in.
+                    in the selected MASQ or Direct profile. Cross-site links and
+                    redirects switch profiles. Android blocks top-frame form
+                    posts because WebView cannot safely inspect their redirects;
+                    modern in-page sign-ins remain available. MASQ never reads
+                    passwords or session tokens. Some providers, including
+                    Google, may refuse embedded sign-in.
                   </Text>
                 )}
                 <View style={styles.siteActions}>
@@ -827,7 +1269,21 @@ export function BrowserScreen({ mode, onClose }: Props) {
           ) : null}
         </View>
       ) : null}
-      <View style={styles.webContainer}>
+      <View
+        accessibilityLabel="Browser load status"
+        accessibilityState={{ busy: loading }}
+        accessibilityValue={{
+          text: loading
+            ? mode === 'masq'
+              ? 'Page load active through MASQ'
+              : 'Direct page load active'
+            : lastLoadMetric
+            ? `Last page load ${lastLoadMetric.outcome} in ${lastLoadMetric.durationMs} milliseconds`
+            : 'No page load active',
+        }}
+        style={styles.webContainer}
+        testID="browser-load-status"
+      >
         {url && protection && siteSettings && !siteSettingsBusy ? (
           <BrowserWebView
             key={`${mode}-webview-${webViewGeneration}`}
@@ -837,7 +1293,12 @@ export function BrowserScreen({ mode, onClose }: Props) {
             allowUniversalAccessFromFileURLs={false}
             allowsBackForwardNavigationGestures
             allowsLinkPreview={false}
-            cacheEnabled={Boolean(siteSettings?.rememberSignIn)}
+            androidBlockedResourceHosts={
+              Platform.OS === 'android' ? requestBlockingHosts : undefined
+            }
+            cacheEnabled={
+              Platform.OS === 'android' || Boolean(siteSettings?.rememberSignIn)
+            }
             fraudulentWebsiteWarningEnabled
             geolocationEnabled={false}
             incognito={Platform.OS === 'ios' && isMasq}
@@ -869,7 +1330,7 @@ export function BrowserScreen({ mode, onClose }: Props) {
             onHttpError={({ nativeEvent }) => {
               cancelScheduledRetry();
               retryCount.current = 0;
-              setLoading(false);
+              finishActiveLoad('http_error');
               setError(
                 isEnsTarget
                   ? `The ENS gateway returned HTTP ${nativeEvent.statusCode} for this .eth website.`
@@ -878,14 +1339,22 @@ export function BrowserScreen({ mode, onClose }: Props) {
                   : `The website returned HTTP ${nativeEvent.statusCode}.`,
               );
             }}
-            onLoad={() => {
+            onLoad={event => {
               retryCount.current = 0;
               httpsRedirectUpgrades.current = 0;
+              finishActiveLoad('completed', event?.nativeEvent?.url);
             }}
-            onLoadEnd={() => setLoading(false)}
-            onLoadStart={() => {
-              setError(null);
-              setLoading(true);
+            onLoadEnd={event =>
+              finishActiveLoad('completed', event?.nativeEvent?.url)
+            }
+            onLoadStart={event => {
+              // Android also emits this callback for same-document history
+              // updates. Those report loading=false and must not arm a false
+              // watchdog for an already-rendered single-page application.
+              if (event?.nativeEvent?.loading === false) {
+                return;
+              }
+              beginActiveLoad(event?.nativeEvent?.url);
             }}
             onNavigationStateChange={navigationChanged}
             onShouldStartLoadWithRequest={shouldStartNavigation}
@@ -936,16 +1405,21 @@ export function BrowserScreen({ mode, onClose }: Props) {
             <Text style={styles.startHint}>
               {protection
                 ? isMasq
-                  ? 'Search with Timpi or enter a public HTTPS address to browse through MASQ.'
-                  : 'Search with Timpi or enter a public HTTPS address using your normal internet connection. Direct browsing is identified by the compact badge above.'
+                  ? `Search with ${browserSearchProviderName(
+                      searchProvider,
+                    )} or enter a public HTTPS address to browse through MASQ.`
+                  : `Search with ${browserSearchProviderName(
+                      searchProvider,
+                    )} or enter a public HTTPS address using your normal internet connection. Direct browsing is identified by the compact badge above.`
                 : isMasq
                 ? 'Resolve browser protection above before opening a website.'
                 : 'Resolve browser safeguards above before opening a website.'}
             </Text>
             {protection ? (
               <Text style={styles.searchProvider}>
-                Free-text searches open Timpi Search. ENS .eth websites use the
-                HTTPS eth.limo gateway.
+                Free-text searches open{' '}
+                {browserSearchProviderName(searchProvider)}. ENS .eth websites
+                use the HTTPS eth.limo gateway.
               </Text>
             ) : null}
           </View>
@@ -1027,6 +1501,35 @@ function PresetButton({
   );
 }
 
+function SearchProviderButton({
+  disabled,
+  label,
+  onPress,
+  selected,
+}: {
+  disabled: boolean;
+  label: string;
+  onPress: () => void;
+  selected: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={`Use ${label} search`}
+      accessibilityRole="radio"
+      accessibilityState={{ checked: selected, disabled }}
+      disabled={disabled}
+      onPress={onPress}
+      style={[
+        styles.presetButton,
+        selected && styles.searchProviderButtonSelected,
+        disabled && styles.disabled,
+      ]}
+    >
+      <Text style={styles.presetButtonText}>{label}</Text>
+    </Pressable>
+  );
+}
+
 function browserAddressError(caught: unknown): string {
   if (!(caught instanceof Error)) {
     return 'Invalid web address.';
@@ -1042,6 +1545,48 @@ function browserAddressError(caught: unknown): string {
 
 const styles = StyleSheet.create({
   screen: { backgroundColor: colors.ink, flex: 1 },
+  closeState: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  closeStateTitle: {
+    color: colors.white,
+    fontSize: 21,
+    fontWeight: '800',
+    marginTop: 18,
+    textAlign: 'center',
+  },
+  closeStateText: {
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 10,
+    maxWidth: 420,
+    textAlign: 'center',
+  },
+  closeStateError: {
+    color: '#FF9EAB',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 12,
+    maxWidth: 420,
+    textAlign: 'center',
+  },
+  closeStateButton: {
+    backgroundColor: colors.violet,
+    borderRadius: radii.medium,
+    marginTop: 20,
+    minWidth: 150,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  closeStateButtonText: {
+    color: colors.white,
+    fontSize: 14,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
   topBar: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1132,6 +1677,19 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 7,
     marginTop: 9,
+  },
+  searchEngineSettings: {
+    borderBottomColor: colors.line,
+    borderBottomWidth: 1,
+    paddingBottom: 9,
+  },
+  searchEngineHeading: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  searchProviderButtonSelected: {
+    backgroundColor: colors.violet,
   },
   protectionOption: {
     alignItems: 'center',

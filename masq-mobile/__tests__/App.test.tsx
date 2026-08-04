@@ -6,7 +6,10 @@ import React from 'react';
 import {
   Alert,
   AppState,
+  BackHandler,
+  Platform,
   Text,
+  TextInput,
   type AppStateStatus,
 } from 'react-native';
 import ReactTestRenderer from 'react-test-renderer';
@@ -23,8 +26,17 @@ import { UNSUPPORTED_SYSTEM_TUNNEL } from '../src/core/systemTunnel';
 
 const mockPrepareBrowserSession = jest.fn();
 const mockCloseBrowserSession = jest.fn();
+const mockRepairPrivateBrowserRoute = jest.fn();
+const TEST_PLATFORM_OS = Platform.OS;
+const HARDWARE_BACK_EVENT = {
+  timeStamp: 0,
+  type: 'hardwareBackPress',
+};
 const mockController = {
   busy: false,
+  profileReady: true,
+  initializationState: 'ready' as 'loading' | 'ready' | 'error',
+  profileRecoveryAvailable: false,
   connectionProgress: { step: 1, total: 5, label: 'Ready' },
   draft: DEFAULT_SETUP,
   entryNodeRefresh: null,
@@ -37,6 +49,8 @@ const mockController = {
     interface: 'wifi',
   } as NetworkStatus,
   refresh: jest.fn().mockResolvedValue(EMPTY_STATUS),
+  retryInitialization: jest.fn().mockResolvedValue(undefined),
+  recoverNetworkProfile: jest.fn().mockResolvedValue(undefined),
   refreshWalletBalance: jest.fn().mockResolvedValue(undefined),
   removeWallet: jest.fn().mockResolvedValue(undefined),
   reset: jest.fn().mockResolvedValue(undefined),
@@ -52,16 +66,21 @@ const mockController = {
   connect: jest.fn().mockResolvedValue(EMPTY_STATUS),
   disconnect: jest.fn().mockResolvedValue(EMPTY_STATUS),
 };
+const mockUseMasqController = jest.fn(
+  (_browserSessionActive: boolean = false) => mockController,
+);
 
 jest.mock('../src/core/browserSession', () => ({
-  closeBrowserSession: (...args: unknown[]) =>
-    mockCloseBrowserSession(...args),
+  closeBrowserSession: (...args: unknown[]) => mockCloseBrowserSession(...args),
   prepareBrowserSession: (...args: unknown[]) =>
     mockPrepareBrowserSession(...args),
+  repairPrivateBrowserRoute: (...args: unknown[]) =>
+    mockRepairPrivateBrowserRoute(...args),
 }));
 
 jest.mock('../src/hooks/useMasqController', () => ({
-  useMasqController: () => mockController,
+  useMasqController: (browserSessionActive?: boolean) =>
+    mockUseMasqController(browserSessionActive),
 }));
 
 jest.mock('../src/screens/BrowserScreen', () => {
@@ -71,15 +90,19 @@ jest.mock('../src/screens/BrowserScreen', () => {
     BrowserScreen: ({
       mode,
       onClose,
+      onRepairRoute,
     }: {
       mode: 'masq' | 'direct';
-      onClose: () => void;
-    }) =>
-      ReactModule.createElement(View, {
+      onClose: (reason?: 'user' | 'background') => Promise<void> | void;
+      onRepairRoute?: () => Promise<void>;
+    }) => {
+      return ReactModule.createElement(View, {
         mode,
         onClose,
+        onRepairRoute,
         testID: 'browser-screen',
-      }),
+      });
+    },
   };
 });
 
@@ -98,13 +121,23 @@ import App from '../App';
 
 describe('App browser routing modes', () => {
   beforeEach(() => {
+    mockUseMasqController.mockClear();
     mockPrepareBrowserSession
       .mockReset()
       .mockImplementation(async (_core, mode) => mode);
     mockCloseBrowserSession.mockReset().mockResolvedValue('blocked');
+    mockRepairPrivateBrowserRoute.mockReset().mockResolvedValue(undefined);
     mockController.refresh.mockClear();
+    mockController.retryInitialization.mockClear();
+    mockController.recoverNetworkProfile.mockClear();
     mockController.connect.mockClear();
     mockController.disconnect.mockClear();
+    mockController.systemTunnel = UNSUPPORTED_SYSTEM_TUNNEL;
+    mockController.profileReady = true;
+    mockController.initializationState = 'ready';
+    mockController.profileRecoveryAvailable = false;
+    mockController.busy = false;
+    mockController.draft = DEFAULT_SETUP;
     mockController.status = { ...EMPTY_STATUS };
     mockController.network = {
       available: true,
@@ -116,6 +149,7 @@ describe('App browser routing modes', () => {
   });
 
   afterEach(() => {
+    (Platform as unknown as { OS: string }).OS = TEST_PLATFORM_OS;
     jest.restoreAllMocks();
     jest.useRealTimers();
   });
@@ -285,7 +319,9 @@ describe('App browser routing modes', () => {
       await Promise.resolve();
     });
     await ReactTestRenderer.act(async () => {
-      await renderer.root.findByProps({ testID: 'browser-screen' }).props.onClose();
+      await renderer.root
+        .findByProps({ testID: 'browser-screen' })
+        .props.onClose();
     });
     ReactTestRenderer.act(() =>
       findButton(renderer, 'Connect to MASQ').props.onPress(),
@@ -301,6 +337,7 @@ describe('App browser routing modes', () => {
       chain: 'base-mainnet',
       connectedNeighbors: 1,
       engineAvailable: true,
+      engineGeneration: 1,
       phase: 'connected',
       proxyPort: 44_443,
       routeHops: 2,
@@ -418,7 +455,9 @@ describe('App browser routing modes', () => {
       connectedNeighbors: 1,
       engineAvailable: true,
       phase: 'connected',
+      proxyPort: 44_443,
       routeHops: 2,
+      routeStage: 2,
       walletAddress: '0x1234567890abcdef',
     };
     mockPrepareBrowserSession.mockRejectedValue(
@@ -445,14 +484,52 @@ describe('App browser routing modes', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('blocks a pending direct session when the app enters the background', async () => {
-    let appStateChange: ((state: AppStateStatus) => void) | null = null;
-    jest.spyOn(AppState, 'addEventListener').mockImplementation(
-      (_event, listener) => {
-        appStateChange = listener;
-        return { remove: jest.fn() };
-      },
+  it('clears a transient private-browser issue after the native route recovers', async () => {
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      engineGeneration: 1,
+      phase: 'connected',
+      proxyPort: 44_443,
+      routeHops: 1,
+      routeStage: 1,
+      walletAddress: '0x1234567890abcdef',
+    };
+    mockPrepareBrowserSession.mockRejectedValue(
+      new Error('MASQ route verification failed.'),
     );
+    const renderer = await renderApp();
+
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'The private route was interrupted',
+    );
+
+    mockController.status = {
+      ...mockController.status,
+      lastError: null,
+      routeHops: 2,
+      routeStage: 2,
+    };
+    await ReactTestRenderer.act(async () => {
+      renderer.update(<App />);
+      await Promise.resolve();
+    });
+
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
+      'The private route was interrupted',
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('blocks a pending direct session when the app enters the background', async () => {
+    const emitAppState = mockAppStateChanges();
     let resolvePreparation!: (mode: 'direct') => void;
     mockPrepareBrowserSession.mockReturnValue(
       new Promise(resolve => {
@@ -470,7 +547,7 @@ describe('App browser routing modes', () => {
       actions.find(action => action.text === 'Browse directly')?.onPress?.();
     });
     ReactTestRenderer.act(() => {
-      appStateChange?.('background');
+      emitAppState('background');
     });
 
     expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
@@ -488,14 +565,8 @@ describe('App browser routing modes', () => {
     ReactTestRenderer.act(() => renderer.unmount());
   });
 
-  it('closes and blocks an active direct session in the background', async () => {
-    let appStateChange: ((state: AppStateStatus) => void) | null = null;
-    jest.spyOn(AppState, 'addEventListener').mockImplementation(
-      (_event, listener) => {
-        appStateChange = listener;
-        return { remove: jest.fn() };
-      },
-    );
+  it('keeps an active direct session mounted behind the privacy shield', async () => {
+    const emitAppState = mockAppStateChanges();
     const alert = jest.spyOn(Alert, 'alert').mockImplementation(jest.fn());
     const renderer = await renderApp();
     ReactTestRenderer.act(() =>
@@ -510,19 +581,367 @@ describe('App browser routing modes', () => {
     });
     const browser = renderer.root.findByProps({ testID: 'browser-screen' });
     expect(browser.props.mode).toBe('direct');
+    expect(
+      mockUseMasqController.mock.calls.some(([active]) => active === true),
+    ).toBe(true);
 
-    ReactTestRenderer.act(() => {
-      appStateChange?.('background');
+    await ReactTestRenderer.act(async () => {
+      emitAppState('background');
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
-    expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
+    expect(mockCloseBrowserSession).not.toHaveBeenCalled();
+    expect(renderer.root.findByProps({ testID: 'browser-screen' })).toBe(
+      browser,
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain('Unlock to continue');
+
+    await ReactTestRenderer.act(async () => {
+      emitAppState('active');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(renderer.root.findByProps({ testID: 'browser-screen' })).toBe(
+      browser,
+    );
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
+      'Unlock to continue',
+    );
+    expect(mockCloseBrowserSession).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('keeps an active MASQ browser mounted across background and resume', async () => {
+    const emitAppState = mockAppStateChanges();
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      phase: 'connected',
+      proxyEnabled: true,
+      proxyPort: 44_443,
+      routeHops: 2,
+      routeStage: 2,
+      walletAddress: '0x1234567890abcdef',
+    };
+    const renderer = await renderApp();
+
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const browser = renderer.root.findByProps({ testID: 'browser-screen' });
+    expect(browser.props.mode).toBe('masq');
+    expect(
+      mockUseMasqController.mock.calls.some(([active]) => active === true),
+    ).toBe(true);
+
+    await ReactTestRenderer.act(async () => {
+      emitAppState('inactive');
+      emitAppState('background');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockCloseBrowserSession).not.toHaveBeenCalled();
+    expect(renderer.root.findByProps({ testID: 'browser-screen' })).toBe(
+      browser,
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain('Unlock to continue');
+
+    await ReactTestRenderer.act(async () => {
+      emitAppState('active');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(renderer.root.findByProps({ testID: 'browser-screen' })).toBe(
+      browser,
+    );
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
+      'Unlock to continue',
+    );
+    expect(mockCloseBrowserSession).not.toHaveBeenCalled();
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('keeps the browser route closed to navigation until blocked is acknowledged', async () => {
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      phase: 'connected',
+      proxyEnabled: true,
+      proxyPort: 44_443,
+      routeHops: 2,
+      walletAddress: '0x1234567890abcdef',
+    };
+    const renderer = await renderApp();
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const browser = renderer.root.findByProps({ testID: 'browser-screen' });
+    const refreshCallsBeforeClose = mockController.refresh.mock.calls.length;
+    mockCloseBrowserSession.mockRejectedValueOnce(
+      new Error('Browser traffic could not be confirmed blocked.'),
+    );
+
+    await expect(browser.props.onClose()).rejects.toThrow(
+      'Browser traffic could not be confirmed blocked.',
+    );
+    expect(
+      renderer.root.findAllByProps({ testID: 'browser-screen' }),
+    ).not.toHaveLength(0);
+    expect(mockController.refresh).toHaveBeenCalledTimes(
+      refreshCallsBeforeClose,
+    );
+
+    await ReactTestRenderer.act(async () => {
+      await browser.props.onClose();
+    });
     expect(
       renderer.root.findAllByProps({ testID: 'browser-screen' }),
     ).toHaveLength(0);
-    const content = JSON.stringify(renderer.toJSON());
-    expect(content).toContain('direct browser was closed');
-    expect(content).not.toContain('private route was interrupted');
-    expect(content).not.toContain('Retry connection');
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('invalidates and fully settles a pending route repair before leaving the browser', async () => {
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      connectedNeighbors: 1,
+      engineAvailable: true,
+      phase: 'connected',
+      proxyEnabled: true,
+      proxyPort: 44_443,
+      routeHops: 2,
+      routeStage: 2,
+      walletAddress: '0x1234567890abcdef',
+    };
+    let resolveRepair!: () => void;
+    let repairIsCurrent!: () => boolean;
+    mockRepairPrivateBrowserRoute.mockImplementation(
+      (_core, _reconnect, isCurrent: () => boolean) => {
+        repairIsCurrent = isCurrent;
+        return new Promise<void>(resolve => {
+          resolveRepair = resolve;
+        });
+      },
+    );
+    const renderer = await renderApp();
+    await ReactTestRenderer.act(async () => {
+      findButton(renderer, 'Open private browser').props.onPress();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const browser = renderer.root.findByProps({ testID: 'browser-screen' });
+    const repair = browser.props.onRepairRoute();
+    await Promise.resolve();
+    expect(repairIsCurrent()).toBe(true);
+
+    let close!: Promise<void>;
+    ReactTestRenderer.act(() => {
+      close = browser.props.onClose();
+    });
+    await ReactTestRenderer.act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(repairIsCurrent()).toBe(false);
+    expect(mockCloseBrowserSession).toHaveBeenCalledTimes(1);
+    expect(
+      renderer.root.findAllByProps({ testID: 'browser-screen' }),
+    ).not.toHaveLength(0);
+
+    await ReactTestRenderer.act(async () => {
+      resolveRepair();
+      await repair;
+      await close;
+    });
+
+    expect(mockCloseBrowserSession).toHaveBeenCalledTimes(2);
+    expect(
+      renderer.root.findAllByProps({ testID: 'browser-screen' }),
+    ).toHaveLength(0);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('uses Android back for inner screens and preserves Home app exit', async () => {
+    (Platform as unknown as { OS: string }).OS = 'android';
+    mockController.status = {
+      ...EMPTY_STATUS,
+      chain: 'base-mainnet',
+      engineAvailable: true,
+      phase: 'ready',
+      walletAddress: '0x1234567890abcdef',
+    };
+    mockController.systemTunnel = {
+      ...UNSUPPORTED_SYSTEM_TUNNEL,
+      active: true,
+      mode: 'wholeDevice',
+      phase: 'active',
+      supported: true,
+      trafficDisposition: 'masq',
+    };
+    let hardwareBack:
+      | ((event: typeof HARDWARE_BACK_EVENT) => boolean | null | undefined)
+      | undefined;
+    const remove = jest.fn();
+    jest
+      .spyOn(BackHandler, 'addEventListener')
+      .mockImplementation((_event, listener) => {
+        hardwareBack = listener;
+        return { remove };
+      });
+    const renderer = await renderApp();
+
+    expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(false);
+
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Node & wallet settings').props.onPress(),
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain('Set up MASQ');
+    ReactTestRenderer.act(() => {
+      expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
+    });
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Node & wallet settings',
+    );
+
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'How MASQ handles data').props.onPress(),
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain('Privacy & legal');
+    ReactTestRenderer.act(() => {
+      expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
+    });
+
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Whole-device HTTPS route ready').props.onPress(),
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain('Traffic routing');
+    ReactTestRenderer.act(() => {
+      expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(true);
+    });
+    expect(hardwareBack?.(HARDWARE_BACK_EVENT)).toBe(false);
+
+    ReactTestRenderer.act(() => renderer.unmount());
+    expect(remove).toHaveBeenCalled();
+  });
+
+  it('does not capture defaults before the complete saved profile is ready', async () => {
+    const savedDraft = {
+      ...DEFAULT_SETUP,
+      rpcUrl: 'https://saved-profile.example',
+      neighbors: [
+        'masq://base-mainnet:key-one@198.51.100.10:443',
+        'masq://base-mainnet:key-two@198.51.100.11:443',
+      ],
+      minHops: 5,
+    };
+    mockController.busy = true;
+    mockController.profileReady = false;
+    mockController.initializationState = 'loading';
+    mockController.draft = DEFAULT_SETUP;
+    const renderer = await renderApp();
+
+    const settings = findButton(renderer, 'Node & wallet settings');
+    expect(settings.props.disabled).toBe(true);
+    expect(settings.props.accessibilityState).toEqual({ disabled: true });
+    expect(findButton(renderer, 'Browse without MASQ').props.disabled).toBe(
+      true,
+    );
+    expect(
+      renderer.root.findByProps({
+        accessibilityLabel: 'Loading saved Node and wallet profile',
+      }).props.disabled,
+    ).toBe(true);
+
+    ReactTestRenderer.act(() => settings.props.onPress());
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Set up MASQ');
+    expect(JSON.stringify(renderer.toJSON())).toContain(
+      'Node and wallet actions stay locked until the complete saved profile is available',
+    );
+
+    mockController.busy = false;
+    mockController.profileReady = true;
+    mockController.initializationState = 'ready';
+    mockController.draft = savedDraft;
+    await ReactTestRenderer.act(async () => {
+      renderer.update(<App />);
+      await Promise.resolve();
+    });
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Node & wallet settings').props.onPress(),
+    );
+
+    expect(JSON.stringify(renderer.toJSON())).toContain('Set up MASQ');
+    ReactTestRenderer.act(() =>
+      findButton(renderer, 'Advanced network settings').props.onPress(),
+    );
+    expect(
+      renderer.root
+        .findAllByType(TextInput)
+        .some(input => input.props.value === savedDraft.rpcUrl),
+    ).toBe(true);
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('offers an explicit retry after profile initialization fails', async () => {
+    mockController.profileReady = false;
+    mockController.initializationState = 'error';
+    const renderer = await renderApp();
+
+    const retry = findButton(renderer, 'Retry profile loading');
+    expect(retry.props.disabled).toBeFalsy();
+    ReactTestRenderer.act(() => retry.props.onPress());
+
+    expect(mockController.retryInitialization).toHaveBeenCalledTimes(1);
+    expect(findButton(renderer, 'Node & wallet settings').props.disabled).toBe(
+      true,
+    );
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
+  it('confirms wallet-preserving profile recovery while Direct Browse remains blocked', async () => {
+    mockController.profileReady = false;
+    mockController.initializationState = 'error';
+    mockController.profileRecoveryAvailable = true;
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(jest.fn());
+    const renderer = await renderApp();
+
+    expect(findButton(renderer, 'Browse without MASQ').props.disabled).toBe(
+      true,
+    );
+    ReactTestRenderer.act(() =>
+      findButton(
+        renderer,
+        'Reset network profile · keep wallet',
+      ).props.onPress(),
+    );
+
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0][0]).toBe('Reset invalid network profile?');
+    expect(alert.mock.calls[0][1]).toContain(
+      'consumer wallet remains on this device',
+    );
+    const reset = alert.mock.calls[0][2]?.find(
+      action => action.text === 'Reset network profile',
+    );
+    await ReactTestRenderer.act(async () => {
+      reset?.onPress?.();
+      await Promise.resolve();
+    });
+    expect(mockController.recoverNetworkProfile).toHaveBeenCalledTimes(1);
     ReactTestRenderer.act(() => renderer.unmount());
   });
 });
@@ -543,12 +962,23 @@ function findButton(
   const matches = renderer.root.findAll(
     node =>
       node.props.accessibilityRole === 'button' &&
-      node
-        .findAllByType(Text)
-        .some(text => text.props.children === label),
+      node.findAllByType(Text).some(text => text.props.children === label),
   );
   if (matches.length === 0) {
     throw new Error(JSON.stringify(renderer.toJSON()));
   }
   return matches[0];
+}
+
+function mockAppStateChanges() {
+  const listeners = new Set<(state: AppStateStatus) => void>();
+  jest
+    .spyOn(AppState, 'addEventListener')
+    .mockImplementation((_event, listener) => {
+      listeners.add(listener);
+      return { remove: () => listeners.delete(listener) };
+    });
+  return (state: AppStateStatus) => {
+    [...listeners].forEach(listener => listener(state));
+  };
 }

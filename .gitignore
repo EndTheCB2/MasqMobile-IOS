@@ -5,6 +5,19 @@
 **/node_modules/
 **/Pods/
 **/vendor/
+# Local signed APKs, screenshots, and release audit output are never source.
+masq-mobile/release-artifacts/
+# The packet tunnel pins small audited tun2proxy and ipstack forks with
+# MASQ-specific fail-closed policy, stream-reset, and accounting fixes.
+!masq-mobile/native/masq-packet-tunnel/vendor/
+!masq-mobile/native/masq-packet-tunnel/vendor/ipstack/
+!masq-mobile/native/masq-packet-tunnel/vendor/ipstack/**
+# crates.io packaging markers and upstream-only workflows are not runtime source.
+masq-mobile/native/masq-packet-tunnel/vendor/ipstack/.cargo-ok
+masq-mobile/native/masq-packet-tunnel/vendor/ipstack/.cargo_vcs_info.json
+masq-mobile/native/masq-packet-tunnel/vendor/ipstack/.github/
+!masq-mobile/native/masq-packet-tunnel/vendor/tun2proxy/
+!masq-mobile/native/masq-packet-tunnel/vendor/tun2proxy/**
 # The legacy web3 fork contains the iOS CFStream connector required by MASQ Mobile.
 !masq-node-mobile/vendor/
 !masq-node-mobile/vendor/web3-0.11.0/

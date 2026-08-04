@@ -52,6 +52,11 @@ impl Future for StreamReaderReal {
                 }
                 Ok(Async::Ready(length)) => {
                     consecutive_read_errors = 0;
+                    if self.is_clandestine && length > 0 {
+                        crate::mobile_runtime::report_entry_handshake_milestone(
+                            crate::mobile_runtime::EntryHandshakeMilestone::InboundBytesReceived,
+                        );
+                    }
                     debug!(
                         self.logger,
                         "Read {}-byte chunk; local and peer addresses redacted", length

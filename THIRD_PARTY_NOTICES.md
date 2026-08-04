@@ -3,8 +3,11 @@
 MASQ Mobile contains adapted MASQ Node source under GPL-3.0-only. See `LICENSE`,
 `masq-node-mobile/LICENSE`, and `MODIFICATIONS.md`.
 
-The Android packet adapter uses `tun2proxy` 0.8.2 under its MIT licence. Its exact transitive Rust
-dependency set is recorded in `masq-mobile/native/masq-packet-tunnel/Cargo.lock`.
+The Android packet adapter uses a modified `tun2proxy` 0.8.2 under its MIT licence and a modified
+`ipstack` 1.0.1 under Apache-2.0. Their upstream licences and detailed modification notices are
+retained in `masq-mobile/native/masq-packet-tunnel/vendor/tun2proxy/{LICENSE,MASQ_PATCHES.md}` and
+`masq-mobile/native/masq-packet-tunnel/vendor/ipstack/{LICENSE,MASQ_PATCHES.md}`. The exact
+transitive Rust dependency set is recorded in `masq-mobile/native/masq-packet-tunnel/Cargo.lock`.
 
 MASQ Node uses a vendored `web3` 0.11.0 source copy under the MIT licence, patched with an iOS
 CFStream socket connector. The upstream notice is retained in

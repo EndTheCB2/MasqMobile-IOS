@@ -14,11 +14,19 @@ import {
   type BrowserSiteSettings,
 } from './browserSiteSettings';
 import {
+  DEFAULT_BROWSER_SEARCH_PROVIDER,
+  type BrowserSearchProvider,
+} from './browserInput';
+import {
   EMPTY_STATUS,
   type CoreStatus,
+  type DebtSettlementQuote,
+  type DebtSettlementStatus,
+  type DebtSummary,
   type MasqConfig,
   type NetworkStatus,
 } from './types';
+import { isValidSavedConfig } from './config';
 import {
   decodeRoutableApps,
   decodeSystemTunnelStatus,
@@ -28,6 +36,48 @@ import {
 } from './systemTunnel';
 
 export type BrowserRoutingMode = 'blocked' | 'masq' | 'direct';
+
+export const SAVED_PROFILE_ERROR_CODE = 'E_SAVED_CONFIG_INVALID';
+
+export class SavedProfileError extends Error {
+  readonly code = SAVED_PROFILE_ERROR_CODE;
+
+  constructor(message = 'The saved MASQ configuration is invalid.') {
+    super(message);
+    this.name = 'SavedProfileError';
+  }
+}
+
+export function isSavedProfileError(caught: unknown): boolean {
+  if (caught instanceof SavedProfileError) {
+    return true;
+  }
+  if (!caught || typeof caught !== 'object') {
+    return false;
+  }
+  const code = (caught as { code?: unknown }).code;
+  return code === 'E_SAVED_CONFIG' || code === SAVED_PROFILE_ERROR_CODE;
+}
+
+export function decodeSavedConfiguration(
+  serialized: string,
+): MasqConfig | null {
+  if (serialized === 'null') {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (!isSavedConfig(parsed)) {
+      throw new SavedProfileError();
+    }
+    return parsed;
+  } catch (caught) {
+    if (caught instanceof SavedProfileError) {
+      throw caught;
+    }
+    throw new SavedProfileError();
+  }
+}
 
 export interface MasqCore {
   getStatus(): Promise<CoreStatus>;
@@ -44,6 +94,15 @@ export interface MasqCore {
   resetNetworkProfile(): Promise<CoreStatus>;
   removeWallet(): Promise<CoreStatus>;
   preflightBrowserProxy(): Promise<CoreStatus>;
+  getDebtSummary(): Promise<DebtSummary>;
+  prepareDebtSettlement(): Promise<DebtSettlementQuote>;
+  confirmDebtSettlement(
+    quoteId: string,
+    maximumMasqWei: string,
+    maximumEstimatedL2FeeWei: string,
+  ): Promise<DebtSettlementStatus>;
+  retryDebtSettlement(): Promise<DebtSettlementStatus>;
+  getDebtSettlementStatus(): Promise<DebtSettlementStatus>;
   getSystemTunnelStatus(): Promise<SystemTunnelStatus>;
   getRoutableApps(): Promise<RoutableApp[]>;
   setSystemTunnel(
@@ -54,6 +113,10 @@ export interface MasqCore {
   setBrowserProtection(
     preferences: BrowserProtectionPreferences,
   ): Promise<BrowserProtectionConfiguration>;
+  getBrowserSearchProvider(): Promise<BrowserSearchProvider>;
+  setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider>;
   setBrowserRoutingMode(mode: BrowserRoutingMode): Promise<BrowserRoutingMode>;
   getBrowserSiteSettings(
     mode: BrowserSiteMode,
@@ -86,15 +149,16 @@ class NativeCore implements MasqCore {
   }
 
   async getSavedConfiguration(): Promise<MasqConfig | null> {
-    const serialized = await NativeMasqCore!.getSavedConfiguration();
-    if (serialized === 'null') {
-      return null;
+    let serialized: string;
+    try {
+      serialized = await NativeMasqCore!.getSavedConfiguration();
+    } catch (caught) {
+      if (isSavedProfileError(caught)) {
+        throw new SavedProfileError();
+      }
+      throw caught;
     }
-    const parsed: unknown = JSON.parse(serialized);
-    if (!isSavedConfig(parsed)) {
-      throw new Error('The saved MASQ configuration is invalid.');
-    }
-    return parsed;
+    return decodeSavedConfiguration(serialized);
   }
 
   async configure(config: MasqConfig): Promise<CoreStatus> {
@@ -141,6 +205,42 @@ class NativeCore implements MasqCore {
     return decodeOperationStatus(await NativeMasqCore!.preflightBrowserProxy());
   }
 
+  async getDebtSummary(): Promise<DebtSummary> {
+    return decodeDebtSummary(await NativeMasqCore!.getDebtSummary());
+  }
+
+  async prepareDebtSettlement(): Promise<DebtSettlementQuote> {
+    return decodeDebtSettlementQuote(
+      await NativeMasqCore!.prepareDebtSettlement(),
+    );
+  }
+
+  async confirmDebtSettlement(
+    quoteId: string,
+    maximumMasqWei: string,
+    maximumEstimatedL2FeeWei: string,
+  ): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.confirmDebtSettlement(
+        quoteId,
+        maximumMasqWei,
+        maximumEstimatedL2FeeWei,
+      ),
+    );
+  }
+
+  async getDebtSettlementStatus(): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.getDebtSettlementStatus(),
+    );
+  }
+
+  async retryDebtSettlement(): Promise<DebtSettlementStatus> {
+    return decodeDebtSettlementStatus(
+      await NativeMasqCore!.retryDebtSettlement(),
+    );
+  }
+
   async getSystemTunnelStatus(): Promise<SystemTunnelStatus> {
     return decodeSystemTunnelStatus(
       await NativeMasqCore!.getSystemTunnelStatus(),
@@ -173,6 +273,21 @@ class NativeCore implements MasqCore {
       await NativeMasqCore!.setBrowserProtection(
         encodeBrowserProtectionPreferences(preferences),
       ),
+    );
+  }
+
+  async getBrowserSearchProvider(): Promise<BrowserSearchProvider> {
+    return decodeBrowserSearchProvider(
+      await NativeMasqCore!.getBrowserSearchProvider(),
+    );
+  }
+
+  async setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider> {
+    const requested = decodeBrowserSearchProvider(provider);
+    return decodeBrowserSearchProvider(
+      await NativeMasqCore!.setBrowserSearchProvider(requested),
     );
   }
 
@@ -227,6 +342,8 @@ class NativeCore implements MasqCore {
 }
 
 class MissingNativeCore implements MasqCore {
+  private browserSearchProvider: BrowserSearchProvider =
+    DEFAULT_BROWSER_SEARCH_PROVIDER;
   private status: CoreStatus = {
     ...EMPTY_STATUS,
     phase: 'blocked',
@@ -286,6 +403,7 @@ class MissingNativeCore implements MasqCore {
 
   async reset(): Promise<CoreStatus> {
     this.status = { ...EMPTY_STATUS };
+    this.browserSearchProvider = DEFAULT_BROWSER_SEARCH_PROVIDER;
     return this.status;
   }
 
@@ -305,6 +423,26 @@ class MissingNativeCore implements MasqCore {
 
   async preflightBrowserProxy(): Promise<CoreStatus> {
     return this.status;
+  }
+
+  async getDebtSummary(): Promise<DebtSummary> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async prepareDebtSettlement(): Promise<DebtSettlementQuote> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async confirmDebtSettlement(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async getDebtSettlementStatus(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
+  }
+
+  async retryDebtSettlement(): Promise<DebtSettlementStatus> {
+    throw new Error('The native MASQ accounting core is unavailable.');
   }
 
   async getSystemTunnelStatus(): Promise<SystemTunnelStatus> {
@@ -342,6 +480,17 @@ class MissingNativeCore implements MasqCore {
       rejectOptionalCookies: preferences.rejectOptionalCookies,
       youtubeBestEffort: false,
     };
+  }
+
+  async getBrowserSearchProvider(): Promise<BrowserSearchProvider> {
+    return this.browserSearchProvider;
+  }
+
+  async setBrowserSearchProvider(
+    provider: BrowserSearchProvider,
+  ): Promise<BrowserSearchProvider> {
+    this.browserSearchProvider = decodeBrowserSearchProvider(provider);
+    return this.browserSearchProvider;
   }
 
   async setBrowserRoutingMode(
@@ -415,6 +564,115 @@ function decodeBrowserRoutingMode(serialized: string): BrowserRoutingMode {
   return serialized;
 }
 
+export function decodeBrowserSearchProvider(
+  serialized: string,
+): BrowserSearchProvider {
+  if (serialized !== 'timpi' && serialized !== 'duckduckgo') {
+    throw new Error(
+      'The native core returned an invalid browser search provider.',
+    );
+  }
+  return serialized;
+}
+
+function isWeiString(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9]{1,39}$/.test(value);
+}
+
+function isSafeCount(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+export function decodeDebtSummary(serialized: string): DebtSummary {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid MASQ debt summary.');
+  }
+  const summary = parsed as Partial<DebtSummary>;
+  if (
+    !isWeiString(summary.totalMasqWei) ||
+    !isSafeCount(summary.creditorCount) ||
+    typeof summary.settlementInProgress !== 'boolean'
+  ) {
+    throw new Error('The native core returned an invalid MASQ debt summary.');
+  }
+  return summary as DebtSummary;
+}
+
+export function decodeDebtSettlementQuote(
+  serialized: string,
+): DebtSettlementQuote {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid settlement quote.');
+  }
+  const quote = parsed as Partial<DebtSettlementQuote>;
+  if (
+    typeof quote.quoteId !== 'string' ||
+    !/^[0-9a-f]{32}$/.test(quote.quoteId) ||
+    !isSafeCount(quote.createdAtUnixSeconds) ||
+    !isSafeCount(quote.expiresAtUnixSeconds) ||
+    quote.expiresAtUnixSeconds <= quote.createdAtUnixSeconds ||
+    !isWeiString(quote.totalMasqWei) ||
+    !isWeiString(quote.estimatedL2FeeWei) ||
+    !isWeiString(quote.masqBalanceWei) ||
+    !isWeiString(quote.baseEthBalanceWei) ||
+    !isSafeCount(quote.creditorCount) ||
+    quote.creditorCount < 1 ||
+    quote.creditorCount > 20 ||
+    typeof quote.hasMoreCreditors !== 'boolean' ||
+    quote.feeEstimateIncludesL1DataFee !== false ||
+    quote.requiresDeviceAuthentication !== false ||
+    quote.requiresExplicitConfirmation !== true
+  ) {
+    throw new Error('The native core returned an invalid settlement quote.');
+  }
+  return quote as DebtSettlementQuote;
+}
+
+export function decodeDebtSettlementStatus(
+  serialized: string,
+): DebtSettlementStatus {
+  const parsed: unknown = JSON.parse(serialized);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('The native core returned an invalid settlement status.');
+  }
+  const status = parsed as Partial<DebtSettlementStatus>;
+  const phases = [
+    'idle',
+    'reserved',
+    'submitted',
+    'attention',
+    'failed',
+    'completed',
+  ];
+  if (
+    (typeof status.operationId !== 'string' && status.operationId !== null) ||
+    (typeof status.operationId === 'string' &&
+      !/^[0-9a-f]{32}$/.test(status.operationId)) ||
+    typeof status.phase !== 'string' ||
+    !phases.includes(status.phase) ||
+    !isWeiString(status.totalMasqWei) ||
+    !isWeiString(status.estimatedL2FeeWei) ||
+    !isSafeCount(status.transactionCount) ||
+    !isSafeCount(status.confirmedTransactionCount) ||
+    status.confirmedTransactionCount > status.transactionCount ||
+    !Array.isArray(status.transactionHashes) ||
+    status.transactionHashes.length !== status.transactionCount ||
+    !status.transactionHashes.every(
+      hash => typeof hash === 'string' && /^0x[0-9a-f]{64}$/.test(hash),
+    ) ||
+    (typeof status.errorCode !== 'string' && status.errorCode !== null)
+  ) {
+    throw new Error('The native core returned an invalid settlement status.');
+  }
+  return status as DebtSettlementStatus;
+}
+
 function decodeStatus(serialized: string): CoreStatus {
   const parsed: unknown = JSON.parse(serialized);
   if (!isCoreStatus(parsed)) {
@@ -441,6 +699,9 @@ function isCoreStatus(value: unknown): value is CoreStatus {
   return (
     typeof status.phase === 'string' &&
     typeof status.engineAvailable === 'boolean' &&
+    typeof status.engineGeneration === 'number' &&
+    Number.isSafeInteger(status.engineGeneration) &&
+    status.engineGeneration >= 0 &&
     typeof status.proxyEnabled === 'boolean' &&
     (typeof status.proxyPort === 'number' || status.proxyPort === null) &&
     (typeof status.chain === 'string' || status.chain === null) &&
@@ -467,7 +728,7 @@ function isSavedConfig(value: unknown): value is MasqConfig {
     return false;
   }
   const config = value as Partial<MasqConfig>;
-  return (
+  if (
     typeof config.configVersion === 'number' &&
     (config.chain === 'base-mainnet' || config.chain === 'base-sepolia') &&
     typeof config.rpcUrl === 'string' &&
@@ -476,7 +737,10 @@ function isSavedConfig(value: unknown): value is MasqConfig {
     typeof config.minHops === 'number' &&
     (typeof config.exitCountry === 'string' || config.exitCountry === null) &&
     typeof config.exitCountryFallback === 'boolean'
-  );
+  ) {
+    return isValidSavedConfig(config as MasqConfig);
+  }
+  return false;
 }
 
 function decodeNetworkStatus(serialized: string): NetworkStatus {

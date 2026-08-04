@@ -1,6 +1,6 @@
 # MASQ Mobile Privacy Policy
 
-Effective: 27 July 2026
+Effective: 3 August 2026
 
 MASQ Mobile is an independent, open-source, consume-only client. It is not an official release of
 the MASQ Project. This direct-download preview is maintained and distributed through the
@@ -13,10 +13,11 @@ responsible for complying with local law.
 The app has no maintainer-operated account, advertising SDK, analytics SDK or cross-app tracking.
 It does not sell personal data. It stores the consumer wallet secret and network profile on the
 device. Using MASQ sends data to a blockchain RPC, a node-finder, MASQ peers and the websites the
-user chooses to visit. Free-text browser searches are sent to Timpi Search, while explicit
-normalized `.eth` addresses are loaded through the independent eth.limo HTTPS gateway. Direct
-browsing instead uses the device's normal internet connection. Those independent services may
-process or retain network data under their own policies.
+user chooses to visit. Free-text browser searches are sent to the user-selected Timpi or
+DuckDuckGo search website, while explicit normalized `.eth` addresses are loaded through the
+independent eth.limo HTTPS gateway. Direct browsing instead uses the device's normal internet
+connection. Those independent services may process or retain network data under their own
+policies.
 
 ## Data stored on the device
 
@@ -87,6 +88,36 @@ the page is blocked rather than loaded through the device's direct connection. A
 switches the browser to direct networking. The public iOS build does not claim to protect traffic
 from other apps.
 
+### Android system-routing dogfood
+
+Whole-device and selected-app routing are available only in a separately compiled Android
+**MASQ Dogfood (Unsafe)** package, not in the public preview. When the user explicitly selects
+apps, their Android package IDs and the consent timestamp are stored only in that dogfood app's
+private local preferences; they are not sent to the maintainer. Android applies VPN inclusion by
+UID, so apps that share a UID can share routing behavior, attached restricted profiles may also
+receive the scope, and a work-profile copy belongs to a separate Android user/profile scope. MASQ
+packages installed when the route is established are excluded so their Node/control traffic and
+explicit Direct browsers do not loop through that TUN.
+
+This internal adapter translates only captured IPv4 TCP connections to port 443 and virtual DNS
+through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and
+unknown transports—remains blocked only while Android still reports a valid TUN capture. Activation
+opens a real HTTP CONNECT tunnel to `example.com:443` through the current MASQ exit as a reachability
+test; it does not request a page or response body. Android snapshots package-to-UID inclusion and
+exclusion when the TUN is established. Turn routing off before installing, removing, enabling,
+disabling or updating apps, then reapply it; otherwise the saved selection/exclusion may no longer
+match the running UID scope. On Android 13 or later, activation is refused unless notification
+permission is granted so the ongoing unsafe-routing state remains visible; turning routing off
+does not require that permission.
+
+Revoking VPN permission, or termination of the service or app process, can restore direct
+networking; the dogfood build is not a fail-closed VPN guarantee. Android Always-on VPN and “Block
+connections without VPN”/lockdown mode are unsupported. The local loopback MASQ proxy is
+unauthenticated; a malicious local app that discovers its temporary port could use the route and
+consume wallet funds. This dogfood mode must not be represented as protecting all traffic and must
+not be publicly distributed until package-change recovery and per-run local proxy authentication
+or peer-UID enforcement are implemented.
+
 ### Direct browsing
 
 **Browse without MASQ** is a separate action that requires an explicit confirmation for every
@@ -98,23 +129,34 @@ including connection destinations where applicable. HTTPS encrypts request and r
 in transit, but does not hide the public IP addresses or all destination metadata. The user must
 reconnect before opening **MASQ Private** again.
 
-The selected browser routing mode is not stored. Closing the browser or moving the app to the
-background returns the native browser network state to blocked. Local browser-protection rules can
-still filter recognized resources in direct mode, but filtering does not hide the public IP
-address or provide MASQ routing.
+The selected browser routing mode is not persisted as a new default. During a temporary app switch,
+the active page remains mounted behind a privacy shield and retains the exact MASQ Private or
+Direct route that the user selected. The hidden page can continue network activity, for example
+while an external sign-in confirmation completes. Explicitly closing the browser returns the native
+browser network state to blocked. The operating system can still evict the app and lose the page.
+Local browser-protection rules can filter recognized resources in direct mode, but filtering does
+not hide the public IP address or provide MASQ routing.
 
-### Timpi Search
+### Search providers
 
-When browser input is not recognized as a public web address, the app opens the public Timpi Search
-website with that input as the search query. In **MASQ Private**, the request follows the selected
-MASQ route and Timpi sees the exit node's IP address. In **Direct**, Timpi sees the public IP used by
-the device's current connection or VPN. MASQ Mobile does not call Timpi's private data API and does
-not separately log, synchronize or send the query to the maintainer.
+The user can select Timpi or DuckDuckGo as the provider for input that is not recognized as a public
+web address. The app stores the provider choice locally, but does not store or synchronize search
+queries or search history. It opens the selected provider's public search website with the input as
+the query. In **MASQ Private**, the request follows the selected MASQ route and the provider sees the
+exit node's IP address. In **Direct**, the provider sees the public IP used by the device's current
+connection or VPN. MASQ Mobile does not call a private search API and does not separately log,
+synchronize or send the query to the maintainer.
 
 Timpi is an independent service. Its published privacy policy states that it may process search
 queries, country-level location, temporary IP data, server-log information and information used for
 advertising. Its current terms and retention practices are controlled by Timpi:
 [Timpi privacy policy](https://timpi.io/wp-content/uploads/2025/07/Timpi-International-Ltd-Privacy-Policy.pdf).
+
+DuckDuckGo is also an independent service. Its published policy states that it does not save or
+share search or browsing history, while requests can still provide temporary technical data such as
+an IP address, browser type and language to deliver and secure the service. Its current terms and
+practices are controlled by DuckDuckGo:
+[DuckDuckGo privacy policy](https://duckduckgo.com/privacy).
 
 ### ENS websites
 

@@ -85,6 +85,24 @@ export function validateConfig(
   return errors;
 }
 
+export function isValidSavedConfig(config: MasqConfig): boolean {
+  if (
+    config.configVersion !== 2 ||
+    config.rpcUrl !== config.rpcUrl.trim() ||
+    config.neighbors.some(node => node !== node.trim())
+  ) {
+    return false;
+  }
+  const draft: SetupDraft = {
+    ...config,
+    walletImportMode: 'seedPhrase',
+    walletSecret: '',
+  };
+  return Object.keys(
+    validateConfig(draft, { walletRequired: false }),
+  ).length === 0;
+}
+
 export function normalizeWalletSecret(draft: SetupDraft): string {
   if (draft.walletImportMode === 'seedPhrase') {
     return draft.walletSecret

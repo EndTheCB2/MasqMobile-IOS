@@ -22,6 +22,9 @@ areas:
   and Android top-frame non-GET requests blocked fail-closed;
 - experimental Android `VpnService` and Rust packet-translator foundations kept behind a public
   safety gate, with Always-on VPN disabled until lifecycle and leak testing is complete; and
+- serialized Android native connection cancellation that invalidates stale discovery/start work;
+  fail-closed browser shutdown that removes the WebView until native routing confirms `blocked`;
+  and Android Back navigation that stays inside browser history before closing; and
 - iOS/Android build scripts, tests, diagnostics, and fail-closed security controls, including
   Android NDK-only native archiving and final-APK ELF linkage verification.
 
