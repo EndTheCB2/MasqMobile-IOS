@@ -14,7 +14,9 @@ acceptance. Do not upload a binary until every **release gate** below has writte
   Obtain qualified legal review or additional permission covering App Store terms, code signing and
   device restrictions. Preserve the exact corresponding source for every submitted binary.
 - **Token-funded routes:** obtain a documented App Review/product decision on MASQ-token payments
-  for digital routing functionality. Do not conceal this mechanism in review notes.
+  for digital routing functionality. Review notes must disclose that the embedded Node can
+  automatically spend MASQ plus Base ETH fees, without another prompt, after an individual
+  creditor balance reaches approximately 0.01 MASQ and is more than 20 minutes old.
 - **Production services:** obtain written confirmation of the production node-finder operator,
   availability, retention policy and support contact. `dev2.api.masq.ai` is not treated as a
   production endpoint by the archive workflow unless explicitly approved.

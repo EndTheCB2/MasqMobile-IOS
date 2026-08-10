@@ -3,10 +3,19 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::config::MobileConfig;
 use crate::wallet::WalletMaterial;
+
+const MOBILE_AUTO_PAYMENT_TRIGGER_GWEI: u64 = 10_000_000;
+// The MASQ payable scanner compares balances strictly with `>`. Keeping the permanent floor
+// one gwei below the nominal trigger makes exactly 0.01 MASQ eligible. It also creates a
+// sub-gwei compatibility band below the nominal trigger, which the UI discloses as approximate.
+const MOBILE_AUTO_PAYMENT_FLOOR_GWEI: u64 = MOBILE_AUTO_PAYMENT_TRIGGER_GWEI - 1;
+const MOBILE_PAYMENT_MATURITY_SEC: u64 = 1_200;
+const MOBILE_PAYMENT_GRACE_PERIOD_SEC: u64 = 1_200;
+const MOBILE_PAYMENT_THRESHOLD_INTERVAL_SEC: u64 = 21_600;
 
 pub struct EngineHandle {
     thread: Option<JoinHandle<i32>>,
@@ -47,30 +56,13 @@ impl EngineHandle {
 
         let (proxy_port, ui_port) = reserve_loopback_ports()?;
         let private_key = wallet.private_key_hex();
-        let mut args = vec![
-            "MASQNode".to_owned(),
-            "--mobile-proxy-port".to_owned(),
-            proxy_port.to_string(),
-            "--ui-port".to_owned(),
-            ui_port.to_string(),
-            "--neighborhood-mode".to_owned(),
-            "consume-only".to_owned(),
-            "--chain".to_owned(),
-            config.chain.identifier().to_owned(),
-            "--blockchain-service-url".to_owned(),
-            config.rpc_url.clone(),
-            "--neighbors".to_owned(),
-            config.neighbors.join(","),
-            "--consuming-private-key".to_owned(),
-            private_key.to_string(),
-            "--data-directory".to_owned(),
-            data_directory.to_owned(),
-            "--log-level".to_owned(),
-            "warn".to_owned(),
-            "--min-hops".to_owned(),
-            config.min_hops.to_string(),
-        ];
-        let secret_argument_index = 14;
+        let args = embedded_node_arguments(
+            config,
+            proxy_port,
+            ui_port,
+            data_directory,
+            private_key.as_str(),
+        );
 
         // Reset observable state before the thread is scheduled so a fast status poll can never
         // mistake the previous run's clean exit for a failure of this new run.
@@ -81,11 +73,7 @@ impl EngineHandle {
         );
         let thread = thread::Builder::new()
             .name("masq-node-consumer".to_owned())
-            .spawn(move || {
-                let exit_code = node_lib::mobile_runtime::run_embedded(&args);
-                args[secret_argument_index].zeroize();
-                exit_code
-            })
+            .spawn(move || node_lib::mobile_runtime::run_embedded(args.as_slice()))
             .map_err(|_| "The MASQ Node thread could not be started.".to_owned())?;
 
         Ok(Self {
@@ -244,6 +232,52 @@ impl Drop for EngineHandle {
     }
 }
 
+fn embedded_node_arguments(
+    config: &MobileConfig,
+    proxy_port: u16,
+    ui_port: u16,
+    data_directory: &str,
+    private_key: &str,
+) -> Zeroizing<Vec<String>> {
+    Zeroizing::new(vec![
+        "MASQNode".to_owned(),
+        "--mobile-proxy-port".to_owned(),
+        proxy_port.to_string(),
+        "--ui-port".to_owned(),
+        ui_port.to_string(),
+        "--neighborhood-mode".to_owned(),
+        "consume-only".to_owned(),
+        "--chain".to_owned(),
+        config.chain.identifier().to_owned(),
+        "--blockchain-service-url".to_owned(),
+        config.rpc_url.clone(),
+        "--neighbors".to_owned(),
+        config.neighbors.join(","),
+        "--consuming-private-key".to_owned(),
+        private_key.to_owned(),
+        "--data-directory".to_owned(),
+        data_directory.to_owned(),
+        "--log-level".to_owned(),
+        "warn".to_owned(),
+        "--min-hops".to_owned(),
+        config.min_hops.to_string(),
+        "--payment-thresholds".to_owned(),
+        mobile_payment_thresholds_argument(),
+    ])
+}
+
+fn mobile_payment_thresholds_argument() -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        MOBILE_AUTO_PAYMENT_TRIGGER_GWEI,
+        MOBILE_PAYMENT_MATURITY_SEC,
+        MOBILE_PAYMENT_GRACE_PERIOD_SEC,
+        MOBILE_AUTO_PAYMENT_FLOOR_GWEI,
+        MOBILE_PAYMENT_THRESHOLD_INTERVAL_SEC,
+        MOBILE_AUTO_PAYMENT_FLOOR_GWEI,
+    )
+}
+
 fn reserve_loopback_ports() -> Result<(u16, u16), String> {
     let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|_| "No free local proxy port is available.".to_owned())?;
@@ -265,7 +299,77 @@ fn reserve_loopback_ports() -> Result<(u16, u16), String> {
 mod tests {
     use super::*;
     use crate::config::Chain;
+    use node_lib::accountant::db_access_objects::utils::ThresholdUtils;
+    use node_lib::accountant::scanners::payable_scanner::utils::{
+        PayableThresholdsGauge, PayableThresholdsGaugeReal,
+    };
+    use node_lib::sub_lib::accountant::PaymentThresholds;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn argument_test_config() -> MobileConfig {
+        MobileConfig {
+            chain: Chain::BaseSepolia,
+            rpc_url: "https://sepolia.base.org".to_owned(),
+            neighbors: vec!["masq://test-neighbor".to_owned()],
+            min_hops: 2,
+            exit_country: None,
+            exit_country_fallback: true,
+            data_directory: Some("/private/test-data".to_owned()),
+        }
+    }
+
+    #[test]
+    fn embedded_arguments_apply_the_mobile_threshold_without_moving_the_secret() {
+        let args = embedded_node_arguments(
+            &argument_test_config(),
+            12_345,
+            23_456,
+            "/private/test-data",
+            "secret",
+        );
+        let threshold_positions = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == "--payment-thresholds").then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(threshold_positions, vec![21]);
+        assert_eq!(
+            args[threshold_positions[0] + 1],
+            "10000000|1200|1200|9999999|21600|9999999"
+        );
+        assert_eq!(args[13], "--consuming-private-key");
+        assert_eq!(args[14], "secret");
+    }
+
+    #[test]
+    fn automatic_payment_threshold_approximates_one_hundredth_masq_within_one_gwei() {
+        let encoded = mobile_payment_thresholds_argument();
+        let thresholds = PaymentThresholds::try_from(encoded.as_str()).unwrap();
+
+        assert_eq!(encoded, "10000000|1200|1200|9999999|21600|9999999");
+        assert_eq!(thresholds.debt_threshold_gwei, 10_000_000);
+        assert_eq!(thresholds.permanent_debt_allowed_gwei, 9_999_999);
+
+        let gauge = PayableThresholdsGaugeReal::default();
+        let exact_trigger_wei = 10_000_000_u128 * 1_000_000_000_u128;
+        let one_wei_below_trigger = exact_trigger_wei - 1;
+        let permanent_floor_wei = 9_999_999_u128 * 1_000_000_000_u128;
+        assert!(gauge.is_innocent_age(1_200, thresholds.maturity_threshold_sec));
+        assert!(!gauge.is_innocent_age(1_201, thresholds.maturity_threshold_sec));
+        assert!(gauge.is_innocent_balance(permanent_floor_wei, permanent_floor_wei));
+        assert!(!gauge.is_innocent_balance(exact_trigger_wei, permanent_floor_wei));
+
+        let threshold_after_maturity =
+            ThresholdUtils::calculate_finite_debt_limit_by_age(&thresholds, 1_201);
+        assert!(exact_trigger_wei > threshold_after_maturity);
+        // The upstream scanner uses strict `>` comparisons while its configuration is expressed
+        // in whole gwei. A one-gwei compatibility band is therefore unavoidable without changing
+        // the official accounting algorithm: after maturity, some wei amounts immediately below
+        // 0.01 MASQ can qualify, but the permanent floor remains less than one gwei lower.
+        assert!(one_wei_below_trigger > threshold_after_maturity);
+        assert!(threshold_after_maturity > permanent_floor_wei);
+    }
 
     #[test]
     #[ignore = "opens loopback listeners for the embedded MASQ actor system"]

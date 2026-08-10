@@ -37,8 +37,8 @@ export function PrivacyScreen({
           text="Your recovery phrase or private key is stored in device-bound secure storage. It is removed only when you choose Remove wallet or Reset everything. Never send recovery words to support."
         />
         <Disclosure
-          title="Debt settlement is an explicit blockchain action"
-          text="Review MASQ debts shows the amount, creditor count and an estimated Base L2 fee before anything is signed. No device code or biometric check is used: tapping Settle now is the final confirmation. The wallet signs locally, but submitted transaction hashes, wallet addresses, token transfers and fees are public on Base. The displayed estimate excludes Base's variable L1 data fee, so the final fee can be higher. An uncertain submission is never retried automatically."
+          title="Automatic and early MASQ payments"
+          text="The embedded Node automatically signs and submits the full balance owed to an individual creditor after that balance reaches approximately 0.01 MASQ and is more than 20 minutes old; eligible debts are normally checked about every 10 minutes. Automatic payments spend MASQ and Base ETH fees without another prompt. Review MASQ debts can settle earlier: it shows the aggregate amount, creditor count and estimated Base L2 fee before tapping Settle now provides the final confirmation. Submitted transaction hashes, wallet addresses, token transfers and fees are public on Base. The displayed estimate excludes Base's variable L1 data fee, so the final fee can be higher. A manual submission with an ambiguous RPC response is not rebroadcast automatically by the manual-settlement flow."
         />
         <Disclosure
           title="MASQ Private is fail-closed"

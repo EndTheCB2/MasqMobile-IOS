@@ -412,7 +412,7 @@ describe('Android native MASQ core integration', () => {
     expect(gradle).toContain('if (unsafeSystemRoutingDogfoodEnabled) {');
     expect(gradle).toContain('applicationIdSuffix ".dogfood"');
     expect(gradle).toContain('versionNameSuffix "-dogfood"');
-    expect(gradle).toContain('versionCode 6021');
+    expect(gradle).toContain('versionCode 6022');
     expect(gradle).toContain(
       'manifestPlaceholders = [masqAppLabel: applicationLabelResource]',
     );

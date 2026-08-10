@@ -655,6 +655,12 @@ describe('HomeScreen connection controls', () => {
       );
     });
 
+    const automaticPaymentCopy = JSON.stringify(renderer.toJSON());
+    expect(automaticPaymentCopy).toContain('approximately 0.01 MASQ per');
+    expect(automaticPaymentCopy).toContain('Base ETH fees');
+    expect(automaticPaymentCopy).toContain('without another');
+    expect(automaticPaymentCopy).toContain('The total above is aggregate');
+
     const reviewButton = renderer.root.find(
       node =>
         node.props.accessibilityRole === 'button' &&

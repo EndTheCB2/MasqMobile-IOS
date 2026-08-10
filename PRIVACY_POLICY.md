@@ -67,6 +67,21 @@ Mainnet and the public [PublicNode Base Sepolia endpoint](https://base-sepolia.p
 Base Sepolia. These are independent services whose availability, privacy and retention practices
 are controlled by their operators. A user-selected RPC is governed by its own operator.
 
+### MASQ debt payments
+
+Paid routing creates a separate payable balance for each creditor Node. When one creditor balance
+reaches approximately 0.01 MASQ and is more than 20 minutes old, the embedded Node can
+automatically sign and submit the full outstanding balance at its next payable scan, normally
+within about 10 minutes.
+This automatic payment does not show another confirmation prompt. **Review MASQ debts** is an
+optional manual path that can settle balances earlier and requires **Settle now** before signing.
+
+Both paths spend MASQ and Base ETH transaction fees from the consuming wallet. Transactions,
+wallet addresses, transferred amounts and fees are public on Base, and the selected RPC processes
+the transaction request. The displayed manual estimate excludes Base's variable L1 data fee, so
+the final fee can be higher. A low per-creditor threshold can produce more frequent transactions
+and fees than the MASQ Node's upstream default policy.
+
 ### Entry-node discovery
 
 The node-finder receives the public IP address, requested MASQ chain and public network/suburb. It

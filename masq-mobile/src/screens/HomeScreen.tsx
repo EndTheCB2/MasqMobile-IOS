@@ -571,8 +571,11 @@ export function HomeScreen({
                 tone="secondary"
               />
               <Text style={styles.walletHelper}>
-                Settling early can reduce delinquency risk, but cannot guarantee
-                that a provider has not already applied its own policy.
+                Automatic payment starts at approximately 0.01 MASQ per
+                creditor after 20 minutes and is checked about every 10
+                minutes. It can spend MASQ plus Base ETH fees without another
+                prompt. The total above is aggregate; Review MASQ debts can
+                settle earlier.
               </Text>
             </Card>
           </View>

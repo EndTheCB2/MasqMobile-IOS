@@ -11,6 +11,31 @@ const neighbors = [
 ];
 
 describe('SetupScreen wallet privacy', () => {
+  it('discloses automatic token and gas spending before configuration is saved', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    ReactTestRenderer.act(() => {
+      renderer = ReactTestRenderer.create(
+        <SetupScreen
+          availableExitCountries={[]}
+          busy={false}
+          error={null}
+          exitCountryInventoryReady={false}
+          hasWallet={false}
+          initial={{ ...DEFAULT_SETUP, neighbors }}
+          onBack={jest.fn()}
+          onSave={jest.fn()}
+        />,
+      );
+    });
+
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).toContain('approximately 0.01');
+    expect(content).toContain('Base ETH network fees');
+    expect(content).toContain('without another confirmation');
+
+    ReactTestRenderer.act(() => renderer.unmount());
+  });
+
   it('masks recovery words by default and requires an explicit reveal', () => {
     let renderer!: ReactTestRenderer.ReactTestRenderer;
     ReactTestRenderer.act(() => {

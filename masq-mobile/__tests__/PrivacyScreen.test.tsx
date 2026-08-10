@@ -35,12 +35,15 @@ describe('PrivacyScreen', () => {
       'MASQ hops and exit-country settings do not apply',
     );
     expect(content).toContain('Wallet secret stays on this device');
+    expect(content).toContain('Automatic and early MASQ payments');
+    expect(content).toContain('individual creditor');
+    expect(content).toContain('reaches approximately 0.01 MASQ');
+    expect(content).toContain('without another prompt');
     expect(content).toContain(
-      'Debt settlement is an explicit blockchain action',
+      'tapping Settle now provides the final confirmation',
     );
-    expect(content).toContain('tapping Settle now is the final confirmation');
     expect(content).toContain('public on Base');
-    expect(content).toContain('never retried automatically');
+    expect(content).toContain('not rebroadcast automatically');
     expect(content).toContain('Browser sessions are temporary by default');
     expect(content).toContain('Remember sign-in');
     expect(content).toContain('Temporary app switching keeps the page ready');

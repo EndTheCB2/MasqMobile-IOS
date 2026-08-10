@@ -117,11 +117,11 @@ android {
         }
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 21
-        versionName "1.0.0-preview.21"
+        versionCode 22
+        versionName "1.0.0-preview.22"
         if (unsafeSystemRoutingDogfoodEnabled) {
             // Keep internal dogfood artifacts visibly distinct from public releases.
-            versionCode 6021
+            versionCode 6022
         }
         manifestPlaceholders = [masqAppLabel: applicationLabelResource]
         buildConfigField(
