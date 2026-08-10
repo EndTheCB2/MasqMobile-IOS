@@ -136,7 +136,9 @@ describe('PrivacyScreen', () => {
       expect(content).toContain('turning routing off never requires');
       expect(content).toContain('service/app-process death can restore direct');
       expect(content).toContain('loopback MASQ proxy is unauthenticated');
-      expect(content).toContain('must not be distributed publicly');
+      expect(content).toContain('publicly downloadable dogfood build');
+      expect(content).toContain('controlled evaluation on a test device');
+      expect(content).toContain('does not make it a production VPN');
     } finally {
       ReactTestRenderer.act(() => renderer?.unmount());
       Object.defineProperty(Platform, 'OS', {

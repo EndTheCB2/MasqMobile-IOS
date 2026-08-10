@@ -106,13 +106,15 @@ from other apps.
 ### Android system-routing dogfood
 
 Whole-device and selected-app routing are available only in a separately compiled Android
-**MASQ Dogfood (Unsafe)** package, not in the public preview. When the user explicitly selects
-apps, their Android package IDs and the consent timestamp are stored only in that dogfood app's
-private local preferences; they are not sent to the maintainer. Android applies VPN inclusion by
-UID, so apps that share a UID can share routing behavior, attached restricted profiles may also
-receive the scope, and a work-profile copy belongs to a separate Android user/profile scope. MASQ
-packages installed when the route is established are excluded so their Node/control traffic and
-explicit Direct browsers do not loop through that TUN.
+**MASQ Dogfood (Unsafe)** package, not in the safer direct-distribution preview. A dogfood APK may
+be publicly downloadable for controlled test-device evaluation; public availability does not make
+it a production VPN. When the user explicitly selects apps, their Android package IDs and the
+consent timestamp are stored only in that dogfood app's private local preferences; they are not
+sent to the maintainer. Android applies VPN inclusion by UID, so apps that share a UID can share
+routing behavior, attached restricted profiles may also receive the scope, and a work-profile copy
+belongs to a separate Android user/profile scope. MASQ packages installed when the route is
+established are excluded so their Node/control traffic and explicit Direct browsers do not loop
+through that TUN.
 
 This internal adapter translates only captured IPv4 TCP connections to port 443 and virtual DNS
 through MASQ. All other captured IP traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and
@@ -129,9 +131,10 @@ Revoking VPN permission, or termination of the service or app process, can resto
 networking; the dogfood build is not a fail-closed VPN guarantee. Android Always-on VPN and “Block
 connections without VPN”/lockdown mode are unsupported. The local loopback MASQ proxy is
 unauthenticated; a malicious local app that discovers its temporary port could use the route and
-consume wallet funds. This dogfood mode must not be represented as protecting all traffic and must
-not be publicly distributed until package-change recovery and per-run local proxy authentication
-or peer-UID enforcement are implemented.
+consume wallet funds. This dogfood mode must not be represented or relied upon as protecting all
+traffic. Its public availability is only for controlled evaluation on a test device with a
+low-value wallet while per-run local proxy authentication or peer-UID enforcement and audited
+process-death fail-closed behavior remain unavailable.
 
 ### Direct browsing
 
