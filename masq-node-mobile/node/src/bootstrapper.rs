@@ -303,8 +303,23 @@ impl RealUser {
             self.home_dir_opt.clone(),
             self.sudo_home_from_sudo_user_and_home(),
             dirs_wrapper.home_dir(),
+            Self::mobile_home_dir_fallback(),
         ]);
         RealUser::new(Some(uid), Some(gid), Some(home_dir))
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn mobile_home_dir_fallback() -> Option<PathBuf> {
+        // Sandboxed mobile processes do not necessarily expose HOME through the
+        // platform directories crate. The app always supplies an absolute,
+        // protected data directory, so `/` is used only as a non-panicking
+        // identity fallback and never as the MASQ storage location.
+        Some(PathBuf::from("/"))
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    fn mobile_home_dir_fallback() -> Option<PathBuf> {
+        None
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -264,6 +264,17 @@ impl<'a> From<&'a PanicInfo<'a>> for AltPanicInfo<'a> {
 }
 
 fn panic_hook(panic_info: AltPanicInfo) {
+    if crate::mobile_runtime::is_embedded() {
+        if let Some(location) = panic_info.location.as_ref() {
+            crate::mobile_runtime::report_panic_location(&location.file, location.line);
+        } else {
+            crate::mobile_runtime::report_panic_location("unknown", 0);
+        }
+        // Mobile status exposes only the bounded file token and line. Do not
+        // persist the panic payload or backtrace because either can contain
+        // descriptors, request data, or other user-derived material.
+        return;
+    }
     let location = match panic_info.location {
         None => "<unknown location>".to_string(),
         Some(location) => format!("{}:{}:{}", location.file, location.line, location.col),
@@ -644,6 +655,7 @@ pub mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn panic_hook_handles_missing_location_and_unprintable_payload() {
         init_test_logging();
         let panic_info = AltPanicInfo {
@@ -660,6 +672,7 @@ pub mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn panic_hook_handles_existing_location_and_string_payload() {
         init_test_logging();
         let panic_info = AltPanicInfo {
@@ -682,6 +695,7 @@ pub mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn panic_hook_handles_existing_location_and_string_slice_payload() {
         init_test_logging();
         let panic_info = AltPanicInfo {

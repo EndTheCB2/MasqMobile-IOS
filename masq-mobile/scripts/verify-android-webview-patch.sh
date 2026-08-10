@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEBVIEW_SOURCE="$ROOT_DIR/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt"
 WEBVIEW_CLIENT_SOURCE="$ROOT_DIR/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java"
+WEBVIEW_VIEW_SOURCE="$ROOT_DIR/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java"
 WEBVIEW_EVENT_SOURCE="$ROOT_DIR/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/events/TopShouldStartLoadWithRequestEvent.kt"
 PATCH_FILE="$ROOT_DIR/patches/react-native-webview+14.0.1.patch"
 
@@ -16,6 +17,8 @@ fail() {
   fail "react-native-webview is not installed. Run npm install before building Android."
 [ -f "$WEBVIEW_CLIENT_SOURCE" ] || \
   fail "react-native-webview navigation source is missing."
+[ -f "$WEBVIEW_VIEW_SOURCE" ] || \
+  fail "react-native-webview request-filter source is missing."
 [ -f "$WEBVIEW_EVENT_SOURCE" ] || \
   fail "react-native-webview navigation event source is missing."
 [ -f "$PATCH_FILE" ] || \
@@ -35,6 +38,25 @@ for required_call in \
 done
 
 for required_call in \
+  'setAndroidBlockedResourceHosts' \
+  '.take(64)'; do
+  /usr/bin/grep -Fq "$required_call" "$WEBVIEW_SOURCE" || \
+    fail "react-native-webview is missing the bounded Android request-filter prop."
+  /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
+    fail "The persisted Android request-filter prop patch is incomplete."
+done
+
+for required_call in \
+  'MAX_BLOCKED_RESOURCE_HOSTS = 64' \
+  'host.equals(blockedHost)' \
+  'host.endsWith("." + blockedHost)'; do
+  /usr/bin/grep -Fq "$required_call" "$WEBVIEW_VIEW_SOURCE" || \
+    fail "react-native-webview is missing exact-host request filtering."
+  /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
+    fail "The persisted exact-host request-filter patch is incomplete."
+done
+
+for required_call in \
   'shouldOverrideUrlLoadingWithMetadata' \
   'request.hasGesture()' \
   'request.isRedirect()' \
@@ -45,14 +67,37 @@ for required_call in \
     fail "The persisted Android navigation metadata patch is incomplete."
 done
 
+
+for required_call in \
+  '!request.isForMainFrame()' \
+  'shouldBlockResource(request.getUrl())' \
+  '"No Content"'; do
+  /usr/bin/grep -Fq "$required_call" "$WEBVIEW_CLIENT_SOURCE" || \
+    fail "react-native-webview is missing pre-download Android request blocking."
+  /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
+    fail "The persisted pre-download Android request-blocking patch is incomplete."
+done
+
 for required_call in \
   'shouldInterceptRequest(WebView view, WebResourceRequest request)' \
-  'request.isForMainFrame()' \
-  '!"GET".equalsIgnoreCase(request.getMethod())' \
+  'request.isForMainFrame() && !"GET".equalsIgnoreCase(request.getMethod())' \
   'Collections.singletonMap("Cache-Control", "no-store")' \
   'new ByteArrayInputStream(blockedBody)'; do
   /usr/bin/grep -Fq "$required_call" "$WEBVIEW_CLIENT_SOURCE" || \
     fail "react-native-webview is missing the fail-closed Android form-navigation guard."
+  /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
+    fail "The persisted fail-closed Android form-navigation patch is incomplete."
+done
+
+for required_call in \
+  "leave Chromium's proxy CONNECT sockets" \
+  'loadUrl("about:blank");' \
+  'clearHistory();' \
+  'removeAllViews();'; do
+  /usr/bin/grep -Fq "$required_call" "$WEBVIEW_VIEW_SOURCE" || \
+    fail "react-native-webview is missing deterministic proxy-session cleanup."
+  /usr/bin/grep -Fq "$required_call" "$PATCH_FILE" || \
+    fail "The persisted Android proxy-session cleanup patch is incomplete."
 done
 
 /usr/bin/grep -Fq 'if (!mData.hasKey("navigationType"))' "$WEBVIEW_EVENT_SOURCE" || \

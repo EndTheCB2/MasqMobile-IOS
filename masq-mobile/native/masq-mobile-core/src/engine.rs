@@ -3,16 +3,31 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::config::MobileConfig;
 use crate::wallet::WalletMaterial;
+
+const MOBILE_AUTO_PAYMENT_TRIGGER_GWEI: u64 = 10_000_000;
+// The MASQ payable scanner compares balances strictly with `>`. Keeping the permanent floor
+// one gwei below the nominal trigger makes exactly 0.01 MASQ eligible. It also creates a
+// sub-gwei compatibility band below the nominal trigger, which the UI discloses as approximate.
+const MOBILE_AUTO_PAYMENT_FLOOR_GWEI: u64 = MOBILE_AUTO_PAYMENT_TRIGGER_GWEI - 1;
+const MOBILE_PAYMENT_MATURITY_SEC: u64 = 1_200;
+const MOBILE_PAYMENT_GRACE_PERIOD_SEC: u64 = 1_200;
+const MOBILE_PAYMENT_THRESHOLD_INTERVAL_SEC: u64 = 21_600;
 
 pub struct EngineHandle {
     thread: Option<JoinHandle<i32>>,
     proxy_port: u16,
     min_hops: u8,
     started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryConnectionOutcome {
+    RetriedInPlace,
+    RestartRequired,
 }
 
 #[derive(Clone, Debug)]
@@ -22,6 +37,9 @@ pub struct EngineSnapshot {
     pub proxy_port: Option<u16>,
     pub route_stage: u8,
     pub route_hops: usize,
+    pub route_proof_generation: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
     pub last_exit_code: Option<i32>,
     pub running_for: Duration,
     pub last_connection_error: Option<String>,
@@ -38,30 +56,13 @@ impl EngineHandle {
 
         let (proxy_port, ui_port) = reserve_loopback_ports()?;
         let private_key = wallet.private_key_hex();
-        let mut args = vec![
-            "MASQNode".to_owned(),
-            "--mobile-proxy-port".to_owned(),
-            proxy_port.to_string(),
-            "--ui-port".to_owned(),
-            ui_port.to_string(),
-            "--neighborhood-mode".to_owned(),
-            "consume-only".to_owned(),
-            "--chain".to_owned(),
-            config.chain.identifier().to_owned(),
-            "--blockchain-service-url".to_owned(),
-            config.rpc_url.clone(),
-            "--neighbors".to_owned(),
-            config.neighbors.join(","),
-            "--consuming-private-key".to_owned(),
-            private_key.to_string(),
-            "--data-directory".to_owned(),
-            data_directory.to_owned(),
-            "--log-level".to_owned(),
-            "warn".to_owned(),
-            "--min-hops".to_owned(),
-            config.min_hops.to_string(),
-        ];
-        let secret_argument_index = 14;
+        let args = embedded_node_arguments(
+            config,
+            proxy_port,
+            ui_port,
+            data_directory,
+            private_key.as_str(),
+        );
 
         // Reset observable state before the thread is scheduled so a fast status poll can never
         // mistake the previous run's clean exit for a failure of this new run.
@@ -72,11 +73,7 @@ impl EngineHandle {
         );
         let thread = thread::Builder::new()
             .name("masq-node-consumer".to_owned())
-            .spawn(move || {
-                let exit_code = node_lib::mobile_runtime::run_embedded(&args);
-                args[secret_argument_index].zeroize();
-                exit_code
-            })
+            .spawn(move || node_lib::mobile_runtime::run_embedded(args.as_slice()))
             .map_err(|_| "The MASQ Node thread could not be started.".to_owned())?;
 
         Ok(Self {
@@ -95,6 +92,9 @@ impl EngineHandle {
             proxy_port: snapshot.proxy_port.or(Some(self.proxy_port)),
             route_stage: snapshot.route_stage,
             route_hops: usize::from(snapshot.route_hops),
+            route_proof_generation: snapshot.route_proof_generation,
+            bytes_up: snapshot.bytes_up,
+            bytes_down: snapshot.bytes_down,
             last_exit_code: snapshot.last_exit_code,
             running_for: self.started_at.elapsed(),
             last_connection_error: snapshot.last_connection_error,
@@ -106,10 +106,26 @@ impl EngineHandle {
         self.min_hops = min_hops;
     }
 
-    pub fn retry_connection(&mut self, entry_nodes: &[String]) -> Result<(), String> {
-        node_lib::mobile_runtime::retry_connection(entry_nodes)?;
-        self.started_at = Instant::now();
-        Ok(())
+    pub fn retry_connection(
+        &mut self,
+        entry_nodes: &[String],
+    ) -> Result<RetryConnectionOutcome, String> {
+        if self.runtime_thread_has_ended() {
+            self.reap_if_finished();
+            return Ok(RetryConnectionOutcome::RestartRequired);
+        }
+
+        match node_lib::mobile_runtime::retry_connection(entry_nodes) {
+            Ok(()) => {
+                self.started_at = Instant::now();
+                Ok(RetryConnectionOutcome::RetriedInPlace)
+            }
+            Err(_error) if self.runtime_thread_has_ended() => {
+                self.reap_if_finished();
+                Ok(RetryConnectionOutcome::RestartRequired)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn stop(&mut self) {
@@ -118,6 +134,7 @@ impl EngineHandle {
             let _ = thread.join();
         }
         let _ = node_lib::mobile_runtime::wait_for_actor_arbiters(Duration::from_secs(10));
+        let _ = node_lib::mobile_runtime::wait_for_stream_connect_jobs(Duration::from_secs(10));
     }
 
     pub fn stop_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
@@ -158,7 +175,21 @@ impl EngineHandle {
                     .to_owned(),
             );
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !node_lib::mobile_runtime::wait_for_stream_connect_jobs(remaining) {
+            return Err(
+                "The embedded MASQ transport workers did not stop in time. Direct browsing remains blocked."
+                    .to_owned(),
+            );
+        }
         main_thread_error.map_or(Ok(()), Err)
+    }
+
+    fn runtime_thread_has_ended(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(JoinHandle::is_finished)
+            .unwrap_or(true)
     }
 
     pub fn reap_if_finished(&mut self) {
@@ -175,12 +206,76 @@ impl EngineHandle {
     }
 }
 
+#[cfg(test)]
+impl EngineHandle {
+    /// Supplies a fully reappable handle for state-transition tests without
+    /// opening a socket or starting the process-global embedded actor system.
+    pub(crate) fn finished_for_state_transition_test() -> Self {
+        let thread = thread::spawn(|| 0);
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        Self {
+            thread: Some(thread),
+            proxy_port: 0,
+            min_hops: 1,
+            started_at: Instant::now(),
+        }
+    }
+}
+
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         if self.thread.is_some() {
             self.stop();
         }
     }
+}
+
+fn embedded_node_arguments(
+    config: &MobileConfig,
+    proxy_port: u16,
+    ui_port: u16,
+    data_directory: &str,
+    private_key: &str,
+) -> Zeroizing<Vec<String>> {
+    Zeroizing::new(vec![
+        "MASQNode".to_owned(),
+        "--mobile-proxy-port".to_owned(),
+        proxy_port.to_string(),
+        "--ui-port".to_owned(),
+        ui_port.to_string(),
+        "--neighborhood-mode".to_owned(),
+        "consume-only".to_owned(),
+        "--chain".to_owned(),
+        config.chain.identifier().to_owned(),
+        "--blockchain-service-url".to_owned(),
+        config.rpc_url.clone(),
+        "--neighbors".to_owned(),
+        config.neighbors.join(","),
+        "--consuming-private-key".to_owned(),
+        private_key.to_owned(),
+        "--data-directory".to_owned(),
+        data_directory.to_owned(),
+        "--log-level".to_owned(),
+        "warn".to_owned(),
+        "--min-hops".to_owned(),
+        config.min_hops.to_string(),
+        "--payment-thresholds".to_owned(),
+        mobile_payment_thresholds_argument(),
+    ])
+}
+
+fn mobile_payment_thresholds_argument() -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        MOBILE_AUTO_PAYMENT_TRIGGER_GWEI,
+        MOBILE_PAYMENT_MATURITY_SEC,
+        MOBILE_PAYMENT_GRACE_PERIOD_SEC,
+        MOBILE_AUTO_PAYMENT_FLOOR_GWEI,
+        MOBILE_PAYMENT_THRESHOLD_INTERVAL_SEC,
+        MOBILE_AUTO_PAYMENT_FLOOR_GWEI,
+    )
 }
 
 fn reserve_loopback_ports() -> Result<(u16, u16), String> {
@@ -204,7 +299,77 @@ fn reserve_loopback_ports() -> Result<(u16, u16), String> {
 mod tests {
     use super::*;
     use crate::config::Chain;
+    use node_lib::accountant::db_access_objects::utils::ThresholdUtils;
+    use node_lib::accountant::scanners::payable_scanner::utils::{
+        PayableThresholdsGauge, PayableThresholdsGaugeReal,
+    };
+    use node_lib::sub_lib::accountant::PaymentThresholds;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn argument_test_config() -> MobileConfig {
+        MobileConfig {
+            chain: Chain::BaseSepolia,
+            rpc_url: "https://sepolia.base.org".to_owned(),
+            neighbors: vec!["masq://test-neighbor".to_owned()],
+            min_hops: 2,
+            exit_country: None,
+            exit_country_fallback: true,
+            data_directory: Some("/private/test-data".to_owned()),
+        }
+    }
+
+    #[test]
+    fn embedded_arguments_apply_the_mobile_threshold_without_moving_the_secret() {
+        let args = embedded_node_arguments(
+            &argument_test_config(),
+            12_345,
+            23_456,
+            "/private/test-data",
+            "secret",
+        );
+        let threshold_positions = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == "--payment-thresholds").then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(threshold_positions, vec![21]);
+        assert_eq!(
+            args[threshold_positions[0] + 1],
+            "10000000|1200|1200|9999999|21600|9999999"
+        );
+        assert_eq!(args[13], "--consuming-private-key");
+        assert_eq!(args[14], "secret");
+    }
+
+    #[test]
+    fn automatic_payment_threshold_approximates_one_hundredth_masq_within_one_gwei() {
+        let encoded = mobile_payment_thresholds_argument();
+        let thresholds = PaymentThresholds::try_from(encoded.as_str()).unwrap();
+
+        assert_eq!(encoded, "10000000|1200|1200|9999999|21600|9999999");
+        assert_eq!(thresholds.debt_threshold_gwei, 10_000_000);
+        assert_eq!(thresholds.permanent_debt_allowed_gwei, 9_999_999);
+
+        let gauge = PayableThresholdsGaugeReal::default();
+        let exact_trigger_wei = 10_000_000_u128 * 1_000_000_000_u128;
+        let one_wei_below_trigger = exact_trigger_wei - 1;
+        let permanent_floor_wei = 9_999_999_u128 * 1_000_000_000_u128;
+        assert!(gauge.is_innocent_age(1_200, thresholds.maturity_threshold_sec));
+        assert!(!gauge.is_innocent_age(1_201, thresholds.maturity_threshold_sec));
+        assert!(gauge.is_innocent_balance(permanent_floor_wei, permanent_floor_wei));
+        assert!(!gauge.is_innocent_balance(exact_trigger_wei, permanent_floor_wei));
+
+        let threshold_after_maturity =
+            ThresholdUtils::calculate_finite_debt_limit_by_age(&thresholds, 1_201);
+        assert!(exact_trigger_wei > threshold_after_maturity);
+        // The upstream scanner uses strict `>` comparisons while its configuration is expressed
+        // in whole gwei. A one-gwei compatibility band is therefore unavoidable without changing
+        // the official accounting algorithm: after maturity, some wei amounts immediately below
+        // 0.01 MASQ can qualify, but the permanent floor remains less than one gwei lower.
+        assert!(one_wei_below_trigger > threshold_after_maturity);
+        assert!(threshold_after_maturity > permanent_floor_wei);
+    }
 
     #[test]
     #[ignore = "opens loopback listeners for the embedded MASQ actor system"]
@@ -300,5 +465,26 @@ mod tests {
             )
         );
         engine.stop();
+    }
+
+    #[test]
+    fn retry_requests_a_restart_only_after_the_runtime_thread_has_finished() {
+        let thread = thread::spawn(|| 0);
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        let mut engine = EngineHandle {
+            thread: Some(thread),
+            proxy_port: 0,
+            min_hops: 1,
+            started_at: Instant::now(),
+        };
+
+        let outcome = engine
+            .retry_connection(&[])
+            .expect("a finished runtime should be safely reaped");
+
+        assert_eq!(outcome, RetryConnectionOutcome::RestartRequired);
+        assert!(engine.thread.is_none());
     }
 }

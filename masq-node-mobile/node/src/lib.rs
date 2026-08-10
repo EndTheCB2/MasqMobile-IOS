@@ -32,6 +32,7 @@ pub mod json_framer;
 pub mod json_masquerader;
 mod listener_handler;
 pub mod masquerader;
+pub mod mobile_debt_settlement;
 pub mod mobile_runtime;
 pub mod neighborhood;
 pub mod node_configurator;

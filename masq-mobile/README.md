@@ -14,8 +14,9 @@ exit services to other nodes.
   unlocked-only Keychain item; Android encrypts it with a non-exportable Android Keystore key.
 - Automatic RPC health checking with chain verification and public fallback endpoints.
 - Automatic selection, reachability testing, retry, and last-known-good caching of two entry nodes.
-- Single-flight connection control with cancellable node refresh when the user disconnects, resets,
-  backgrounds the app, or taps connect more than once.
+- Single-flight connection control with generation-checked Android native start/stop serialization
+  and cancellable node refresh when the user disconnects, resets, backgrounds the app, or taps
+  connect more than once.
 - An explicit cancel action while a route is being built, with fail-safe shutdown that still stops
   the core if browser-proxy cleanup itself reports an error.
 - Actionable, privacy-safe issue categories that route the user to retry, device settings, the
@@ -40,6 +41,9 @@ exit services to other nodes.
 - Opt-in Reject-only handling for supported OneTrust, Cookiebot, Didomi, Usercentrics and DPG
   Media dialogs. Unknown gates remain visible and **Accept** is never selected.
 - ENS `.eth` navigation through eth.limo HTTPS transport without search or Direct fallback.
+- A user-selectable Timpi or DuckDuckGo provider for free-text searches. The selected provider
+  receives the query and the apparent MASQ-exit or Direct-connection IP; the app stores only the
+  provider choice, not search queries or search history.
 - Temporary sessions by default, with exact-host remembered sign-in profiles only after Android
   WebView confirms multi-profile isolation support. Cross-site top-frame transitions select the
   destination profile and top-frame non-GET form navigations are blocked fail-closed.
@@ -66,9 +70,12 @@ exit services to other nodes.
   fast resume. Opening the explicit direct browser instead performs an acknowledged full teardown
   of the mesh and system tunnel while retaining the wallet and profile; MASQ can reconnect later
   in the same app process.
-- Race-free native status polling, iOS/Android network-path monitoring, foreground recovery, and
-  fail-closed browser shutdown when the app enters the background. Browser mode is never
-  persisted, and backgrounding always selects `blocked`.
+- Race-free native status polling, iOS/Android network-path monitoring and foreground recovery.
+  During a temporary app switch, an active WebView remains mounted behind the privacy shield and
+  retains its selected MASQ Private or Direct routing lease, without cross-mode fallback. This lets
+  external sign-in confirmations finish, but the page may continue network activity while hidden.
+  Explicit browser close ends the lease and clears temporary data; OS process eviction can still
+  lose the exact page or unfinished form.
 - Separate wallet, network-profile, and full resets, plus redacted diagnostics sharing.
 
 The iOS build intentionally remains browser-only. Whole-device routing needs a separately signed
@@ -90,8 +97,26 @@ React Native UI
 Android apps (optional)
   -> Android VpnService TUN
   -> isolated tun2proxy Rust library
-  -> the same fail-closed local CONNECT port
+  -> IPv4 TCP/443 plus virtual DNS only
+  -> the same local MASQ CONNECT port
 ```
+
+The optional path above exists only in the separately compiled
+`com.endthecb2.masqmobile.dogfood` package. The public build keeps it disabled. The dogfood
+`VpnService` captures either device scope or selected Android package UIDs and stores package IDs
+plus the consent timestamp locally. MASQ packages installed when the route is created are excluded.
+Android snapshots package-to-UID rules at that moment, so turn routing off before package changes
+and reapply it. Shared-UID apps can share routing behavior, attached restricted profiles may also
+receive the scope, and work-profile copies are a separate user scope. All other captured IP
+traffic—including other TCP ports, non-DNS UDP, IPv6, ICMP and unknown transports—is blocked only
+while Android capture remains valid. Activation opens a real CONNECT tunnel to `example.com:443`
+through the MASQ exit to test reachability without requesting a page/body. Service/process death or
+VPN revocation can restore direct networking, and Always-on/lockdown are unsupported. On Android
+13+, the native service refuses both new and sticky-recovered activation when notification
+permission is unavailable; OFF cleanup remains available without it. The loopback
+proxy has no per-run authentication; another malicious local app that discovers its temporary port
+could consume the route and wallet funds. This internal package is blocked from public distribution
+until package-change recovery and local proxy authentication or peer-UID enforcement exist.
 
 The mobile app is located in this directory. The adapted upstream Node worktree is located next to
 it at `../masq-node-mobile`. Additional technical context is available in
@@ -165,9 +190,11 @@ privacy-scans a versioned APK. It requires `MASQ_ANDROID_KEYSTORE`,
 `MASQ_ANDROID_KEYSTORE_PASSWORD`, an optional `MASQ_ANDROID_KEY_PASSWORD` and
 `MASQ_NODE_FINDER_URL` in the local environment. It also requires
 `MASQ_ANDROID_EXPECTED_CERT_SHA256`, copied from the approved keystore's public certificate
-fingerprint, so an accidental signing-key change cannot produce a release. Read it with
+fingerprint. The official direct-release script also pins the preview.2 certificate, so changing
+only the environment cannot silently produce an incompatible update. Read the fingerprint with
 `keytool -list -v -keystore "$MASQ_ANDROID_KEYSTORE"` and remove the displayed colon separators.
-The keystore and passwords must remain outside the repository. End-user installation and update
+The keystore and passwords must remain outside the repository; the script exposes the passwords
+only to the signing subprocess, after compilation has finished. End-user installation and update
 instructions are in
 [`../ANDROID_DIRECT_INSTALL.md`](../ANDROID_DIRECT_INSTALL.md).
 
@@ -181,13 +208,16 @@ instructions are in
 6. Start MASQ and follow the five-stage connection status.
 7. Open **MASQ Private** after its route preflight succeeds, or explicitly choose **Browse without
    MASQ** and confirm that the normal connection exposes the device IP and bypasses MASQ routing.
-8. Choose **Balanced** or **Strict**, or review the individual **Ads & trackers**,
+8. Choose Timpi or DuckDuckGo as the free-text search provider. MASQ Mobile stores the provider
+   choice but not search queries or search history.
+9. Choose **Balanced** or **Strict**, or review the individual **Ads & trackers**,
    **Cross-site cookies**, **Hide resolved banners** and **Reject optional cookies** controls.
    Exact-host protection exceptions and remembered sign-ins are opt-in.
-9. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
-   the logical ENS address in the bar.
-10. On Android, optionally open Traffic scope and protect the whole device or selected apps. Android
-   asks once for VPN permission; the selected package names stay on the device.
+10. Enter a normalized `.eth` address to load it through the eth.limo HTTPS gateway while retaining
+    the logical ENS address in the bar.
+11. In public Android previews, only traffic from the embedded **MASQ Private** browser can use
+    MASQ. Whole-device and selected-app routing remain unavailable until lifecycle, handover and
+    leak tests pass.
 
 A real route requires reachable entry nodes and a wallet that meets the network requirements. No
 community nodes or private keys are intentionally hardcoded in the source code.
@@ -274,24 +304,30 @@ self-contained unsigned Android release APK with commit-pinned actions.
   configuration, and only after the explicit direct action.
 - iOS uses separate ephemeral stores by default. Android uses separate MASQ and Direct WebView
   profiles when the runtime supports them, and offers exact-host persistence only after opt-in;
-  unsupported runtimes remain temporary. The browser closes on background, routing returns to a
-  blocked sink, and MASQ never permits proxy failover.
+  unsupported runtimes remain temporary. During a temporary app switch, the active WebView stays
+  mounted behind a privacy shield and retains the exact selected MASQ Private or Direct route, with
+  no cross-mode fallback. The hidden page can continue network activity so an external sign-in
+  confirmation can complete. Explicit close ends the session and blocks browser routing; OS process
+  eviction can still lose the exact page. MASQ never permits proxy failover.
 - Browser-protection preferences are local app settings. Protection does not send browsing
   telemetry, but destination websites still receive normal requests and can detect or react to
   blocked resources. In direct mode they also receive the public IP of the current connection or
   VPN.
 - Browser navigation accepts HTTPS only and blocks localhost, private, and link-local addresses.
-  Free text entered in the browser bar opens the public Timpi Search website through the selected
-  MASQ Private or Direct routing mode; MASQ Mobile does not embed Timpi's private data API.
+  Free text entered in the browser bar opens the selected public Timpi or DuckDuckGo search website
+  through the active MASQ Private or Direct routing mode. The provider receives the query and sees
+  the MASQ exit IP or the current public connection/VPN IP, respectively. MASQ Mobile stores only
+  the provider choice and does not store or synchronize queries or search history.
 - Normalized `.eth` addresses are rewritten locally to eth.limo HTTPS transport. Gateway failure
-  is reported and never falls back to Timpi, ordinary DNS or Direct networking.
+  is reported and never falls back to a search provider, ordinary DNS or Direct networking.
 - After import, the wallet secret is removed from React state and temporary Rust copies are
   zeroized. iOS persists it with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; Android uses
   AES-GCM with a non-exportable key held by Android Keystore.
-- The Android `VpnService` keeps an established TUN descriptor open when its translator stops, but
-  whole-device and selected-app routing remain disabled in public previews until process-death,
-  service restart, network handover and leak testing also pass. Android Always-on VPN support is
-  disabled while that validation is incomplete.
+- The Android dogfood `VpnService` keeps an established, still-valid TUN descriptor open when its
+  translator stops, but this blocks only the scope Android continues to capture. Revocation and
+  service/process death can restore direct traffic. Whole-device and selected-app routing remain
+  disabled in public previews until process-death, service restart, network handover and leak
+  testing pass. Android Always-on VPN and lockdown remain unsupported.
 - iOS system routing returns an explicit unsupported result until a correctly provisioned Packet
   Tunnel extension exists.
 - MASQ Node remains beta software. Before store publication, conduct a mobile security review,

@@ -500,7 +500,9 @@ export function SetupScreen({
               blockchain requests. MASQ peers process the routing metadata
               needed to carry traffic. This app has no ads, analytics or
               cross-app tracking, and the wallet secret stays in secure device
-              storage.
+              storage. After an individual debt reaches approximately 0.01
+              MASQ and is old enough, the embedded Node can automatically spend
+              MASQ plus Base ETH network fees without another confirmation.
             </Text>
           </View>
         </View>

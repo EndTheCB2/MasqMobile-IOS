@@ -1,10 +1,16 @@
 import {
   isDescriptorForChain,
+  isValidSavedConfig,
   normalizeBrowserUrl,
   normalizeWalletSecret,
   parseNeighborList,
   validateConfig,
 } from '../src/core/config';
+import {
+  decodeSavedConfiguration,
+  isSavedProfileError,
+  SavedProfileError,
+} from '../src/core/masqCore';
 import { DEFAULT_SETUP } from '../src/core/types';
 
 describe('mobile consume configuration', () => {
@@ -94,6 +100,51 @@ describe('mobile consume configuration', () => {
     };
 
     expect(validateConfig(draft, { walletRequired: false })).toEqual({});
+  });
+
+  it('requires a normalized, current and semantically valid saved profile', () => {
+    const saved = {
+      configVersion: 2,
+      chain: 'base-mainnet' as const,
+      rpcUrl: 'https://rpc.example',
+      neighbors: [descriptor],
+      minHops: 4,
+      exitCountry: 'NL',
+      exitCountryFallback: false,
+    };
+
+    expect(isValidSavedConfig(saved)).toBe(true);
+    expect(isValidSavedConfig({ ...saved, configVersion: 1 })).toBe(false);
+    expect(isValidSavedConfig({ ...saved, rpcUrl: ' http://rpc.example' })).toBe(
+      false,
+    );
+    expect(isValidSavedConfig({ ...saved, neighbors: [] })).toBe(false);
+    expect(isValidSavedConfig({ ...saved, minHops: 0 })).toBe(false);
+    expect(isValidSavedConfig({ ...saved, exitCountry: 'Netherlands' })).toBe(
+      false,
+    );
+    expect(decodeSavedConfiguration(JSON.stringify(saved))).toEqual(saved);
+  });
+
+  it('normalizes malformed serialized profiles to a stable coded error', () => {
+    for (const serialized of [
+      '{not-json',
+      JSON.stringify({ configVersion: 2 }),
+    ]) {
+      try {
+        decodeSavedConfiguration(serialized);
+        throw new Error('Expected the saved profile to be rejected.');
+      } catch (caught) {
+        expect(caught).toBeInstanceOf(SavedProfileError);
+        expect(isSavedProfileError(caught)).toBe(true);
+        expect((caught as SavedProfileError).code).toBe(
+          'E_SAVED_CONFIG_INVALID',
+        );
+      }
+    }
+    expect(isSavedProfileError({ code: 'E_SAVED_CONFIG' })).toBe(true);
+    expect(isSavedProfileError({ code: 'E_SAVED_CONFIG_INVALID' })).toBe(true);
+    expect(isSavedProfileError({ code: 'E_BRIDGE_TIMEOUT' })).toBe(false);
   });
 
   it('rejects unsupported hop counts and malformed country codes', () => {

@@ -13,7 +13,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = []
 # The default build is deliberately unavailable rather than silently sending traffic directly.
-node-engine = ["dep:node_lib"]
+node-engine = ["dep:native-tls", "dep:node_lib"]
 
 [dependencies]
 jni = "=0.21.1"
@@ -26,3 +26,4 @@ tiny-bip39 = "=0.8.2"
 tiny-hderive = "=0.3.0"
 zeroize = "=1.4.3"
 node_lib = { package = "node", path = "../../../masq-node-mobile/node", optional = true }
+native-tls = { version = "=0.2.8", features = ["vendored"], optional = true }

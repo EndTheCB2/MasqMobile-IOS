@@ -18,12 +18,18 @@ The Android package ID is `com.endthecb2.masqmobile`.
 
 ## Install
 
-### Updating from preview.2 or later
+### Updating the public preview.2 lineage
 
-Preview.3 fixed the Android native MASQ-core packaging in preview.2. Preview.4 and later can be
-installed directly over preview.2 or preview.3; do not uninstall or reset the app. They use the
-same package ID and permanent signing certificate, so Android preserves the encrypted wallet,
-browser settings, and network profile.
+Preview.3 fixed the Android native MASQ-core packaging in preview.2. Every release after preview.2
+in the public `com.endthecb2.masqmobile` lineage can be installed directly over preview.2 or another
+public-lineage preview; do not uninstall or reset the app. They use the same package ID and
+permanent signing certificate, so Android preserves the encrypted wallet, browser settings, and
+network profile.
+
+The separately published `1.0.0-preview.7` system-routing experiment used package ID
+`com.endthecb2.masqmobile.dogfood` and a different signing certificate. It is not an update in the
+public lineage and cannot be replaced in place by a public-lineage APK. Check the package ID and
+certificate stated in each Release instead of relying only on the preview number.
 
 ### One-time migration from preview.1
 
@@ -47,14 +53,14 @@ installations are not affected. Releases after preview.2 must keep the preview.2
    APK as harmful, stop and report the exact warning on this repository instead of bypassing it.
 6. After installation, turn **Allow from this source** off again for the browser or Files app.
 
-Preview.4 does not offer whole-device or selected-app routing. Android Always-on VPN support is
-disabled until process-death, network-handover and leak tests pass. If an earlier experimental
-preview left a system tunnel active, installing preview.4 stops it.
+The current preview does not offer whole-device or selected-app routing. Android Always-on VPN
+support is disabled until process-death, network-handover and leak tests pass. If an earlier
+experimental preview left a system tunnel active, installing the current preview stops it.
 
 ## Check the download
 
 The Release contains `SHA256SUMS.txt` and `SIGNING-CERTIFICATE.txt`. A technical user can compare
-the APK's SHA-256 checksum with `SHA256SUMS.txt`. Preview.2 uses certificate SHA-256
+the APK's SHA-256 checksum with `SHA256SUMS.txt`. The public preview.2 lineage uses certificate SHA-256
 `346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41`. Every later update must have
 this same signing-certificate fingerprint and a higher Android version code.
 
@@ -76,6 +82,14 @@ or from GitHub.
 - The app consumes MASQ routes; it does not serve traffic for other peers.
 - **MASQ Private** fails closed. It does not silently fall back to the device connection.
 - **Browse without MASQ** is an explicit direct mode and exposes the connection's normal public IP.
+- After the user connects, Android shows a persistent low-priority notification so the consumer
+  session can remain active while the app is backgrounded or the screen is locked.
+- During a temporary app switch, an open browser page remains mounted behind a privacy shield and
+  retains its exact MASQ Private or Direct route. The hidden page can continue network activity.
+  Explicit browser close ends that routing lease, and Android process eviction can still lose the
+  exact page or unfinished form.
+- Screen-off operation can increase battery use. Android Doze, manufacturer battery restrictions,
+  loss of validated network access, or a user force-stop can still suspend or end the connection.
 - Android whole-device and selected-app routing is withheld from this public preview until the
   complete `VpnService` lifecycle passes fail-closed leak testing.
 - Browser protection is best effort. This public build does not claim YouTube ad blocking.

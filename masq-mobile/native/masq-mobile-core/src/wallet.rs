@@ -68,6 +68,11 @@ impl WalletMaterial {
         Zeroizing::new(encode_hex(self.secret.as_slice()))
     }
 
+    #[cfg(feature = "node-engine")]
+    pub fn private_key_bytes(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.secret.to_vec())
+    }
+
     #[cfg(test)]
     pub fn secret_bytes(&self) -> &[u8] {
         self.secret.as_slice()

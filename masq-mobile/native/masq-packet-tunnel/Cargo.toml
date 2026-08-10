@@ -12,6 +12,8 @@ name = "masq_packet_tunnel"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+jni = "=0.22.4"
 once_cell = "=1.21.4"
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
-tun2proxy = { version = "=0.8.2", default-features = false }
+# Local, auditable 0.8.2 fork. See vendor/tun2proxy/MASQ_PATCHES.md.
+tun2proxy = { path = "vendor/tun2proxy", version = "=0.8.2", default-features = false }

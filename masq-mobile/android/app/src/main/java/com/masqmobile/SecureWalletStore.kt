@@ -13,6 +13,19 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** Stores the consumer wallet encrypted by a non-exportable, device-bound Android Keystore key. */
 internal class SecureWalletStore(context: Context) {
+  class UnreadableException :
+      IllegalStateException(
+          "The encrypted consumer wallet could not be read safely.",
+      )
+
+  sealed class PreservationRead {
+    object Absent : PreservationRead()
+    class Readable(val secret: String) : PreservationRead() {
+      override fun toString(): String = "Readable([REDACTED])"
+    }
+    object Unreadable : PreservationRead()
+  }
+
   private val preferences =
       context.getSharedPreferences(SECURE_PREFERENCES, Context.MODE_PRIVATE)
 
@@ -32,24 +45,50 @@ internal class SecureWalletStore(context: Context) {
   }
 
   fun load(): String? {
-    val encryptedValue = preferences.getString(ENCRYPTED_WALLET, null) ?: return null
-    val initializationVector = preferences.getString(INITIALIZATION_VECTOR, null) ?: return null
+    return when (val result = readForPreservation()) {
+      PreservationRead.Absent -> null
+      is PreservationRead.Readable -> result.secret
+      PreservationRead.Unreadable -> throw UnreadableException()
+    }
+  }
+
+  fun readForPreservation(): PreservationRead {
+    val encryptedValue: String?
+    val initializationVector: String?
+    try {
+      encryptedValue = preferences.getString(ENCRYPTED_WALLET, null)
+      initializationVector = preferences.getString(INITIALIZATION_VECTOR, null)
+    } catch (_: Exception) {
+      return PreservationRead.Unreadable
+    }
+    if (encryptedValue == null && initializationVector == null) {
+      return PreservationRead.Absent
+    }
+    if (encryptedValue == null || initializationVector == null) {
+      return PreservationRead.Unreadable
+    }
     return try {
-      val key = keyStore().getKey(KEY_ALIAS, null) as? SecretKey ?: return null
+      val key =
+          keyStore().getKey(KEY_ALIAS, null) as? SecretKey
+              ?: return PreservationRead.Unreadable
       val cipher = Cipher.getInstance(TRANSFORMATION)
       cipher.init(
           Cipher.DECRYPT_MODE,
           key,
           GCMParameterSpec(128, Base64.decode(initializationVector, Base64.NO_WRAP)),
       )
-      String(
-          cipher.doFinal(Base64.decode(encryptedValue, Base64.NO_WRAP)),
-          StandardCharsets.UTF_8,
-      )
+      val secret =
+          String(
+              cipher.doFinal(Base64.decode(encryptedValue, Base64.NO_WRAP)),
+              StandardCharsets.UTF_8,
+          )
+      if (secret.isEmpty()) {
+        PreservationRead.Unreadable
+      } else {
+        PreservationRead.Readable(secret)
+      }
     } catch (_: Exception) {
-      // Never retain an unreadable secret or fall back to plaintext storage.
-      deleteEncryptedValue()
-      null
+      PreservationRead.Unreadable
     }
   }
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
 pub mod lower_level_interface_web3;
-mod utils;
+pub(crate) mod utils;
 
 use std::cmp::PartialEq;
 use std::collections::BTreeMap;
@@ -450,6 +450,10 @@ impl BlockchainInterfaceWeb3 {
                 70_000
             }
         }
+    }
+
+    pub(crate) fn http_transport(&self) -> Http {
+        self.transport.clone()
     }
 
     fn extract_transactions_from_logs(logs: Vec<Log>) -> Vec<BlockchainTransaction> {

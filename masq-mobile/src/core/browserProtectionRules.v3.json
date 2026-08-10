@@ -7,6 +7,20 @@
     "iframe[src*=\"googlesyndication.com\"]",
     "iframe[src*=\"googleadservices.com\"]"
   ],
+  "requestHosts": [
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "googletagservices.com",
+    "amazon-adsystem.com",
+    "adnxs.com",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "scorecardresearch.com",
+    "quantserve.com"
+  ],
   "rejectSelectors": [
     "#onetrust-reject-all-handler",
     "#CybotCookiebotDialogBodyButtonDecline",

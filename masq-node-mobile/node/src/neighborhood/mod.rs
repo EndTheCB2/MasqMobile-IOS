@@ -19,7 +19,7 @@ use crate::neighborhood::gossip::{AccessibleGossipRecord, Gossip_0v1};
 use crate::neighborhood::gossip_acceptor::{GossipAcceptanceResult, GossipAcceptorInvalid};
 use crate::neighborhood::node_location::get_node_location;
 use crate::neighborhood::overall_connection_status::{
-    ConnectionStage, OverallConnectionStage, OverallConnectionStatus,
+    ConnectionStage, ConnectionStageErrors, OverallConnectionStage, OverallConnectionStatus,
 };
 use crate::stream_messages::RemovedStreamType;
 use crate::sub_lib::cryptde::CryptDE;
@@ -41,7 +41,9 @@ use crate::sub_lib::neighborhood::{DispatcherNodeQueryMessage, GossipFailure_0v1
 use crate::sub_lib::neighborhood::{Hops, NeighborhoodMetadata, NodeQueryResponseMetadata};
 use crate::sub_lib::neighborhood::{NRMetadataChange, NodeQueryMessage};
 use crate::sub_lib::neighborhood::{NeighborhoodSubs, NeighborhoodTools};
-use crate::sub_lib::neighborhood::{RouteUseFailedMessage, RouteUseSucceededMessage};
+use crate::sub_lib::neighborhood::{
+    RenewRouteReadinessLeaseMessage, RouteUseFailedMessage, RouteUseSucceededMessage,
+};
 use crate::sub_lib::node_addr::NodeAddr;
 use crate::sub_lib::peer_actors::{BindMessage, NewPublicIp, StartMessage};
 use crate::sub_lib::route::Route;
@@ -214,10 +216,8 @@ impl Handler<RouteQueryMessage> for Neighborhood {
     }
 }
 
-impl Handler<RouteUseSucceededMessage> for Neighborhood {
-    type Result = ();
-
-    fn handle(&mut self, _msg: RouteUseSucceededMessage, ctx: &mut Self::Context) -> Self::Result {
+impl Neighborhood {
+    fn apply_route_readiness_lease_renewal(&mut self, ctx: &mut Context<Self>) {
         self.consecutive_route_failures = 0;
         self.topology_route_available = true;
         self.route_readiness_proof_is_stale = false;
@@ -241,6 +241,52 @@ impl Handler<RouteUseSucceededMessage> for Neighborhood {
             actor.expire_route_readiness_lease(route_readiness_generation);
         });
         self.route_readiness_expiration_handle_opt = Some(expiration_handle);
+    }
+
+    fn can_acknowledge_mobile_route_readiness_renewal(&self, mobile_runtime_epoch: u64) -> bool {
+        crate::mobile_runtime::runtime_epoch_is_current(mobile_runtime_epoch)
+            && self.overall_connection_status.stage() == OverallConnectionStage::RouteFound
+            && self.topology_route_available
+            && !self.route_readiness_proof_is_stale
+            && !self
+                .neighborhood_database
+                .root()
+                .full_neighbor_keys(&self.neighborhood_database)
+                .is_empty()
+    }
+}
+
+impl Handler<RouteUseSucceededMessage> for Neighborhood {
+    type Result = ();
+
+    fn handle(&mut self, _msg: RouteUseSucceededMessage, ctx: &mut Self::Context) -> Self::Result {
+        crate::mobile_runtime::report_route_use_succeeded();
+        self.apply_route_readiness_lease_renewal(ctx);
+    }
+}
+
+impl Handler<RenewRouteReadinessLeaseMessage> for Neighborhood {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        msg: RenewRouteReadinessLeaseMessage,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        let state_accepted =
+            self.can_acknowledge_mobile_route_readiness_renewal(msg.mobile_runtime_epoch);
+        let proof_recorded = state_accepted
+            && crate::mobile_runtime::report_route_use_succeeded_for_epoch(
+                msg.mobile_runtime_epoch,
+            );
+        if proof_recorded {
+            self.apply_route_readiness_lease_renewal(ctx);
+        }
+        // Runtime lifecycle changes do not pass through this actor mailbox. Recheck immediately
+        // before acknowledging so prepare/finish/stop racing the queued request fail closed.
+        let accepted = proof_recorded
+            && crate::mobile_runtime::runtime_epoch_is_current(msg.mobile_runtime_epoch);
+        let _ = msg.acknowledgement.try_send(accepted);
     }
 }
 
@@ -349,12 +395,16 @@ impl Handler<ConnectionProgressMessage> for Neighborhood {
                 if !event_was_applied {
                     return;
                 }
+                let all_entry_attempts_terminal = self.report_mobile_entry_failure_if_exhausted();
                 match msg.event {
                     ConnectionProgressEvent::TcpConnectionSuccessful => {
                         self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
                     }
                     ConnectionProgressEvent::IntroductionGossipReceived(_)
                     | ConnectionProgressEvent::StandardGossipReceived => {
+                        crate::mobile_runtime::report_entry_handshake_milestone(
+                            crate::mobile_runtime::EntryHandshakeMilestone::GossipAccepted,
+                        );
                         if self.overall_connection_status.stage()
                             == OverallConnectionStage::NotConnected
                         {
@@ -368,11 +418,19 @@ impl Handler<ConnectionProgressMessage> for Neighborhood {
                                 );
                         }
                     }
+                    ConnectionProgressEvent::PassLoopFound => {
+                        if self.overall_connection_status.stage()
+                            == OverallConnectionStage::NotConnected
+                            && !all_entry_attempts_terminal
+                        {
+                            self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
+                        }
+                    }
                     ConnectionProgressEvent::TcpConnectionFailed
-                    | ConnectionProgressEvent::PassLoopFound
                     | ConnectionProgressEvent::NoGossipResponseReceived => {
                         if self.overall_connection_status.stage()
                             == OverallConnectionStage::NotConnected
+                            && !all_entry_attempts_terminal
                         {
                             self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
                         }
@@ -397,6 +455,21 @@ impl Handler<AskAboutDebutGossipMessage> for Neighborhood {
         let node_descriptor = &msg.prev_connection_progress.initial_node_descriptor;
         let connection_is_not_established =
             self.overall_connection_status.stage() == OverallConnectionStage::NotConnected;
+        let mobile_embedded = crate::mobile_runtime::is_embedded();
+        let all_entry_attempts_were_terminal =
+            mobile_embedded && self.overall_connection_status.all_entry_attempts_terminal();
+        let another_initial_attempt_is_unresolved = mobile_embedded
+            && self
+                .overall_connection_status
+                .progress
+                .iter()
+                .any(|connection_progress| {
+                    connection_progress.initial_node_descriptor != *node_descriptor
+                        && !matches!(
+                            connection_progress.connection_stage,
+                            ConnectionStage::Failed(_) | ConnectionStage::NeighborshipEstablished
+                        )
+                });
         let retry_target_in_use = node_descriptor
             .node_addr_opt
             .as_ref()
@@ -436,10 +509,14 @@ impl Handler<AskAboutDebutGossipMessage> for Neighborhood {
                     ConnectionStage::Failed(_)
                 ) && connection_is_not_established
                 {
-                    if retry_target_in_use {
+                    if all_entry_attempts_were_terminal {
+                        // The mobile outer recovery owns pair rotation once all
+                        // selected peers are terminal. Never erase that state
+                        // with an internal single-peer retry.
+                    } else if retry_target_in_use || another_initial_attempt_is_unresolved {
                         warning!(
                             self.logger,
-                            "Deferring retry because the initial Node is the current peer of another connection attempt; identity redacted."
+                            "Deferring retry while another initial connection attempt is unresolved; identity redacted."
                         );
                         schedule_retry_for_peer =
                             Some(current_connection_progress.current_peer_addr)
@@ -456,6 +533,10 @@ impl Handler<AskAboutDebutGossipMessage> for Neighborhood {
             )
         }
 
+        if self.report_mobile_entry_failure_if_exhausted() {
+            schedule_retry_for_peer = None;
+            retry_descriptor = None;
+        }
         if let Some(peer_addr) = schedule_retry_for_peer {
             self.send_ask_about_debut_gossip_message(ctx, peer_addr);
         }
@@ -658,6 +739,9 @@ impl Neighborhood {
             route_query: addr.clone().recipient::<RouteQueryMessage>(),
             route_use_failed: addr.clone().recipient::<RouteUseFailedMessage>(),
             route_use_succeeded: addr.clone().recipient::<RouteUseSucceededMessage>(),
+            renew_route_readiness_lease: addr
+                .clone()
+                .recipient::<RenewRouteReadinessLeaseMessage>(),
             update_node_record_metadata: addr
                 .clone()
                 .recipient::<UpdateNodeRecordMetadataMessage>(),
@@ -672,6 +756,34 @@ impl Neighborhood {
             from_ui_message_sub: addr.clone().recipient::<NodeFromUiMessage>(),
             connection_progress_sub: addr.clone().recipient::<ConnectionProgressMessage>(),
         }
+    }
+
+    /// Publishes one privacy-safe terminal code only after the complete
+    /// parallel entry set has failed. This is shared by actor messages that
+    /// terminate attempts without going through ConnectionProgressMessage.
+    fn report_mobile_entry_failure_if_exhausted(&self) -> bool {
+        if !crate::mobile_runtime::is_embedded()
+            || self.overall_connection_status.stage() != OverallConnectionStage::NotConnected
+            || !self.overall_connection_status.all_entry_attempts_terminal()
+        {
+            return false;
+        }
+        let saw_pass_loop = self
+            .overall_connection_status
+            .progress
+            .iter()
+            .any(|progress| {
+                matches!(
+                    progress.connection_stage,
+                    ConnectionStage::Failed(ConnectionStageErrors::PassLoopFound)
+                )
+            });
+        crate::mobile_runtime::report_connection_error(if saw_pass_loop {
+            crate::mobile_runtime::MobileConnectionError::PassLoopFound
+        } else {
+            crate::mobile_runtime::MobileConnectionError::NoEntryProgress
+        });
+        true
     }
 
     fn handle_start_message(&mut self) {
@@ -984,6 +1096,9 @@ impl Neighborhood {
         let rejection_was_applied =
             self.overall_connection_status.progress[position].reject_debut(&self.logger);
         if !rejection_was_applied {
+            return None;
+        }
+        if self.report_mobile_entry_failure_if_exhausted() {
             return None;
         }
         if !refusal_is_retryable {
@@ -2474,6 +2589,7 @@ impl Neighborhood {
             if !another_initial_connection_is_active {
                 self.set_mobile_connection_stage(OverallConnectionStage::NotConnected);
             }
+            self.report_mobile_entry_failure_if_exhausted();
         }
         let neighbor_key = match self.neighborhood_database.node_by_ip(&msg.peer_addr.ip()) {
             None => {
@@ -2689,7 +2805,7 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::path::Path;
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
@@ -3752,11 +3868,11 @@ mod tests {
     }
 
     #[test]
-    fn neighborhood_ignores_out_of_order_gossip_without_broadcasting_a_connected_state() {
+    fn neighborhood_accepts_authenticated_gossip_that_arrives_before_tcp_progress() {
         let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
-            "neighborhood_ignores_out_of_order_gossip_without_broadcasting_a_connected_state",
+            "neighborhood_accepts_authenticated_gossip_that_arrives_before_tcp_progress",
         );
         let (node_to_ui_recipient, node_to_ui_recording_arc) =
             make_recipient_and_recording_arc(Some(TypeId::of::<NodeToUiMessage>()));
@@ -3776,19 +3892,29 @@ mod tests {
             assert_eq!(
                 actor.overall_connection_status,
                 OverallConnectionStatus {
-                    stage: OverallConnectionStage::NotConnected,
+                    stage: OverallConnectionStage::ConnectedToNeighbor,
                     progress: vec![ConnectionProgress {
                         initial_node_descriptor: node_descriptor,
                         current_peer_addr: node_ip_addr,
-                        connection_stage: ConnectionStage::StageZero,
+                        connection_stage: ConnectionStage::NeighborshipEstablished,
                     }]
                 }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
-        System::current().stop();
         assert_eq!(system.run(), 0);
-        assert_eq!(node_to_ui_recording_arc.lock().unwrap().len(), 0);
+        let recording = node_to_ui_recording_arc.lock().unwrap();
+        assert_eq!(recording.len(), 1);
+        assert_eq!(
+            recording.get_record::<NodeToUiMessage>(0),
+            &NodeToUiMessage {
+                target: MessageTarget::AllClients,
+                body: UiConnectionChangeBroadcast {
+                    stage: UiConnectionStage::ConnectedToNeighbor,
+                }
+                .tmb(0),
+            }
+        );
     }
 
     #[test]
@@ -6773,6 +6899,208 @@ mod tests {
             }
         );
         assert_eq!(accountant_recording_arc.lock().unwrap().len(), 1);
+    }
+
+    fn ready_subject_for_acknowledged_mobile_renewal() -> Neighborhood {
+        let (ui_gateway, _, _) = make_recorder();
+        let mut subject = make_standard_subject();
+        let root_key = subject.neighborhood_database.root().public_key().clone();
+        let full_neighbor = make_node_record(45_670, true);
+        let full_neighbor_key = full_neighbor.public_key().clone();
+        subject
+            .neighborhood_database
+            .add_node(full_neighbor)
+            .unwrap();
+        subject
+            .neighborhood_database
+            .add_arbitrary_full_neighbor(&root_key, &full_neighbor_key);
+        assert!(!subject
+            .neighborhood_database
+            .root()
+            .full_neighbor_keys(&subject.neighborhood_database)
+            .is_empty());
+        subject.node_to_ui_recipient_opt = Some(ui_gateway.start().recipient());
+        subject.overall_connection_status.stage = OverallConnectionStage::RouteFound;
+        subject.topology_route_available = true;
+        subject.route_readiness_proof_is_stale = false;
+        subject.accountant_started = true;
+        subject
+    }
+
+    fn run_acknowledged_mobile_renewal(
+        test_name: &str,
+        subject: Neighborhood,
+        mobile_runtime_epoch: u64,
+        enqueue_before_renewal: impl FnOnce(&Addr<Neighborhood>),
+    ) -> (bool, u64) {
+        let system = System::new(test_name);
+        let observed_generation = Arc::new(Mutex::new(0));
+        let observed_generation_for_actor = observed_generation.clone();
+        let subject_addr = subject.start();
+        enqueue_before_renewal(&subject_addr);
+        let (acknowledgement, receiver) = mpsc::sync_channel(1);
+        subject_addr
+            .try_send(RenewRouteReadinessLeaseMessage {
+                mobile_runtime_epoch,
+                acknowledgement,
+            })
+            .unwrap();
+        subject_addr
+            .try_send(AssertionsMessage {
+                assertions: Box::new(move |neighborhood: &mut Neighborhood| {
+                    *observed_generation_for_actor.lock().unwrap() =
+                        neighborhood.route_readiness_generation;
+                }),
+            })
+            .unwrap();
+
+        System::current().stop();
+        assert_eq!(system.run(), 0);
+        let accepted = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let generation = *observed_generation.lock().unwrap();
+        (accepted, generation)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledged_mobile_renewal_accepts_only_a_current_ready_route() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "acknowledged_mobile_renewal_accepts_only_a_current_ready_route",
+            ready_subject_for_acknowledged_mobile_renewal(),
+            epoch,
+            |_| {},
+        );
+
+        assert!(accepted);
+        assert_eq!(generation, 1);
+        crate::mobile_runtime::finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queued_mobile_renewal_is_rejected_after_route_failure_demotion() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "queued_mobile_renewal_is_rejected_after_route_failure_demotion",
+            ready_subject_for_acknowledged_mobile_renewal(),
+            epoch,
+            |subject_addr| {
+                for _ in 0..CONSECUTIVE_ROUTE_FAILURES_BEFORE_DEMOTION {
+                    subject_addr.try_send(RouteUseFailedMessage).unwrap();
+                }
+            },
+        );
+
+        assert!(!accepted);
+        assert_eq!(generation, 0);
+        crate::mobile_runtime::finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledged_mobile_renewal_rejects_stale_proof() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+        let mut subject = ready_subject_for_acknowledged_mobile_renewal();
+        subject.route_readiness_proof_is_stale = true;
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "acknowledged_mobile_renewal_rejects_stale_proof",
+            subject,
+            epoch,
+            |_| {},
+        );
+
+        assert!(!accepted);
+        assert_eq!(generation, 0);
+        crate::mobile_runtime::finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledged_mobile_renewal_rejects_unavailable_topology_at_route_found_stage() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+        let mut subject = ready_subject_for_acknowledged_mobile_renewal();
+        subject.topology_route_available = false;
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "acknowledged_mobile_renewal_rejects_unavailable_topology_at_route_found_stage",
+            subject,
+            epoch,
+            |_| {},
+        );
+
+        assert!(!accepted);
+        assert_eq!(generation, 0);
+        crate::mobile_runtime::finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acknowledged_mobile_renewal_rejects_route_without_a_full_neighbor() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+        let mut subject = ready_subject_for_acknowledged_mobile_renewal();
+        let full_neighbor_keys = subject
+            .neighborhood_database
+            .root()
+            .full_neighbor_keys(&subject.neighborhood_database)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        full_neighbor_keys
+            .iter()
+            .for_each(|key| subject.neighborhood_database.remove_node(key));
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "acknowledged_mobile_renewal_rejects_route_without_a_full_neighbor",
+            subject,
+            epoch,
+            |_| {},
+        );
+
+        assert!(!accepted);
+        assert_eq!(generation, 0);
+        crate::mobile_runtime::finish(0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn queued_mobile_renewal_rejects_an_epoch_changed_before_actor_handling() {
+        crate::mobile_runtime::prepare(44_443);
+        crate::mobile_runtime::mark_started();
+        let old_epoch = crate::mobile_runtime::current_runtime_epoch_for_test().unwrap();
+
+        let (accepted, generation) = run_acknowledged_mobile_renewal(
+            "queued_mobile_renewal_rejects_an_epoch_changed_before_actor_handling",
+            ready_subject_for_acknowledged_mobile_renewal(),
+            old_epoch,
+            |subject_addr| {
+                subject_addr
+                    .try_send(AssertionsMessage {
+                        assertions: Box::new(|_| {
+                            crate::mobile_runtime::prepare(44_444);
+                            crate::mobile_runtime::mark_started();
+                        }),
+                    })
+                    .unwrap();
+            },
+        );
+
+        assert!(!accepted);
+        assert_eq!(generation, 0);
+        crate::mobile_runtime::finish(0);
     }
 
     #[test]

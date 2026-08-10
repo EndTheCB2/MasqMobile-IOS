@@ -3,7 +3,7 @@ import {
   reconcileMasqIssue,
   type MasqIssue,
 } from '../src/core/issues';
-import {EMPTY_STATUS, type NetworkStatus} from '../src/core/types';
+import { EMPTY_STATUS, type NetworkStatus } from '../src/core/types';
 
 const online: NetworkStatus = {
   available: true,
@@ -15,20 +15,92 @@ const online: NetworkStatus = {
 
 describe('MASQ issue classification', () => {
   it.each([
-    ['E_ENTRY_NODE_DISCOVERY', 'No reachable entry nodes', 'entry-nodes', 'retry'],
-    ['E_CORE_UNAVAILABLE', 'Native MASQ core is missing', 'native-core', 'none'],
+    [
+      'E_ENTRY_NODE_DISCOVERY',
+      'No reachable entry nodes',
+      'entry-nodes',
+      'retry',
+    ],
+    [
+      'E_CORE_UNAVAILABLE',
+      'Native MASQ core is missing',
+      'native-core',
+      'none',
+    ],
     ['E_KEYSTORE', 'Android Keystore failed', 'wallet', 'wallet'],
     ['E_RPC', 'RPC chain ID mismatch', 'rpc', 'network-profile'],
     ['E_PROXY_STATE', 'Private proxy failed', 'route', 'retry'],
+    ['E_PRIVATE_ROUTE_FAILED', 'Private route proof failed', 'route', 'retry'],
+    [
+      'E_PRIVATE_ROUTE_TIMEOUT',
+      'Private route proof timed out',
+      'route',
+      'retry',
+    ],
+    [
+      'E_CONNECTION_BUDGET_EXHAUSTED',
+      'Connection budget exhausted',
+      'route',
+      'retry',
+    ],
   ])('maps %s to an actionable category', (code, message, category, action) => {
     const result = classifyMasqIssue(
-      Object.assign(new Error(message), {code}),
+      Object.assign(new Error(message), { code }),
       online,
       EMPTY_STATUS,
     );
 
-    expect(result).toMatchObject({category, action, code});
+    expect(result).toMatchObject({ category, action, code });
     expect(result?.message).not.toContain(message);
+  });
+
+  it.each([
+    [
+      'E_ENTRY_DEBUT_NOT_WRITTEN',
+      'TCP connected, but MASQ did not write the entry handshake.',
+    ],
+    [
+      'E_ENTRY_NO_INBOUND_BYTES',
+      'MASQ wrote the entry handshake, but the peer sent no reply bytes.',
+    ],
+    [
+      'E_ENTRY_INBOUND_NOT_ACCEPTED',
+      'Reply bytes arrived, but MASQ accepted no valid gossip.',
+    ],
+    [
+      'E_ENTRY_GOSSIP_NOT_PROMOTED',
+      'MASQ accepted gossip, but did not promote the peer.',
+    ],
+  ])('uses a fixed safe summary for milestone %s', (code, summary) => {
+    const privateNativeDetail =
+      'private-key material at masq://base-mainnet:key@198.51.100.2:443';
+    const result = classifyMasqIssue(
+      Object.assign(new Error(privateNativeDetail), { code }),
+      online,
+      EMPTY_STATUS,
+    );
+
+    expect(result).toMatchObject({
+      action: 'retry',
+      category: 'entry-nodes',
+      code,
+    });
+    expect(result?.message).toContain(summary);
+    expect(result?.message).not.toContain(privateNativeDetail);
+  });
+
+  it.each([
+    ['E_CORE_STARTUP_FAILED', 'native-core'],
+    ['E_CORE_EARLY_EXIT', 'route'],
+    ['E_NETWORK_HANDOVER_RETRY', 'route'],
+  ])('classifies stable core lifecycle code %s', (code, category) => {
+    expect(
+      classifyMasqIssue(
+        Object.assign(new Error('Internal native detail.'), { code }),
+        online,
+        EMPTY_STATUS,
+      ),
+    ).toMatchObject({ action: 'retry', category, code });
   });
 
   it('prioritizes a known offline state over a secondary native error', () => {
@@ -38,7 +110,7 @@ describe('MASQ issue classification', () => {
       interface: 'cellular',
     });
 
-    expect(result).toMatchObject({category: 'offline', action: 'settings'});
+    expect(result).toMatchObject({ category: 'offline', action: 'settings' });
   });
 
   it('does not surface intentional cancellation as an error', () => {
@@ -52,10 +124,10 @@ describe('MASQ issue classification', () => {
     const result = classifyMasqIssue(
       new Error('Fully restart the app before changing active Node settings.'),
       online,
-      {...EMPTY_STATUS, phase: 'connected'},
+      { ...EMPTY_STATUS, phase: 'connected' },
     );
 
-    expect(result).toMatchObject({category: 'route', action: 'none'});
+    expect(result).toMatchObject({ category: 'route', action: 'none' });
     expect(result?.message).toContain('changing active Node settings');
   });
 });
@@ -67,6 +139,15 @@ describe('MASQ issue recovery', () => {
     code: null,
     message: 'Temporary problem',
   });
+  const routeReady = {
+    ...EMPTY_STATUS,
+    connectedNeighbors: 1,
+    engineAvailable: true,
+    engineGeneration: 4,
+    phase: 'connected' as const,
+    proxyPort: 44_443,
+    routeStage: 2,
+  };
 
   it('clears offline and entry-node issues after observed recovery', () => {
     expect(
@@ -76,12 +157,22 @@ describe('MASQ issue recovery', () => {
       }),
     ).toBeNull();
     expect(
-      reconcileMasqIssue(
-        issue('entry-nodes'),
-        {...EMPTY_STATUS, connectedNeighbors: 1, phase: 'connected'},
-        online,
-      ),
+      reconcileMasqIssue(issue('entry-nodes'), routeReady, online),
     ).toBeNull();
+  });
+
+  it('keeps entry-node and permission issues through legacy stage one', () => {
+    const legacyStageOne = {
+      ...routeReady,
+      routeStage: 1,
+    };
+
+    (['entry-nodes', 'permission'] as const).forEach(category => {
+      const pending = issue(category);
+      expect(reconcileMasqIssue(pending, legacyStageOne, online)).toBe(
+        pending,
+      );
+    });
   });
 
   it('keeps a route issue until an exit route is actually ready', () => {
@@ -99,17 +190,19 @@ describe('MASQ issue recovery', () => {
       ),
     ).toBe(routeIssue);
     expect(
-      reconcileMasqIssue(
-        routeIssue,
-        {
-          ...EMPTY_STATUS,
-          connectedNeighbors: 1,
-          phase: 'connected',
-          routeStage: 2,
-        },
-        online,
-      ),
+      reconcileMasqIssue(routeIssue, routeReady, online),
     ).toBeNull();
+  });
+
+  it.each([
+    ['unavailable engine', { engineAvailable: false }],
+    ['missing engine generation', { engineGeneration: 0 }],
+    ['stale native error', { lastError: 'E_PRIVATE_ROUTE_FAILED: stale' }],
+  ])('does not clear route issues for %s', (_label, override) => {
+    const pending = issue('route');
+    expect(
+      reconcileMasqIssue(pending, { ...routeReady, ...override }, online),
+    ).toBe(pending);
   });
 
   it.each(['wallet', 'rpc', 'native-core'] as const)(

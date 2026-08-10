@@ -7,15 +7,32 @@ APP_GRADLE="$ANDROID_DIR/app/build.gradle"
 DIST_DIR="$ROOT_DIR/distribution/android"
 SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 BUILD_TOOLS_VERSION="${MASQ_ANDROID_BUILD_TOOLS_VERSION:-36.0.0}"
+APPROVED_CERT_SHA256="346611622A6BCC187C0D31F54B2EF74903F830086FB17770F65016929DFE9F41"
 
+if [ "${MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD:-NO}" = "YES" ]; then
+  echo "error: direct public releases cannot enable unsafe system-routing dogfood." >&2
+  exit 1
+fi
+unset MASQ_ENABLE_UNSAFE_SYSTEM_ROUTING_DOGFOOD
 : "${MASQ_NODE_FINDER_URL:?Set MASQ_NODE_FINDER_URL to the reviewed HTTPS node-finder endpoint.}"
 : "${MASQ_ANDROID_KEYSTORE:?Set MASQ_ANDROID_KEYSTORE to the private release-keystore path.}"
 : "${MASQ_ANDROID_KEYSTORE_PASSWORD:?Set MASQ_ANDROID_KEYSTORE_PASSWORD without writing it to source control.}"
 : "${MASQ_ANDROID_EXPECTED_CERT_SHA256:?Set MASQ_ANDROID_EXPECTED_CERT_SHA256 to the approved signing-certificate digest.}"
 
 MASQ_ANDROID_KEY_ALIAS="${MASQ_ANDROID_KEY_ALIAS:-masq-mobile-preview2}"
-MASQ_ANDROID_KEY_PASSWORD="${MASQ_ANDROID_KEY_PASSWORD:-$MASQ_ANDROID_KEYSTORE_PASSWORD}"
-export MASQ_ANDROID_KEY_PASSWORD MASQ_ANDROID_KEYSTORE_PASSWORD
+KEYSTORE_PASSWORD_VALUE="$MASQ_ANDROID_KEYSTORE_PASSWORD"
+KEY_PASSWORD_VALUE="${MASQ_ANDROID_KEY_PASSWORD:-$KEYSTORE_PASSWORD_VALUE}"
+unset MASQ_ANDROID_KEY_PASSWORD MASQ_ANDROID_KEYSTORE_PASSWORD
+
+EXPECTED_CERT_SHA256="$(
+  printf '%s' "$MASQ_ANDROID_EXPECTED_CERT_SHA256" |
+    tr '[:lower:]' '[:upper:]' |
+    tr -d ':[:space:]'
+)"
+if [ "$EXPECTED_CERT_SHA256" != "$APPROVED_CERT_SHA256" ]; then
+  echo "error: expected certificate does not match the certificate pinned for official updates." >&2
+  exit 1
+fi
 
 case "$(printf '%s' "$MASQ_NODE_FINDER_URL" | tr '[:upper:]' '[:lower:]')" in
   https://dev* | *://localhost* | *.invalid* | *://test* | *://staging*)
@@ -106,7 +123,9 @@ if unzip -p "$UNSIGNED_APK" 'classes*.dex' |
 fi
 
 "$ZIPALIGN" -f -P 16 4 "$UNSIGNED_APK" "$ALIGNED_APK"
-"$APKSIGNER" sign \
+MASQ_ANDROID_KEYSTORE_PASSWORD="$KEYSTORE_PASSWORD_VALUE" \
+MASQ_ANDROID_KEY_PASSWORD="$KEY_PASSWORD_VALUE" \
+  "$APKSIGNER" sign \
   --ks "$MASQ_ANDROID_KEYSTORE" \
   --ks-key-alias "$MASQ_ANDROID_KEY_ALIAS" \
   --ks-pass env:MASQ_ANDROID_KEYSTORE_PASSWORD \
@@ -114,6 +133,7 @@ fi
   --v4-signing-enabled false \
   --out "$SIGNED_TEMP_APK" \
   "$ALIGNED_APK"
+unset KEYSTORE_PASSWORD_VALUE KEY_PASSWORD_VALUE
 
 CERTIFICATE_REPORT="$DIST_DIR/.${APK_BASENAME}-certificate.txt"
 trap 'rm -f "$ALIGNED_APK" "$SIGNED_TEMP_APK" "$SIGNED_TEMP_IDSIG" "$CERTIFICATE_REPORT"' EXIT
@@ -121,11 +141,6 @@ trap 'rm -f "$ALIGNED_APK" "$SIGNED_TEMP_APK" "$SIGNED_TEMP_IDSIG" "$CERTIFICATE
 ACTUAL_CERT_SHA256="$(
   awk -F ': ' '/Signer #1 certificate SHA-256 digest/ { print toupper($2) }' \
     "$CERTIFICATE_REPORT"
-)"
-EXPECTED_CERT_SHA256="$(
-  printf '%s' "$MASQ_ANDROID_EXPECTED_CERT_SHA256" |
-    tr '[:lower:]' '[:upper:]' |
-    tr -d ':[:space:]'
 )"
 if [ -z "$ACTUAL_CERT_SHA256" ] || [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
   echo "error: APK signing certificate does not match the approved fingerprint." >&2

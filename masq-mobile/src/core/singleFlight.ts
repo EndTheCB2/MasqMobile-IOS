@@ -20,6 +20,17 @@ export class SingleFlight<T> {
     return started;
   }
 
+  whenIdle(): Promise<void> {
+    const running = this.active;
+    if (!running) {
+      return Promise.resolve();
+    }
+    return running.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
   private clear(completed: Promise<T>) {
     if (this.active === completed) {
       this.active = null;

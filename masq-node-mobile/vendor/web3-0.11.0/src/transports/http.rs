@@ -16,11 +16,19 @@ use std::sync::Arc;
 use std::ffi::CString;
 #[cfg(target_os = "ios")]
 use std::io;
+#[cfg(target_os = "android")]
+use std::io;
+#[cfg(target_os = "android")]
+use std::net::IpAddr;
 #[cfg(target_os = "ios")]
 use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 #[cfg(target_os = "ios")]
 use std::os::unix::io::FromRawFd;
 
+#[cfg(target_os = "android")]
+use self::hyper::client::connect::dns::{GaiResolver, Name, Resolve};
+#[cfg(target_os = "android")]
+use self::hyper::client::connect::HttpConnector;
 #[cfg(target_os = "ios")]
 use self::hyper::client::connect::{Connect, Connected, Destination};
 
@@ -72,6 +80,34 @@ impl From<native_tls::Error> for Error {
 const MAX_SINGLE_CHUNK: usize = 256;
 const DEFAULT_MAX_PARALLEL: usize = 64;
 type Pending = oneshot::Sender<Result<hyper::Chunk>>;
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug)]
+struct AndroidPreferIpv4Resolver {
+    inner: GaiResolver,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidPreferIpv4Resolver {
+    fn new(threads: usize) -> Self {
+        Self {
+            inner: GaiResolver::new(threads),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Resolve for AndroidPreferIpv4Resolver {
+    type Addrs = std::vec::IntoIter<IpAddr>;
+    type Future = Box<dyn Future<Item = Self::Addrs, Error = io::Error> + Send>;
+
+    fn resolve(&self, name: Name) -> Self::Future {
+        Box::new(self.inner.resolve(name).map(|addresses| {
+            let (ipv4, ipv6): (Vec<_>, Vec<_>) = addresses.partition(IpAddr::is_ipv4);
+            ipv4.into_iter().chain(ipv6).collect::<Vec<_>>().into_iter()
+        }))
+    }
+}
 
 #[cfg(target_os = "ios")]
 const APPLE_CONNECT_TIMEOUT_MS: i32 = 12_000;
@@ -168,8 +204,27 @@ impl Http {
     pub fn with_event_loop(url: &str, handle: &reactor::Handle, max_parallel: usize) -> Result<Self> {
         let (write_sender, write_receiver) = mpsc::unbounded();
 
-        #[cfg(all(feature = "tls", not(target_os = "ios")))]
+        #[cfg(all(feature = "tls", not(any(target_os = "android", target_os = "ios"))))]
         let client = hyper::Client::builder().build::<_, hyper::Body>(hyper_tls::HttpsConnector::new(4)?);
+
+        #[cfg(all(feature = "tls", target_os = "android"))]
+        let client = {
+            // Vendored OpenSSL has desktop defaults and otherwise cannot find
+            // Android's trusted CA directory. Keep certificate and hostname
+            // verification enabled while pointing it at the read-only platform
+            // trust store before native-tls constructs the connector.
+            let cert_dir = if std::path::Path::new("/apex/com.android.conscrypt/cacerts").is_dir() {
+                "/apex/com.android.conscrypt/cacerts"
+            } else {
+                "/system/etc/security/cacerts"
+            };
+            std::env::set_var("SSL_CERT_DIR", cert_dir);
+            let tls = native_tls::TlsConnector::builder().build()?;
+            let mut connector = HttpConnector::new_with_resolver(AndroidPreferIpv4Resolver::new(4));
+            connector.enforce_http(false);
+            let https = hyper_tls::HttpsConnector::from((connector, tls));
+            hyper::Client::builder().build::<_, hyper::Body>(https)
+        };
 
         #[cfg(all(feature = "tls", target_os = "ios"))]
         let client = {
